@@ -2491,7 +2491,92 @@ class ModelWorker:
                         else:
                             device_map[f"model.layers.{i}"] = "cuda:1"
                     
-                    logger.info("-
+                    logger.info("- Distributing model across GPUs...")
+                    self.model = dispatch_model(self.model, device_map=device_map)
+                    logger.info("- Model distributed successfully")
+                    
+                    # KV cache 信息
+                    hidden_size = self.model.config.hidden_size
+                    logger.info(f"- Model architecture:")
+                    logger.info(f"  - Number of layers: {num_layers}")
+                    logger.info(f"  - Hidden size: {hidden_size}")
+                    
+                    # 估算 KV cache 大小
+                    seq_len = input_ids.shape[1] + max_new_tokens
+                    kv_cache_size = 2 * num_layers * seq_len * hidden_size * input_ids.shape[0] * 2 / (1024**3)  # in GB
+                    logger.info(f"- Estimated KV cache size: {kv_cache_size:.2f}GB")
+                    
+                    # 检查是否启用了 flash attention
+                    if hasattr(self.model.config, '_attn_implementation'):
+                        logger.info(f"- Attention implementation: {self.model.config._attn_implementation}")
+                    
+                    logger.info("- Starting token generation...")
+                    streamer = TextStreamer(
+                        self.tokenizer, 
+                        skip_prompt=True,
+                        skip_special_tokens=True
+                    )
+                    
+                    outputs = self.model.generate(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        max_new_tokens=max_new_tokens,
+                        temperature=temperature,
+                        top_p=top_p,
+                        do_sample=input_data.get('do_sample', True),
+                        streamer=streamer
+                    )
+                    
+                    # 生成完成后的处理
+                    logger.info("- Moving outputs to CPU...")
+                    outputs_cpu = outputs.to('cpu', non_blocking=True)
+                    torch.cuda.synchronize()
+                    
+                    # 记录GPU内存使用情况
+                    logger.info("- Final GPU memory usage:")
+                    logger.info(f"  GPU 0: {torch.cuda.memory_allocated(0)/1024**3:.2f}GB")
+                    logger.info(f"  GPU 1: {torch.cuda.memory_allocated(1)/1024**3:.2f}GB")
+                    
+                    return {
+                        'output_ids': outputs_cpu.numpy().tolist(),
+                        'status': 'success'
+                    }
+            else:
+                # 单 GPU 模式代码保持不变...
+
+```
+
+
+主要改动：
+1. 导入 accelerate 的 dispatch_model 函数
+2. 使用字符串形式的设备名称 ("cuda:0", "cuda:1")
+3. 使用 dispatch_model 来分配模型到不同设备
+
+运行前需要安装 accelerate：
+```bash
+pip install accelerate
+```
+
+
+然后运行：
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0,1 python -m ktransformers.worker --worker_address "10.21.22.206:29500"
+```
+
+
+这样应该能正确地将模型分布到两个 GPU 上。如果还有问题，请告诉我。
+
+---
+
+_**User**_
+
+现在报错显存不足，请只使用cuda0进行模型加载，cuda1专职进行模型推理
+
+---
+
+_**Assistant**_
+
+
 
 ---
 

@@ -20,11 +20,12 @@ def load_model_and_tokenizer(model_path: str, gguf_path: str):
     torch.set_default_dtype(config.torch_dtype)
     
     logger.info("Loading model...")
+    # 明确指定模型加载到 cuda:0
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         config=config,
         trust_remote_code=True,
-        device_map="auto"
+        device_map="cuda:0"  # 修改这里，强制加载到 cuda:0
     )
     model.eval()
     
@@ -56,7 +57,7 @@ class ModelWorker:
             model_path,
             config=config,
             trust_remote_code=True,
-            device_map="auto"
+            device_map="cuda:0"
         )
         self.model.eval()
         
@@ -113,26 +114,12 @@ class ModelWorker:
                     logger.info(f"- GPU 0 memory allocated: {torch.cuda.memory_allocated(0)/1024**3:.2f}GB")
                     logger.info(f"- GPU 1 memory allocated: {torch.cuda.memory_allocated(1)/1024**3:.2f}GB")
                     
-                    # 设置设备映射
-                    logger.info("- Setting up device map...")
-                    num_layers = len(self.model.model.layers)
-                    device_map = {
-                        "model.embed_tokens": "cuda:0",
-                        "model.norm": "cuda:0",
-                        "lm_head": "cuda:0",
-                    }
-                    # 将一半的层分配到每个 GPU
-                    for i in range(num_layers):
-                        if i < num_layers // 2:
-                            device_map[f"model.layers.{i}"] = "cuda:0"
-                        else:
-                            device_map[f"model.layers.{i}"] = "cuda:1"
-                    
-                    logger.info("- Distributing model across GPUs...")
-                    self.model = dispatch_model(self.model, device_map=device_map)
-                    logger.info("- Model distributed successfully")
+                    # 将模型的生成部分移到 cuda:1
+                    logger.info("- Moving generation components to inference GPU...")
+                    self.model.lm_head = self.model.lm_head.to('cuda:1')
                     
                     # KV cache 信息
+                    num_layers = len(self.model.model.layers)
                     hidden_size = self.model.config.hidden_size
                     logger.info(f"- Model architecture:")
                     logger.info(f"  - Number of layers: {num_layers}")
@@ -163,6 +150,10 @@ class ModelWorker:
                         do_sample=input_data.get('do_sample', True),
                         streamer=streamer
                     )
+                    
+                    # 生成完成后，将 lm_head 移回 cuda:0
+                    logger.info("- Moving generation components back to storage GPU...")
+                    self.model.lm_head = self.model.lm_head.to('cuda:0')
                     
                     # 生成完成后的处理
                     logger.info("- Moving outputs to CPU...")

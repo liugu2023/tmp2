@@ -1575,6 +1575,116 @@ _**Assistant**_
 
 
 
+
+
+抱歉，看来 DeepSeek 模型不支持 callback 参数。让我们修改 worker.py 中的代码，使用其他方式来显示生成进度：
+
+```python:ktransformers/worker.py
+def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        logger.info("Received generation request")
+        logger.info(f"Input sequence length: {len(input_data['input_ids'])}")
+        
+        # 创建输入张量
+        logger.info("Moving input tensors to GPU...")
+        input_ids = torch.tensor(input_data['input_ids'], device='cuda')
+        attention_mask = torch.tensor(input_data['attention_mask'], device='cuda')
+        
+        # 生成参数日志
+        max_new_tokens = input_data.get('max_new_tokens', 512)
+        temperature = input_data.get('temperature', 0.6)
+        top_p = input_data.get('top_p', 0.9)
+        logger.info(f"Generation parameters: max_new_tokens={max_new_tokens}, "
+                   f"temperature={temperature}, "
+                   f"top_p={top_p}")
+        
+        # 生成文本
+        logger.info("Starting text generation...")
+        start_time = time.time()
+        with torch.no_grad(), torch.amp.autocast('cuda'):
+            logger.info("Initializing generation process...")
+            
+            outputs = self.model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                do_sample=input_data.get('do_sample', True),
+                streamer=TextStreamer(self.tokenizer, skip_prompt=True)  # 添加实时输出
+            )
+        
+        end_time = time.time()
+        generation_time = end_time - start_time
+        tokens_generated = len(outputs[0]) - len(input_ids[0])
+        tokens_per_second = tokens_generated / generation_time
+        
+        logger.info(f"Generation completed in {generation_time:.2f} seconds")
+        logger.info(f"Tokens generated: {tokens_generated}")
+        logger.info(f"Generation speed: {tokens_per_second:.2f} tokens/second")
+        logger.info(f"Final sequence length: {len(outputs[0])}")
+        
+        # 移动到CPU
+        logger.info("Moving outputs to CPU...")
+        outputs_cpu = outputs.to('cpu', non_blocking=True)
+        torch.cuda.synchronize()
+        
+        # 记录GPU内存使用情况
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        logger.info(f"GPU Memory: Allocated={allocated:.2f}GB, Reserved={reserved:.2f}GB")
+        
+        logger.info("Preparing response...")
+        return {
+            'output_ids': outputs_cpu.numpy().tolist(),
+            'status': 'success'
+        }
+    except Exception as e:
+        logger.error(f"Generation error: {str(e)}")
+        return {
+            'status': 'error',
+            'error': str(e)
+        }
+```
+
+
+主要改动：
+1. 移除了不支持的 callback 参数
+2. 添加了时间统计
+3. 计算生成速度（tokens/second）
+4. 使用 TextStreamer 实现实时输出（如果模型支持）
+
+运行命令保持不变：
+
+1. GPU 机器 (10.21.22.206):
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0 python -m ktransformers.worker --worker_address "10.21.22.206:29500"
+```
+
+
+2. CPU 机器 (10.21.22.100):
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.local_chat \
+    --model_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/ \
+    --gguf_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/ \
+    --worker_address "10.21.22.206:29500"
+```
+
+
+现在您应该能看到生成速度和内存使用等详细信息。如果还有其他需求，请告诉我。
+
+---
+
+_**User**_
+
+Initializing generation process这步详细信息输出
+
+---
+
+_**Assistant**_
+
+
+
 ---
 
 

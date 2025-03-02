@@ -97,7 +97,29 @@ class ModelWorker:
             start_time = time.time()
             with torch.no_grad(), torch.amp.autocast('cuda'):
                 logger.info("Initializing generation process...")
+                # 添加详细的初始化信息
+                logger.info("- Checking model state...")
+                logger.info(f"- Model device: {self.model.device}")
+                logger.info(f"- Input shape: {input_ids.shape}")
+                logger.info(f"- Current GPU memory allocated: {torch.cuda.memory_allocated()/1024**3:.2f}GB")
                 
+                # KV cache 信息
+                num_layers = len(self.model.model.layers)
+                hidden_size = self.model.config.hidden_size
+                logger.info(f"- Model architecture:")
+                logger.info(f"  - Number of layers: {num_layers}")
+                logger.info(f"  - Hidden size: {hidden_size}")
+                
+                # 估算 KV cache 大小
+                seq_len = input_ids.shape[1] + max_new_tokens
+                kv_cache_size = 2 * num_layers * seq_len * hidden_size * input_ids.shape[0] * 2 / (1024**3)  # in GB
+                logger.info(f"- Estimated KV cache size: {kv_cache_size:.2f}GB")
+                
+                # 检查是否启用了 flash attention
+                if hasattr(self.model.config, '_attn_implementation'):
+                    logger.info(f"- Attention implementation: {self.model.config._attn_implementation}")
+                
+                logger.info("- Starting token generation...")
                 outputs = self.model.generate(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
@@ -105,7 +127,7 @@ class ModelWorker:
                     temperature=temperature,
                     top_p=top_p,
                     do_sample=input_data.get('do_sample', True),
-                    streamer=TextStreamer(self.tokenizer, skip_prompt=True)  # 添加实时输出
+                    streamer=TextStreamer(self.tokenizer, skip_prompt=True)
                 )
             
             end_time = time.time()

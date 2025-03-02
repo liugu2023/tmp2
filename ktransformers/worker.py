@@ -35,11 +35,10 @@ class ModelWorker:
         self.socket.bind(f"tcp://*:{port}")
         self.socket.setsockopt(zmq.RCVHWM, 0)
         self.socket.setsockopt(zmq.SNDHWM, 0)
-        self.socket.setsockopt(zmq.TCP_IB, 1)
         
         self.model = None
         self.tokenizer = None
-        logger.info(f"Worker started at {address} using IB network")
+        logger.info(f"Worker started at {address} with high-performance network")
 
     def load_model(self, model_path: str, gguf_path: str):
         logger.info("Loading tokenizer...")

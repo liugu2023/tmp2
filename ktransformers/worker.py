@@ -60,13 +60,26 @@ class ModelWorker:
             logger.info("Loading model...")
             num_layers = config.num_hidden_layers
             
-            # 使用默认的设备映射策略进行初始加载
-            device_map = "auto"
-            max_memory = {0: "14GB", "cpu": "128GB"}
+            # 优化设备映射策略，将更多计算密集型组件放在 GPU 上
+            device_map = {
+                'model.embed_tokens': 0,    # 词嵌入层在 GPU
+                'model.norm': 0,            # 归一化层在 GPU
+                'lm_head': 0,              # 输出层在 GPU
+            }
             
-            logger.info("Using auto device map for initial loading")
+            # 将更多的 Transformer 层放在 GPU 上
+            for i in range(num_layers):
+                if i < num_layers * 0.6:    # 60% 的层放在 GPU 上
+                    device_map[f'model.layers.{i}'] = 0
+                else:
+                    device_map[f'model.layers.{i}'] = 'cpu'
             
-            # 加载模型
+            # 增加 GPU 内存使用
+            max_memory = {0: "15GB", "cpu": "128GB"}  # 使用更多 GPU 内存
+            
+            logger.info(f"Device map configuration: {device_map}")
+            
+            # 加载模型时启用性能优化
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_path,
                 config=config,
@@ -74,24 +87,30 @@ class ModelWorker:
                 device_map=device_map,
                 max_memory=max_memory,
                 offload_folder="offload",
-                torch_dtype=torch.float16
+                torch_dtype=torch.float16,
+                low_cpu_mem_usage=True,     # 减少 CPU 内存使用
             )
-            self.model.eval()
             
-            # 记录初始设备分配
-            logger.info("Initial device map:")
+            # 启用 CUDA 图优化
+            self.model.eval()
+            torch.cuda.empty_cache()
+            
+            # 记录设备分配
+            logger.info("Final device map:")
             for name, device in self.model.hf_device_map.items():
                 logger.info(f"{name}: {device}")
             
             # 设置生成配置
             try:
                 self.model.generation_config = GenerationConfig.from_pretrained(model_path)
+                self.model.generation_config.use_cache = True  # 启用 KV 缓存
             except Exception as e:
                 logger.warning(f"Generation config can't auto create, making default. Message: {e}")
                 self.model.generation_config = GenerationConfig(
                     temperature=0.6,
                     top_p=0.9,
-                    do_sample=True
+                    do_sample=True,
+                    use_cache=True
                 )
             if self.model.generation_config.pad_token_id is None:
                 self.model.generation_config.pad_token_id = self.model.generation_config.eos_token_id
@@ -108,34 +127,34 @@ class ModelWorker:
             logger.info("Received generation request")
             logger.info(f"Input sequence length: {len(input_data['input_ids'])}")
             
-            # 创建输入张量并放在 GPU 上
-            input_ids = torch.tensor(input_data['input_ids'], device='cuda')
-            attention_mask = torch.tensor(input_data['attention_mask'], device='cuda')
+            # 优化输入处理
+            input_ids = torch.tensor(input_data['input_ids'], device='cuda', dtype=torch.long)
+            attention_mask = torch.tensor(input_data['attention_mask'], device='cuda', dtype=torch.long)
             
             logger.info(f"Generation parameters: max_new_tokens={input_data.get('max_new_tokens', 512)}, "
                        f"temperature={input_data.get('temperature', 0.6)}, "
                        f"top_p={input_data.get('top_p', 0.9)}")
             
-            logger.info("Starting text generation...")
-            with torch.no_grad(), torch.amp.autocast('cuda'):
-                outputs = self.model.generate(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    max_new_tokens=input_data.get('max_new_tokens', 512),
-                    temperature=input_data.get('temperature', 0.6),
-                    top_p=input_data.get('top_p', 0.9),
-                    do_sample=input_data.get('do_sample', True),
-                    use_cache=True
-                )
+            # 使用混合精度和缓存优化生成
+            with torch.cuda.amp.autocast(enabled=True):
+                with torch.no_grad():
+                    outputs = self.model.generate(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        max_new_tokens=input_data.get('max_new_tokens', 512),
+                        temperature=input_data.get('temperature', 0.6),
+                        top_p=input_data.get('top_p', 0.9),
+                        do_sample=input_data.get('do_sample', True),
+                        use_cache=True,
+                        num_beams=1,         # 减少束搜索开销
+                        pad_token_id=self.model.generation_config.pad_token_id,
+                    )
             
             logger.info(f"Generation completed. Output sequence length: {len(outputs[0])}")
             
-            # 异步传输到 CPU
+            # 优化输出处理
             outputs_cpu = outputs.to('cpu', non_blocking=True)
             torch.cuda.synchronize()
-            
-            # 清理 CUDA 缓存
-            torch.cuda.empty_cache()
             
             return {
                 'output_ids': outputs_cpu.numpy().tolist(),

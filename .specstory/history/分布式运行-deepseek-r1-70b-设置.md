@@ -2547,6 +2547,115 @@ PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0 python -m ktra
 
 ---
 
+_**User**_
+
+模型加载不要全放到GPU上，遵循默认就好
+
+---
+
+_**Assistant**_
+
+
+
+
+
+明白了，让我们修改回默认的加载策略，但在加载后再进行层的重分配：
+
+```python:ktransformers/worker.py
+def load_model(self, model_path: str, gguf_path: str):
+    try:
+        logger.info("Loading tokenizer...")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        
+        logger.info("Loading model config...")
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        torch.set_default_dtype(config.torch_dtype)
+        
+        logger.info("Loading model...")
+        num_layers = config.num_hidden_layers
+        
+        # 使用默认的设备映射策略进行初始加载
+        device_map = "auto"
+        max_memory = {0: "14GB", "cpu": "128GB"}
+        
+        logger.info("Using auto device map for initial loading")
+        
+        # 加载模型
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            config=config,
+            trust_remote_code=True,
+            device_map=device_map,
+            max_memory=max_memory,
+            offload_folder="offload",
+            torch_dtype=torch.float16
+        )
+        self.model.eval()
+        
+        # 记录初始设备分配
+        logger.info("Initial device map:")
+        for name, device in self.model.hf_device_map.items():
+            logger.info(f"{name}: {device}")
+        
+        # 设置生成配置
+        try:
+            self.model.generation_config = GenerationConfig.from_pretrained(model_path)
+        except Exception as e:
+            logger.warning(f"Generation config can't auto create, making default. Message: {e}")
+            self.model.generation_config = GenerationConfig(
+                temperature=0.6,
+                top_p=0.9,
+                do_sample=True
+            )
+        if self.model.generation_config.pad_token_id is None:
+            self.model.generation_config.pad_token_id = self.model.generation_config.eos_token_id
+        
+        logger.info("Model loading completed successfully")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error loading model: {str(e)}")
+        return False
+```
+
+
+主要改动：
+1. 移除了手动的设备映射配置
+2. 使用 "auto" 设备映射让 transformers 自动处理
+3. 保留了内存限制设置
+4. 添加了初始设备分配的日志记录
+
+这样可以：
+1. 利用 transformers 的默认加载策略
+2. 让系统自动决定最优的层分配
+3. 仍然保持内存使用限制
+4. 通过日志了解实际的设备分配情况
+
+请重新运行：
+
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0 python -m ktransformers.worker \
+    --worker_address "10.21.22.206:29500" \
+    --cpu_worker_address "10.21.22.100:29501"
+```
+
+
+如果还有问题，请告诉我。
+
+---
+
+_**User**_
+
+现在显卡使用率太低了
+
+---
+
+_**Assistant**_
+
+
+
+---
+
 
 
 ---

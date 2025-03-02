@@ -1863,7 +1863,86 @@ def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
             
             logger.info("  - Generation started with following settings:")
             logger.info(f"    - Input context length: {len(input_ids[0])} tokens")
-            logger.info(f"    - Maximum
+            logger.info(f"    - Maximum new tokens: {max_new_tokens}")
+            logger.info(f"    - Temperature: {temperature}")
+            logger.info(f"    - Top-p sampling: {top_p}")
+            logger.info(f"    - Do sample: {input_data.get('do_sample', True)}")
+            
+            outputs = self.model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                do_sample=input_data.get('do_sample', True),
+                streamer=streamer
+            )
+            
+            # 记录生成完成的信息
+            final_time = time.time()
+            total_gen_time = final_time - gen_start_time
+            logger.info("  - Generation completed:")
+            logger.info(f"    - Total generation time: {total_gen_time:.2f} seconds")
+            logger.info(f"    - Final sequence length: {len(outputs[0])} tokens")
+            logger.info(f"    - New tokens generated: {len(outputs[0]) - len(input_ids[0])}")
+            logger.info(f"    - Average speed: {(len(outputs[0]) - len(input_ids[0])) / total_gen_time:.2f} tokens/sec")
+
+        # ... 后面的代码保持不变 ...
+
+```
+
+
+主要添加的信息：
+1. 生成配置详情
+   - Repetition penalty
+   - Length penalty
+   - Early stopping 设置
+   - 特殊 token IDs
+
+2. 实时生成进度
+   - 每2秒更新一次生成速度
+   - 显示已生成的 token 数量
+   - 显示经过的时间
+
+3. 生成过程信息
+   - 输入上下文长度
+   - 生成参数详细说明
+   - 实时生成的文本内容
+
+4. 完成统计
+   - 总生成时间
+   - 最终序列长度
+   - 新生成的 token 数量
+   - 平均生成速度
+
+运行命令保持不变：
+
+1. GPU 机器 (10.21.22.206):
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0 python -m ktransformers.worker --worker_address "10.21.22.206:29500"
+```
+
+2. CPU 机器 (10.21.22.100):
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.local_chat \
+    --model_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/ \
+    --gguf_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/ \
+    --worker_address "10.21.22.206:29500"
+```
+
+这样您就能看到更详细的生成过程信息了。如果需要其他信息，请告诉我。
+
+---
+
+_**User**_
+
+降低最大token为50
+
+---
+
+_**Assistant**_
+
+
 
 ---
 

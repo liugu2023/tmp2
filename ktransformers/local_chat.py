@@ -109,7 +109,7 @@ def local_chat(
     model_path: str | None = None,
     optimize_config_path: str = None,
     gguf_path: str | None = None,
-    max_new_tokens: int = 50,
+    max_new_tokens: int = 300,
     cpu_infer: int = Config().cpu_infer,
     use_cuda_graph: bool = True,
     prompt_file : str | None = None,
@@ -248,7 +248,7 @@ def main():
     parser.add_argument('--gguf_path', type=str, required=True)
     parser.add_argument('--worker_address', type=str, default=None,
                       help='Address of worker for distributed mode (e.g., "10.21.22.206:29500")')
-    parser.add_argument('--max_new_tokens', type=int, default=50)
+    parser.add_argument('--max_new_tokens', type=int, default=300)
     parser.add_argument('--cpu_infer', type=int, default=Config().cpu_infer)
     parser.add_argument('--use_cuda_graph', type=bool, default=True)
     parser.add_argument('--prompt_file', type=str, default=None)

@@ -85,7 +85,7 @@ class ModelWorker:
             attention_mask = torch.tensor(input_data['attention_mask'], device='cuda')
             
             # 生成参数日志
-            max_new_tokens = input_data.get('max_new_tokens', 50)
+            max_new_tokens = input_data.get('max_new_tokens', 512)
             temperature = input_data.get('temperature', 0.6)
             top_p = input_data.get('top_p', 0.9)
             logger.info(f"Generation parameters: max_new_tokens={max_new_tokens}, "

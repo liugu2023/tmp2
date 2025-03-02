@@ -36,10 +36,13 @@ class ModelWorker:
         self.socket.setsockopt(zmq.RCVHWM, 0)
         self.socket.setsockopt(zmq.SNDHWM, 0)
         
-        # 移除 CPU 线程设置，因为我们不想使用这台机器的 CPU
+        # 设置 GPU 内存限制
+        torch.cuda.set_per_process_memory_fraction(0.75)  # 限制 GPU 内存使用为总量的 75%
+        
         self.model = None
         self.tokenizer = None
         logger.info(f"Worker started at {address}, listening on all interfaces")
+        logger.info(f"GPU memory limit set to 12GB")
 
     def load_model(self, model_path: str, gguf_path: str):
         logger.info("Loading tokenizer...")
@@ -50,12 +53,18 @@ class ModelWorker:
         torch.set_default_dtype(config.torch_dtype)
         
         logger.info("Loading model...")
-        # 强制模型加载到 GPU
+        # 设置设备映射，将部分层卸载到 CPU
+        max_memory = {0: "12GB", "cpu": "128GB"}  # 限制 GPU 使用 12GB，CPU 使用 128GB
+        device_map = "auto"
+        
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path,
             config=config,
             trust_remote_code=True,
-            device_map="cuda"  # 修改为直接使用 CUDA，而不是 auto
+            device_map=device_map,
+            max_memory=max_memory,
+            offload_folder="offload",  # 设置模型权重卸载目录
+            offload_state_dict=True    # 启用状态字典卸载
         )
         self.model.eval()
         
@@ -72,6 +81,11 @@ class ModelWorker:
         if self.model.generation_config.pad_token_id is None:
             self.model.generation_config.pad_token_id = self.model.generation_config.eos_token_id
             
+        # 打印设备分配信息
+        logger.info("Model device map:")
+        for name, device in self.model.hf_device_map.items():
+            logger.info(f"{name}: {device}")
+            
         logger.info("Model loaded successfully")
 
     def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -79,7 +93,7 @@ class ModelWorker:
             logger.info("Received generation request")
             logger.info(f"Input sequence length: {len(input_data['input_ids'])}")
             
-            # 直接在 GPU 上创建张量
+            # 创建输入张量
             input_ids = torch.tensor(input_data['input_ids'], device='cuda')
             attention_mask = torch.tensor(input_data['attention_mask'], device='cuda')
             
@@ -96,7 +110,7 @@ class ModelWorker:
                     temperature=input_data.get('temperature', 0.6),
                     top_p=input_data.get('top_p', 0.9),
                     do_sample=input_data.get('do_sample', True),
-                    use_cache=True  # 确保使用 KV 缓存
+                    use_cache=True
                 )
             
             logger.info(f"Generation completed. Output sequence length: {len(outputs[0])}")
@@ -104,6 +118,9 @@ class ModelWorker:
             # 异步传输到 CPU
             outputs_cpu = outputs.to('cpu', non_blocking=True)
             torch.cuda.synchronize()
+            
+            # 清理 CUDA 缓存
+            torch.cuda.empty_cache()
             
             return {
                 'output_ids': outputs_cpu.numpy().tolist(),

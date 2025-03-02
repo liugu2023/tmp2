@@ -39,6 +39,8 @@ class ModelWorker:
         
         self.model = None
         self.tokenizer = None
+        self.device_map = None  # 添加设备映射跟踪
+        self.n_layers = None    # 添加层数跟踪
         logger.info(f"Worker started at {address}, listening on all interfaces")
 
     def load_model(self, model_path: str, gguf_path: str):
@@ -48,33 +50,15 @@ class ModelWorker:
         logger.info("Loading model config...")
         config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         torch.set_default_dtype(config.torch_dtype)
+        self.n_layers = config.num_hidden_layers
         
-        logger.info("Loading model...")
-        # 创建自定义设备映射
-        n_layers = config.num_hidden_layers
-        n_layers_gpu = int(n_layers * 0.7)  # 70% 的层在 GPU 上
-        
-        device_map = {
-            'model.embed_tokens': 'cuda',
-            'model.norm': 'cuda',
-            'lm_head': 'cuda',
-        }
-        
-        # 分配transformer层
-        for i in range(n_layers):
-            if i < n_layers_gpu:
-                device_map[f'model.layers.{i}'] = 'cuda'
-            else:
-                device_map[f'model.layers.{i}'] = 'cpu'
-        
-        logger.info(f"Device map configuration: {device_map}")
-        
+        logger.info("Loading model with default device mapping...")
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path,
             config=config,
             trust_remote_code=True,
-            device_map=device_map,
-            torch_dtype=torch.float16  # 使用 FP16 来减少内存使用
+            device_map="auto",
+            torch_dtype=torch.float16
         )
         self.model.eval()
         
@@ -101,10 +85,60 @@ class ModelWorker:
         
         logger.info("Model loaded successfully")
 
+    def _optimize_memory(self, input_length: int):
+        """根据输入长度动态调整模型层的设备分配"""
+        if input_length > 512:  # 对于长输入，将更多层移到 CPU
+            n_layers_gpu = int(self.n_layers * 0.5)  # 50% 的层在 GPU
+        else:
+            n_layers_gpu = int(self.n_layers * 0.7)  # 70% 的层在 GPU
+        
+        new_device_map = {
+            'model.embed_tokens': 'cuda',
+            'model.norm': 'cuda',
+            'lm_head': 'cuda',
+        }
+        
+        for i in range(self.n_layers):
+            if i < n_layers_gpu:
+                new_device_map[f'model.layers.{i}'] = 'cuda'
+            else:
+                new_device_map[f'model.layers.{i}'] = 'cpu'
+        
+        # 只在设备映射发生变化时才重新分配
+        if new_device_map != self.device_map:
+            logger.info("Adjusting model layer distribution...")
+            logger.info(f"Moving {self.n_layers - n_layers_gpu} layers to CPU")
+            
+            # 记录调整前的内存
+            before_mem = torch.cuda.memory_allocated() / 1024**2
+            
+            # 移动层到新设备
+            for name, device in new_device_map.items():
+                if hasattr(self.model, name):
+                    module = getattr(self.model, name)
+                    module.to(device)
+                else:
+                    try:
+                        module = self.model.get_submodule(name)
+                        module.to(device)
+                    except AttributeError:
+                        continue
+            
+            # 记录调整后的内存
+            after_mem = torch.cuda.memory_allocated() / 1024**2
+            logger.info(f"Memory change: {after_mem - before_mem:.1f}MB")
+            
+            self.device_map = new_device_map
+            torch.cuda.empty_cache()
+
     def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
         try:
             logger.info("Received generation request")
-            logger.info(f"Input sequence length: {len(input_data['input_ids'])}")
+            input_length = len(input_data['input_ids'])
+            logger.info(f"Input sequence length: {input_length}")
+            
+            # 根据输入长度优化内存
+            self._optimize_memory(input_length)
             
             # 创建输入张量
             logger.info("Moving input tensors to GPU...")

@@ -64,10 +64,24 @@ class ModelWorker:
         
         # 创建设备映射
         if self.num_gpus > 1:
-            # 在多个 GPU 之间平均分配模型层
-            device_map = "auto"
-            max_memory = {i: "40GiB" for i in range(self.num_gpus)}  # 为每个 GPU 分配内存
-            logger.info(f"Using device map: auto with max_memory: {max_memory}")
+            # 手动创建设备映射，确保使用所有 GPU
+            num_layers = config.num_hidden_layers
+            layers_per_gpu = num_layers // self.num_gpus
+            
+            device_map = {
+                'model.embed_tokens': 0,
+                'model.norm': self.num_gpus - 1,
+                'lm_head': self.num_gpus - 1,
+            }
+            
+            # 分配 transformer 层到不同 GPU
+            for i in range(num_layers):
+                gpu_id = min(i // layers_per_gpu, self.num_gpus - 1)
+                device_map[f'model.layers.{i}'] = gpu_id
+                
+            max_memory = {i: "40GiB" for i in range(self.num_gpus)}
+            logger.info(f"Using custom device map across {self.num_gpus} GPUs")
+            logger.info(f"Device map: {device_map}")
         else:
             device_map = "auto"
             max_memory = None
@@ -111,8 +125,10 @@ class ModelWorker:
             logger.info("Received generation request")
             logger.info(f"Input sequence length: {len(input_data['input_ids'])}")
             
-            input_ids = torch.tensor(input_data['input_ids'], device='cuda')
-            attention_mask = torch.tensor(input_data['attention_mask'], device='cuda')
+            # 对于多 GPU，我们使用第一个 GPU 作为输入设备
+            input_device = "cuda:0"
+            input_ids = torch.tensor(input_data['input_ids'], device=input_device)
+            attention_mask = torch.tensor(input_data['attention_mask'], device=input_device)
             
             # 优化生成参数
             generation_config = {

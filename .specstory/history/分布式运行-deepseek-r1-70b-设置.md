@@ -1720,6 +1720,133 @@ _**Assistant**_
 
 
 
+
+
+好的，让我们修改代码以使用多个 GPU。我们需要修改 worker.py 来支持多 GPU 并行：
+
+```python:ktransformers/worker.py
+class ModelWorker:
+    def __init__(self, address: str):
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.REP)
+        host, port = address.split(':')
+        self.socket.bind(f"tcp://0.0.0.0:{port}")
+        self.socket.setsockopt(zmq.RCVHWM, 0)
+        self.socket.setsockopt(zmq.SNDHWM, 0)
+        
+        # 设置 CPU 线程数
+        torch.set_num_threads(10)
+        
+        self.model = None
+        self.tokenizer = None
+        
+        # 获取可用的 GPU
+        self.num_gpus = torch.cuda.device_count()
+        logger.info(f"Found {self.num_gpus} GPUs")
+        
+        logger.info(f"Worker started at {address}, listening on all interfaces")
+        logger.info(f"CPU threads set to: {torch.get_num_threads()}")
+
+    def load_model(self, model_path: str, gguf_path: str):
+        logger.info("Loading tokenizer...")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        
+        logger.info("Loading model config...")
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        
+        # 优化模型配置
+        config.use_cache = True
+        config.pretraining_tp = 1
+        config.torch_dtype = torch.float16
+        torch.set_default_dtype(torch.float16)
+        
+        # 创建设备映射
+        if self.num_gpus > 1:
+            # 在多个 GPU 之间平均分配模型层
+            device_map = "auto"
+            max_memory = {i: "40GiB" for i in range(self.num_gpus)}  # 为每个 GPU 分配内存
+            logger.info(f"Using device map: auto with max_memory: {max_memory}")
+        else:
+            device_map = "auto"
+            max_memory = None
+        
+        logger.info("Loading model...")
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            config=config,
+            trust_remote_code=True,
+            device_map=device_map,
+            max_memory=max_memory,
+            torch_dtype=torch.float16,
+            low_cpu_mem_usage=True
+        )
+        self.model.eval()
+        
+        # 优化生成配置
+        try:
+            self.model.generation_config = GenerationConfig.from_pretrained(model_path)
+        except Exception as e:
+            logger.warning(f"Generation config can't auto create, making default. Message: {e}")
+            self.model.generation_config = GenerationConfig(
+                temperature=0.6,
+                top_p=0.9,
+                do_sample=True,
+                num_beams=1,
+                early_stopping=True,
+                use_cache=True
+            )
+        if self.model.generation_config.pad_token_id is None:
+            self.model.generation_config.pad_token_id = self.model.generation_config.eos_token_id
+            
+        logger.info("Model loaded successfully")
+        if self.num_gpus > 1:
+            logger.info("Model distributed across multiple GPUs")
+            for name, param in self.model.named_parameters():
+                logger.info(f"Parameter {name} on device: {param.device}")
+
+    # ... rest of the code remains the same ...
+```
+
+
+现在运行时：
+
+```bash
+# 使用所有可用的 GPU
+CUDA_VISIBLE_DEVICES=0,1 python -m ktransformers.worker --worker_address "127.0.0.1:29500"
+```
+
+
+主要改动：
+1. 自动检测可用的 GPU 数量
+2. 在多个 GPU 之间自动分配模型层
+3. 为每个 GPU 分配合适的内存限制
+4. 添加了详细的设备分配日志
+
+这样应该能充分利用两块 GPU 的性能。模型的不同层会被自动分配到不同的 GPU 上，可以：
+1. 增加总可用显存
+2. 在某些情况下提高推理速度
+3. 更好地利用硬件资源
+
+如果需要更细粒度的控制或其他优化，请告诉我。
+
+---
+
+_**User**_
+
+现在可以识别到俩gpu，但只使用了一块
+
+---
+
+_**Assistant**_
+
+
+
+让我们修改代码来强制使用两块 GPU。问题可能出在设备映射上，我们需要明确指定模型层的分布：
+
+```python:ktransformers/worker.py
+def load_model(self, model_path: str, gguf_path: str):
+    logger.info
+
 ---
 
 

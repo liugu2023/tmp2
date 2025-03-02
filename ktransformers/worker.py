@@ -36,13 +36,13 @@ class ModelWorker:
         self.socket.setsockopt(zmq.RCVHWM, 0)
         self.socket.setsockopt(zmq.SNDHWM, 0)
         
-        # 设置 GPU 内存限制
-        torch.cuda.set_per_process_memory_fraction(0.75)  # 限制 GPU 内存使用为总量的 75%
+        # 设置 GPU 内存限制到 14GB
+        torch.cuda.set_per_process_memory_fraction(0.88)  # 设置为总显存的 88%，约 14GB
         
         self.model = None
         self.tokenizer = None
         logger.info(f"Worker started at {address}, listening on all interfaces")
-        logger.info(f"GPU memory limit set to 12GB")
+        logger.info(f"GPU memory limit set to 14GB")
 
     def load_model(self, model_path: str, gguf_path: str):
         logger.info("Loading tokenizer...")
@@ -53,9 +53,14 @@ class ModelWorker:
         torch.set_default_dtype(config.torch_dtype)
         
         logger.info("Loading model...")
-        # 设置设备映射，将部分层卸载到 CPU
-        max_memory = {0: "12GB", "cpu": "128GB"}  # 限制 GPU 使用 12GB，CPU 使用 128GB
-        device_map = "auto"
+        # 设置设备映射，将计算密集型层放在 GPU 上
+        device_map = {
+            'model.embed_tokens': 'cuda',  # 词嵌入层放在 GPU
+            'model.norm': 'cuda',          # 归一化层放在 GPU
+            'lm_head': 'cuda',             # 语言模型头放在 GPU
+            'model.layers': 'auto'         # 其他层自动分配
+        }
+        max_memory = {0: "14GB", "cpu": "128GB"}  # 调整 GPU 内存到 14GB
         
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path,
@@ -63,8 +68,7 @@ class ModelWorker:
             trust_remote_code=True,
             device_map=device_map,
             max_memory=max_memory,
-            offload_folder="offload",  # 设置模型权重卸载目录
-            offload_state_dict=True    # 启用状态字典卸载
+            offload_folder="offload"
         )
         self.model.eval()
         
@@ -93,7 +97,7 @@ class ModelWorker:
             logger.info("Received generation request")
             logger.info(f"Input sequence length: {len(input_data['input_ids'])}")
             
-            # 创建输入张量
+            # 创建输入张量并放在 GPU 上
             input_ids = torch.tensor(input_data['input_ids'], device='cuda')
             attention_mask = torch.tensor(input_data['attention_mask'], device='cuda')
             

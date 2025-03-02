@@ -1276,6 +1276,161 @@ _**Assistant**_
 
 
 
+让我们在代码中添加更详细的日志记录，以便了解程序的执行流程：
+
+```python:ktransformers/worker.py
+def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        logger.info("Received generation request")
+        logger.info(f"Input sequence length: {len(input_data['input_ids'])}")
+        
+        # 创建输入张量
+        logger.info("Moving input tensors to GPU...")
+        input_ids = torch.tensor(input_data['input_ids'], device='cuda')
+        attention_mask = torch.tensor(input_data['attention_mask'], device='cuda')
+        
+        # 生成参数日志
+        logger.info(f"Generation parameters: max_new_tokens={input_data.get('max_new_tokens', 512)}, "
+                   f"temperature={input_data.get('temperature', 0.7)}, "
+                   f"top_p={input_data.get('top_p', 0.9)}")
+        
+        # 生成文本
+        logger.info("Starting text generation...")
+        with torch.no_grad(), torch.amp.autocast('cuda'):
+            outputs = self.model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=input_data.get('max_new_tokens', 512),
+                temperature=input_data.get('temperature', 0.7),
+                top_p=input_data.get('top_p', 0.9),
+                do_sample=input_data.get('do_sample', True)
+            )
+        
+        logger.info(f"Generation completed. Output sequence length: {len(outputs[0])}")
+        
+        # 移动到CPU
+        logger.info("Moving outputs to CPU...")
+        outputs_cpu = outputs.to('cpu', non_blocking=True)
+        torch.cuda.synchronize()
+        
+        logger.info("Preparing response...")
+        return {
+            'output_ids': outputs_cpu.numpy().tolist(),
+            'status': 'success'
+        }
+    except Exception as e:
+        logger.error(f"Generation error: {str(e)}")
+        return {
+            'status': 'error',
+            'error': str(e)
+        }
+```
+
+同时在 local_chat.py 中也添加详细日志：
+
+```python:ktransformers/local_chat.py
+def generate(self, input_ids, attention_mask, **kwargs):
+    try:
+        logger.info("Preparing generation request...")
+        message = {
+            'command': 'generate',
+            'data': {
+                'input_ids': input_ids.cpu().numpy().tolist(),
+                'attention_mask': attention_mask.cpu().numpy().tolist(),
+                **kwargs
+            }
+        }
+        
+        logger.info("Sending request to worker...")
+        self.socket.send_pyobj(message)
+        
+        logger.info("Waiting for response...")
+        response = self.socket.recv_pyobj()
+        
+        if response['status'] == 'success':
+            logger.info("Response received successfully")
+            return torch.tensor(response['output_ids'])
+        else:
+            logger.error(f"Generation failed: {response.get('error')}")
+            raise Exception(f"Generation failed: {response.get('error')}")
+    except Exception as e:
+        logger.error(f"Error in generate: {str(e)}")
+        raise
+
+# 在主循环中也添加日志
+while True:
+    try:
+        content = input("Chat: ")
+        if content.lower() in ['quit', 'exit']:
+            break
+            
+        logger.info("Processing input...")
+        if content == "":
+            if args.prompt_file is not None:
+                logger.info(f"Reading from prompt file: {args.prompt_file}")
+                with open(args.prompt_file, "r", encoding='utf-8') as f:
+                    content = f.read()
+            else:
+                content = "Please write a piece of quicksort code in C++."
+        elif os.path.isfile(content):
+            logger.info(f"Reading from file: {content}")
+            with open(content, "r", encoding='utf-8') as f:
+                content = f.read()
+        
+        logger.info("Creating chat messages...")
+        messages = [{"role": "user", "content": content}]
+        
+        logger.info("Tokenizing input...")
+        input_tensor = tokenizer.apply_chat_template(
+            messages, add_generation_prompt=True, return_tensors="pt"
+        )
+        
+        logger.info("Starting generation...")
+        outputs = model.generate(
+            input_tensor,
+            torch.ones_like(input_tensor),
+            max_new_tokens=args.max_new_tokens,
+            temperature=0.7,
+            top_p=0.9,
+            do_sample=True
+        )
+        
+        logger.info("Decoding response...")
+        response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        print("\nAssistant:", response)
+```
+
+现在您应该能看到详细的执行流程：
+1. 输入处理
+2. 消息创建和标记化
+3. 发送请求到 worker
+4. worker 接收和处理请求
+5. 模型生成过程
+6. 响应处理和解码
+7. 最终输出
+
+每个步骤都会有相应的日志输出，这样您就能清楚地知道程序在每个时刻在做什么。要查看这些日志，您可以在运行时设置更详细的日志级别：
+
+```bash
+export PYTHONPATH=/archive/liugu/ds/ktransformers
+python -m ktransformers.local_chat \
+    --model_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/ \
+    --gguf_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/ \
+    --worker_address "10.21.22.206:29500"
+```
+
+---
+
+_**User**_
+
+生成太慢了，查看逻辑，CPU内核分配30个，temperature设置为0.6
+
+---
+
+_**Assistant**_
+
+
+
 ---
 
 

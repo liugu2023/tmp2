@@ -36,9 +36,13 @@ class ModelWorker:
         self.socket.setsockopt(zmq.RCVHWM, 0)
         self.socket.setsockopt(zmq.SNDHWM, 0)
         
+        # 设置 CPU 线程数
+        torch.set_num_threads(30)  # 设置 CPU 线程数为 30
+        
         self.model = None
         self.tokenizer = None
         logger.info(f"Worker started at {address}, listening on all interfaces")
+        logger.info(f"CPU threads set to: {torch.get_num_threads()}")
 
     def load_model(self, model_path: str, gguf_path: str):
         logger.info("Loading tokenizer...")
@@ -77,36 +81,29 @@ class ModelWorker:
             logger.info("Received generation request")
             logger.info(f"Input sequence length: {len(input_data['input_ids'])}")
             
-            # 创建输入张量
-            logger.info("Moving input tensors to GPU...")
             input_ids = torch.tensor(input_data['input_ids'], device='cuda')
             attention_mask = torch.tensor(input_data['attention_mask'], device='cuda')
             
-            # 生成参数日志
             logger.info(f"Generation parameters: max_new_tokens={input_data.get('max_new_tokens', 512)}, "
-                       f"temperature={input_data.get('temperature', 0.7)}, "
+                       f"temperature={input_data.get('temperature', 0.6)}, "  # 修改默认温度
                        f"top_p={input_data.get('top_p', 0.9)}")
             
-            # 生成文本
             logger.info("Starting text generation...")
             with torch.no_grad(), torch.amp.autocast('cuda'):
                 outputs = self.model.generate(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     max_new_tokens=input_data.get('max_new_tokens', 512),
-                    temperature=input_data.get('temperature', 0.7),
+                    temperature=input_data.get('temperature', 0.6),  # 修改温度为 0.6
                     top_p=input_data.get('top_p', 0.9),
                     do_sample=input_data.get('do_sample', True)
                 )
             
             logger.info(f"Generation completed. Output sequence length: {len(outputs[0])}")
             
-            # 移动到CPU
-            logger.info("Moving outputs to CPU...")
             outputs_cpu = outputs.to('cpu', non_blocking=True)
             torch.cuda.synchronize()
             
-            logger.info("Preparing response...")
             return {
                 'output_ids': outputs_cpu.numpy().tolist(),
                 'status': 'success'

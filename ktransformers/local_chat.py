@@ -216,7 +216,7 @@ def local_chat(
                 input_tensor,
                 torch.ones_like(input_tensor),
                 max_new_tokens=max_new_tokens,
-                temperature=0.7,
+                temperature=0.6,
                 top_p=0.9,
                 do_sample=True
             )
@@ -264,6 +264,10 @@ def main():
         model.load_model(args.model_path, args.gguf_path)
         tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
         
+        # 设置 CPU 线程数
+        torch.set_num_threads(30)
+        logger.info(f"CPU threads set to: {torch.get_num_threads()}")
+        
         while True:
             try:
                 content = input("Chat: ")
@@ -296,7 +300,7 @@ def main():
                     input_tensor,
                     torch.ones_like(input_tensor),
                     max_new_tokens=args.max_new_tokens,
-                    temperature=0.7,
+                    temperature=0.6,
                     top_p=0.9,
                     do_sample=True
                 )

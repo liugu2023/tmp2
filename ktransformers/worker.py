@@ -11,7 +11,8 @@ class ModelWorker:
     def __init__(self, address: str):
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.REP)
-        self.socket.bind(f"tcp://{address}")
+        host, port = address.split(':')
+        self.socket.bind(f"tcp://*:{port}")
         self.model = None
         self.tokenizer = None
         logger.info(f"Worker started at {address}")

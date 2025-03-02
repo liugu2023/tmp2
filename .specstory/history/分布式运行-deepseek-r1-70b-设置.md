@@ -280,6 +280,111 @@ python -m ktransformers.local_chat \
 
 ---
 
+_**User**_
+
+我会手动安装依赖，告诉我所需以来
+
+---
+
+_**Assistant**_
+
+好的，这个分布式系统需要安装以下依赖：
+
+```bash
+pip install pyzmq>=24.0.0  # 用于进程间通信
+```
+
+这是唯一需要额外安装的依赖，其他所需的依赖项（如 torch 等）应该已经在原项目中安装好了。
+
+安装完依赖后，您可以按以下步骤运行分布式系统：
+
+1. 在 GPU 机器 (10.21.22.206) 上运行 worker：
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0 python -m ktransformers.worker --worker_address "10.21.22.206:29500"
+```
+
+2. 在 CPU 机器 (10.21.22.100) 上运行主程序：
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.local_chat \
+    --model_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/ \
+    --gguf_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/ \
+    --worker_address "10.21.22.206:29500"
+```
+
+我已经实现了：
+1. 基于 ZMQ 的进程间通信
+2. GPU 计算与 CPU 输入输出分离
+3. 错误处理和日志记录
+4. 支持所有原有的生成参数
+
+如果运行时遇到任何问题，请告诉我具体的错误信息。
+
+---
+
+_**User**_
+
+(ds) root@login:/archive/liugu/ds/ktransformers# PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0 python -m ktransformers.worker --worker_address "10.21.22.206:29500"
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 84, in <module>
+    main()
+    ^^^^^^
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 80, in main
+    worker = ModelWorker(args.worker_address)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 14, in __init__
+    self.socket.bind(f"tcp://{address}")
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/zmq/sugar/socket.py", line 317, in bind
+    super().bind(addr)
+  File "_zmq.py", line 917, in zmq.backend.cython._zmq.Socket.bind
+  File "_zmq.py", line 179, in zmq.backend.cython._zmq._check_rc
+zmq.error.ZMQError: Cannot assign requested address (addr='tcp://10.21.22.206:29500')
+
+---
+
+_**Assistant**_
+
+
+
+这个错误是因为我们在绑定地址时需要使用 "*" 来表示监听所有网络接口，或者使用具体的本地IP地址。让我修改一下 worker.py：
+
+```python:ktransformers/worker.py
+# ... existing code ...
+
+class ModelWorker:
+    def __init__(self, address: str):
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.REP)
+        # 修改绑定地址格式
+        host, port = address.split(':')
+        self.socket.bind(f"tcp://*:{port}")  # 使用 * 监听所有接口
+        self.model = None
+        self.tokenizer = None
+        logger.info(f"Worker started at {address}")
+
+# ... rest of the existing code ...
+```
+
+现在您可以这样运行 worker：
+
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0 python -m ktransformers.worker --worker_address "10.21.22.206:29500"
+```
+
+对应的，在 CPU 机器上运行主程序时，需要使用完整的 IP 地址：
+
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.local_chat \
+    --model_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/ \
+    --gguf_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/ \
+    --worker_address "10.21.22.206:29500"
+```
+
+这样修改后，worker 应该可以正常启动了。如果还有其他问题，请告诉我。
+
+---
+
 
 
 ---

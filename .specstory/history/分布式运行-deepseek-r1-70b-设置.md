@@ -1431,6 +1431,129 @@ _**Assistant**_
 
 
 
+好的，让我们优化一下生成参数和资源分配。我们需要修改两个文件：
+
+```python:ktransformers/worker.py
+def __init__(self, address: str):
+    self.context = zmq.Context()
+    self.socket = self.context.socket(zmq.REP)
+    host, port = address.split(':')
+    self.socket.bind(f"tcp://0.0.0.0:{port}")
+    self.socket.setsockopt(zmq.RCVHWM, 0)
+    self.socket.setsockopt(zmq.SNDHWM, 0)
+    
+    # 设置 CPU 线程数
+    torch.set_num_threads(30)  # 设置 CPU 线程数为 30
+    
+    self.model = None
+    self.tokenizer = None
+    logger.info(f"Worker started at {address}, listening on all interfaces")
+    logger.info(f"CPU threads set to: {torch.get_num_threads()}")
+
+def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        logger.info("Received generation request")
+        logger.info(f"Input sequence length: {len(input_data['input_ids'])}")
+        
+        input_ids = torch.tensor(input_data['input_ids'], device='cuda')
+        attention_mask = torch.tensor(input_data['attention_mask'], device='cuda')
+        
+        logger.info(f"Generation parameters: max_new_tokens={input_data.get('max_new_tokens', 512)}, "
+                   f"temperature={input_data.get('temperature', 0.6)}, "  # 修改默认温度
+                   f"top_p={input_data.get('top_p', 0.9)}")
+        
+        logger.info("Starting text generation...")
+        with torch.no_grad(), torch.amp.autocast('cuda'):
+            outputs = self.model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=input_data.get('max_new_tokens', 512),
+                temperature=input_data.get('temperature', 0.6),  # 修改温度为 0.6
+                top_p=input_data.get('top_p', 0.9),
+                do_sample=input_data.get('do_sample', True)
+            )
+        
+        logger.info(f"Generation completed. Output sequence length: {len(outputs[0])}")
+        
+        outputs_cpu = outputs.to('cpu', non_blocking=True)
+        torch.cuda.synchronize()
+        
+        return {
+            'output_ids': outputs_cpu.numpy().tolist(),
+            'status': 'success'
+        }
+    except Exception as e:
+        logger.error(f"Generation error: {str(e)}")
+        return {
+            'status': 'error',
+            'error': str(e)
+        }
+```
+
+```python:ktransformers/local_chat.py
+def main():
+    # ... 其他代码保持不变 ...
+
+    if args.worker_address:
+        # 分布式模式
+        logger.info("Running in distributed mode")
+        model = DistributedModel(args.worker_address)
+        model.load_model(args.model_path, args.gguf_path)
+        tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+        
+        # 设置 CPU 线程数
+        torch.set_num_threads(30)
+        logger.info(f"CPU threads set to: {torch.get_num_threads()}")
+        
+        while True:
+            try:
+                content = input("Chat: ")
+                if content.lower() in ['quit', 'exit']:
+                    break
+                    
+                logger.info("Processing input...")
+                # ... 其他代码保持不变 ...
+                
+                logger.info("Starting generation...")
+                outputs = model.generate(
+                    input_tensor,
+                    torch.ones_like(input_tensor),
+                    max_new_tokens=args.max_new_tokens,
+                    temperature=0.6,  # 修改温度为 0.6
+                    top_p=0.9,
+                    do_sample=True
+                )
+                
+                logger.info("Decoding response...")
+                response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+                print("\nAssistant:", response)
+```
+
+主要优化：
+1. 设置 CPU 线程数为 30
+2. 将 temperature 从 0.7 降低到 0.6，这会使生成更加确定性，通常会更快
+3. 在两端都设置了 CPU 线程数，确保资源充分利用
+
+这些修改应该能提高生成速度。如果还需要进一步优化，我们可以：
+1. 调整 batch_size
+2. 减小 max_new_tokens
+3. 进一步调整 temperature 和 top_p
+4. 使用更激进的 torch.cuda.amp 设置
+
+请告诉我运行效果如何。
+
+---
+
+_**User**_
+
+不要使用10.21.22.206的cpu，哪个cpu太老了
+
+---
+
+_**Assistant**_
+
+
+
 ---
 
 

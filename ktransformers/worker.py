@@ -36,13 +36,10 @@ class ModelWorker:
         self.socket.setsockopt(zmq.RCVHWM, 0)
         self.socket.setsockopt(zmq.SNDHWM, 0)
         
-        # 设置 CPU 线程数
-        torch.set_num_threads(30)  # 设置 CPU 线程数为 30
-        
+        # 移除 CPU 线程设置，因为我们不想使用这台机器的 CPU
         self.model = None
         self.tokenizer = None
         logger.info(f"Worker started at {address}, listening on all interfaces")
-        logger.info(f"CPU threads set to: {torch.get_num_threads()}")
 
     def load_model(self, model_path: str, gguf_path: str):
         logger.info("Loading tokenizer...")
@@ -53,11 +50,12 @@ class ModelWorker:
         torch.set_default_dtype(config.torch_dtype)
         
         logger.info("Loading model...")
+        # 强制模型加载到 GPU
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path,
             config=config,
             trust_remote_code=True,
-            device_map="auto"
+            device_map="cuda"  # 修改为直接使用 CUDA，而不是 auto
         )
         self.model.eval()
         
@@ -67,7 +65,7 @@ class ModelWorker:
         except Exception as e:
             logger.warning(f"Generation config can't auto create, making default. Message: {e}")
             self.model.generation_config = GenerationConfig(
-                temperature=0.7,
+                temperature=0.6,
                 top_p=0.9,
                 do_sample=True
             )
@@ -81,11 +79,12 @@ class ModelWorker:
             logger.info("Received generation request")
             logger.info(f"Input sequence length: {len(input_data['input_ids'])}")
             
+            # 直接在 GPU 上创建张量
             input_ids = torch.tensor(input_data['input_ids'], device='cuda')
             attention_mask = torch.tensor(input_data['attention_mask'], device='cuda')
             
             logger.info(f"Generation parameters: max_new_tokens={input_data.get('max_new_tokens', 512)}, "
-                       f"temperature={input_data.get('temperature', 0.6)}, "  # 修改默认温度
+                       f"temperature={input_data.get('temperature', 0.6)}, "
                        f"top_p={input_data.get('top_p', 0.9)}")
             
             logger.info("Starting text generation...")
@@ -94,13 +93,15 @@ class ModelWorker:
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     max_new_tokens=input_data.get('max_new_tokens', 512),
-                    temperature=input_data.get('temperature', 0.6),  # 修改温度为 0.6
+                    temperature=input_data.get('temperature', 0.6),
                     top_p=input_data.get('top_p', 0.9),
-                    do_sample=input_data.get('do_sample', True)
+                    do_sample=input_data.get('do_sample', True),
+                    use_cache=True  # 确保使用 KV 缓存
                 )
             
             logger.info(f"Generation completed. Output sequence length: {len(outputs[0])}")
             
+            # 异步传输到 CPU
             outputs_cpu = outputs.to('cpu', non_blocking=True)
             torch.cuda.synchronize()
             

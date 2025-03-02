@@ -2143,7 +2143,117 @@ Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
 
 _**Assistant**_
 
+看起来是因为系统只有一个 GPU 可用。让我们修改代码，先检查可用的 GPU 数量：
 
+```python:ktransformers/worker.py
+def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        logger.info("Received generation request")
+        logger.info(f"Input sequence length: {len(input_data['input_ids'])}")
+        
+        # 检查可用的 GPU 数量
+        gpu_count = torch.cuda.device_count()
+        logger.info(f"Available GPUs: {gpu_count}")
+        
+        if gpu_count >= 2:
+            # 多 GPU 模式
+            main_gpu = torch.device("cuda:0")
+            infer_gpu = torch.device("cuda:1")
+            logger.info(f"Using GPU 0 for model storage and GPU 1 for inference")
+            
+            # 创建输入张量到推理 GPU
+            logger.info("Moving input tensors to inference GPU...")
+            input_ids = torch.tensor(input_data['input_ids'], device=infer_gpu)
+            attention_mask = torch.tensor(input_data['attention_mask'], device=infer_gpu)
+            
+            # ... 多 GPU 的代码 ...
+            
+        else:
+            # 单 GPU 模式
+            logger.info("Only one GPU available, using single GPU mode")
+            input_ids = torch.tensor(input_data['input_ids'], device='cuda')
+            attention_mask = torch.tensor(input_data['attention_mask'], device='cuda')
+            
+            # 生成参数日志
+            max_new_tokens = input_data.get('max_new_tokens', 50)
+            temperature = input_data.get('temperature', 0.6)
+            top_p = input_data.get('top_p', 0.9)
+            logger.info(f"Generation parameters: max_new_tokens={max_new_tokens}, "
+                       f"temperature={temperature}, "
+                       f"top_p={top_p}")
+            
+            # 生成文本
+            logger.info("Starting text generation...")
+            start_time = time.time()
+            
+            with torch.no_grad(), torch.amp.autocast('cuda'):
+                logger.info("Initializing generation process...")
+                logger.info("- Checking model state...")
+                logger.info(f"- Model device: {self.model.device}")
+                logger.info(f"- Input shape: {input_ids.shape}")
+                logger.info(f"- Current GPU memory allocated: {torch.cuda.memory_allocated()/1024**3:.2f}GB")
+                
+                # 其他初始化信息...
+                streamer = TextStreamer(
+                    self.tokenizer, 
+                    skip_prompt=True,
+                    skip_special_tokens=True
+                )
+                
+                outputs = self.model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    do_sample=input_data.get('do_sample', True),
+                    streamer=streamer
+                )
+        
+        # 后续处理代码保持不变...
+
+```
+
+运行命令：
+
+1. 如果有两个 GPU：
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0,1 python -m ktransformers.worker --worker_address "10.21.22.206:29500"
+```
+
+2. 如果只有一个 GPU：
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0 python -m ktransformers.worker --worker_address "10.21.22.206:29500"
+```
+
+这样代码会根据可用的 GPU 数量自动选择合适的模式。如果需要其他调整，请告诉我。
+
+---
+
+_**User**_
+
+WARNING:accelerate.big_modeling:Some parameters are on the meta device because they were offloaded to the cpu.
+INFO:__main__:Model loaded successfully
+INFO:__main__:Received generation request
+INFO:__main__:Input sequence length: 1
+INFO:__main__:Available GPUs: 2
+INFO:__main__:Using GPU 0 for model storage and GPU 1 for inference
+INFO:__main__:Moving input tensors to inference GPU...
+INFO:__main__:Generation parameters: max_new_tokens=50, temperature=0.7, top_p=0.9
+INFO:__main__:Starting text generation...
+INFO:__main__:Initializing generation process...
+INFO:__main__:- Checking model state...
+INFO:__main__:- Model device: cuda:0
+INFO:__main__:- Input shape: torch.Size([1, 7])
+INFO:__main__:- GPU 0 memory allocated: 13.11GB
+INFO:__main__:- GPU 1 memory allocated: 14.34GB
+INFO:__main__:- Moving necessary model parts to inference GPU...
+INFO:__main__:- Model architecture:
+INFO:__main__:  - Number of layers: 80
+INFO:__main__:  - Hidden size: 8192
+INFO:__main__:- Estimated KV cache size: 0.14GB
+INFO:__main__:- Attention implementation: sdpa
+ERROR:__main__:Generation error: 'LlamaForCausalLM' object has no attribute 'parallelize'
 
 ---
 

@@ -1636,6 +1636,95 @@ def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
 
 ---
 
+_**User**_
+
+再把模型卸载到cpu上一部分，现在想显存不够
+
+---
+
+_**Assistant**_
+
+
+
+让我们修改代码来优化显存使用，将一部分模型层卸载到 CPU：
+
+```python:ktransformers/worker.py
+def load_model(self, model_path: str, gguf_path: str):
+    logger.info("Loading tokenizer...")
+    self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    
+    logger.info("Loading model config...")
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    torch.set_default_dtype(config.torch_dtype)
+    
+    logger.info("Loading model...")
+    # 创建自定义设备映射
+    n_layers = config.num_hidden_layers
+    n_layers_gpu = int(n_layers * 0.7)  # 70% 的层在 GPU 上
+    
+    device_map = {
+        'model.embed_tokens': 'cuda',
+        'model.norm': 'cuda',
+        'lm_head': 'cuda',
+    }
+    
+    # 分配transformer层
+    for i in range(n_layers):
+        if i < n_layers_gpu:
+            device_map[f'model.layers.{i}'] = 'cuda'
+        else:
+            device_map[f'model.layers.{i}'] = 'cpu'
+    
+    logger.info(f"Device map configuration: {device_map}")
+    
+    self.model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        config=config,
+        trust_remote_code=True,
+        device_map=device_map,
+        torch_dtype=torch.float16  # 使用 FP16 来减少内存使用
+    )
+    self.model.eval()
+    
+    # 设置生成配置
+    try:
+        self.model.generation_config = GenerationConfig.from_pretrained(model_path)
+    except Exception as e:
+        logger.warning(f"Generation config can't auto create, making default. Message: {e}")
+        self.model.generation_config = GenerationConfig(
+            temperature=0.7,
+            top_p=0.9,
+            do_sample=True
+        )
+    if self.model.generation_config.pad_token_id is None:
+        self.model.generation_config.pad_token_id = self.model.generation_config.eos_token_id
+    
+    # 打印每个设备的内存使用情况
+    logger.info("Initial memory usage after model loading:")
+    logger.info("GPU Memory Usage:")
+    for i in range(torch.cuda.device_count()):
+        mem_allocated = torch.cuda.memory_allocated(i) / 1024**2
+        mem_reserved = torch.cuda.memory_reserved(i) / 1024**2
+        logger.info(f"  GPU {i}: Allocated: {mem_allocated:.1f}MB, Reserved: {mem_reserved:.1f}MB")
+    
+    logger.info("Model loaded successfully")
+```
+
+主要改动：
+1. 将 30% 的 transformer 层放在 CPU 上
+2. 使用 float16 精度
+3. 将关键层（embedding、最终层范化、语言模型头）保留在 GPU 上
+4. 添加了内存使用情况的详细日志
+
+这样设置后，模型会：
+1. 在生成时自动处理 CPU-GPU 之间的数据传输
+2. 减少 GPU 显存使用
+3. 可能会稍微降低一些速度，但能保证模型能够运行
+
+如
+
+---
+
 
 
 ---

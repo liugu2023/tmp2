@@ -50,11 +50,31 @@ class ModelWorker:
         torch.set_default_dtype(config.torch_dtype)
         
         logger.info("Loading model...")
+        # 创建自定义设备映射
+        n_layers = config.num_hidden_layers
+        n_layers_gpu = int(n_layers * 0.7)  # 70% 的层在 GPU 上
+        
+        device_map = {
+            'model.embed_tokens': 'cuda',
+            'model.norm': 'cuda',
+            'lm_head': 'cuda',
+        }
+        
+        # 分配transformer层
+        for i in range(n_layers):
+            if i < n_layers_gpu:
+                device_map[f'model.layers.{i}'] = 'cuda'
+            else:
+                device_map[f'model.layers.{i}'] = 'cpu'
+        
+        logger.info(f"Device map configuration: {device_map}")
+        
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path,
             config=config,
             trust_remote_code=True,
-            device_map="auto"
+            device_map=device_map,
+            torch_dtype=torch.float16  # 使用 FP16 来减少内存使用
         )
         self.model.eval()
         
@@ -70,7 +90,15 @@ class ModelWorker:
             )
         if self.model.generation_config.pad_token_id is None:
             self.model.generation_config.pad_token_id = self.model.generation_config.eos_token_id
-            
+        
+        # 打印每个设备的内存使用情况
+        logger.info("Initial memory usage after model loading:")
+        logger.info("GPU Memory Usage:")
+        for i in range(torch.cuda.device_count()):
+            mem_allocated = torch.cuda.memory_allocated(i) / 1024**2
+            mem_reserved = torch.cuda.memory_reserved(i) / 1024**2
+            logger.info(f"  GPU {i}: Allocated: {mem_allocated:.1f}MB, Reserved: {mem_reserved:.1f}MB")
+        
         logger.info("Model loaded successfully")
 
     def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:

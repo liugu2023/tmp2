@@ -33,20 +33,38 @@ class ModelWorker:
         self.socket = self.context.socket(zmq.REP)
         host, port = address.split(':')
         self.socket.bind(f"tcp://*:{port}")
+        self.socket.setsockopt(zmq.RCVHWM, 0)
+        self.socket.setsockopt(zmq.SNDHWM, 0)
+        self.socket.setsockopt(zmq.TCP_IB, 1)
+        
         self.model = None
         self.tokenizer = None
-        logger.info(f"Worker started at {address}")
+        logger.info(f"Worker started at {address} using IB network")
 
     def load_model(self, model_path: str, gguf_path: str):
-        self.model, self.tokenizer = load_model_and_tokenizer(model_path, gguf_path)
+        logger.info("Loading tokenizer...")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        
+        logger.info("Loading model config...")
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        torch.set_default_dtype(config.torch_dtype)
+        
+        logger.info("Loading model...")
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            config=config,
+            trust_remote_code=True,
+            device_map="auto"
+        )
+        self.model.eval()
         logger.info("Model loaded successfully")
 
     def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
         try:
-            input_ids = torch.tensor(input_data['input_ids']).cuda()
-            attention_mask = torch.tensor(input_data['attention_mask']).cuda()
+            input_ids = torch.tensor(input_data['input_ids'], device='cuda')
+            attention_mask = torch.tensor(input_data['attention_mask'], device='cuda')
             
-            with torch.no_grad():
+            with torch.no_grad(), torch.cuda.amp.autocast():
                 outputs = self.model.generate(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
@@ -56,8 +74,11 @@ class ModelWorker:
                     do_sample=input_data.get('do_sample', True)
                 )
             
+            outputs_cpu = outputs.to('cpu', non_blocking=True)
+            torch.cuda.synchronize()
+            
             return {
-                'output_ids': outputs.cpu().numpy().tolist(),
+                'output_ids': outputs_cpu.numpy().tolist(),
                 'status': 'success'
             }
         except Exception as e:

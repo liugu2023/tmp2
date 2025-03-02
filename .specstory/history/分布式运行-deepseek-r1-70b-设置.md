@@ -469,6 +469,172 @@ _**Assistant**_
 
 
 
+明白了，我们需要修改 local_chat.py 中的代码，让它在分布式模式下跳过本地模型加载的步骤。让我们修改 local_chat.py：
+
+```python:ktransformers/local_chat.py
+# ... existing code ...
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--model_path', type=str, required=True)
+    parser.add_argument('--gguf_path', type=str, required=True)
+    parser.add_argument('--worker_address', type=str, default=None,
+                      help='Address of worker for distributed mode (e.g., "10.21.22.206:29500")')
+    parser.add_argument('--max_new_tokens', type=int, default=300)
+    parser.add_argument('--cpu_infer', type=int, default=Config().cpu_infer)
+    parser.add_argument('--use_cuda_graph', type=bool, default=True)
+    parser.add_argument('--prompt_file', type=str, default=None)
+    parser.add_argument('--mode', type=str, default="normal")
+    parser.add_argument('--force_think', type=bool, default=False)
+    parser.add_argument('--chunk_prefill_size', type=int, default=8192)
+    args = parser.parse_args()
+
+    if args.worker_address:
+        # 分布式模式
+        logger.info("Running in distributed mode")
+        model = DistributedModel(args.worker_address)
+        model.load_model(args.model_path, args.gguf_path)
+        tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+        
+        while True:
+            content = input("Chat: ")
+            if content == "":
+                if args.prompt_file is not None:
+                    content = open(args.prompt_file, "r").read()
+                else:
+                    content = "Please write a piece of quicksort code in C++."
+            elif os.path.isfile(content):
+                content = open(content, "r").read()
+                
+            messages = [{"role": "user", "content": content}]
+            input_tensor = tokenizer.apply_chat_template(
+                messages, add_generation_prompt=True, return_tensors="pt"
+            )
+            
+            outputs = model.generate(
+                input_tensor,
+                torch.ones_like(input_tensor),
+                max_new_tokens=args.max_new_tokens,
+                temperature=0.7,
+                top_p=0.9,
+                do_sample=True
+            )
+            
+            response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+            print("Assistant:", response)
+    else:
+        # 本地模式
+        local_chat(
+            model_path=args.model_path,
+            gguf_path=args.gguf_path,
+            max_new_tokens=args.max_new_tokens,
+            cpu_infer=args.cpu_infer,
+            use_cuda_graph=args.use_cuda_graph,
+            prompt_file=args.prompt_file,
+            mode=args.mode,
+            force_think=args.force_think,
+            chunk_prefill_size=args.chunk_prefill_size
+        )
+
+if __name__ == "__main__":
+    fire.Fire(main)
+```
+
+主要改动：
+1. 在分布式模式下，只加载 tokenizer，不加载完整模型
+2. 简化了分布式模式下的交互逻辑
+3. 保持了原有的本地模式功能
+
+现在再次运行：
+
+1. GPU 机器 (10.21.22.206):
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0 python -m ktransformers.worker --worker_address "10.21.22.206:29500"
+```
+
+2. CPU 机器 (10.21.22.100):
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.local_chat \
+    --model_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/ \
+    --gguf_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/ \
+    --worker_address "10.21.22.206:29500"
+```
+
+这样应该就不会卡在 flashinfer 检测那里了。如果还有其他问题，请告诉我。
+
+---
+
+_**User**_
+
+节点间有40G的IB卡互联，更改分布式结构
+
+---
+
+_**Assistant**_
+
+明白了，我们可以利用 InfiniBand 网络来优化分布式通信。让我们修改代码以使用 IB 网络：
+
+```python:ktransformers/worker.py
+import torch
+import zmq
+from typing import Dict, Any
+import logging
+from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class ModelWorker:
+    def __init__(self, address: str):
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.REP)
+        host, port = address.split(':')
+        # 使用 IB 网络
+        self.socket.bind(f"tcp://*:{port}")
+        self.socket.setsockopt(zmq.RCVHWM, 0)  # 无限接收缓冲
+        self.socket.setsockopt(zmq.SNDHWM, 0)  # 无限发送缓冲
+        # 启用 IB 传输
+        self.socket.setsockopt(zmq.TCP_IB, 1)
+        
+        self.model = None
+        self.tokenizer = None
+        logger.info(f"Worker started at {address} using IB network")
+
+    def load_model(self, model_path: str, gguf_path: str):
+        logger.info("Loading tokenizer...")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        
+        logger.info("Loading model config...")
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        torch.set_default_dtype(config.torch_dtype)
+        
+        logger.info("Loading model...")
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            config=config,
+            trust_remote_code=True,
+            device_map="auto"
+        )
+        self.model.eval()
+        logger.info("Model loaded successfully")
+
+    def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            # 直接在GPU上创建张量，避免CPU-GPU传输
+            input_ids = torch.tensor(input_data['input_ids'], device='cuda')
+            attention_mask = torch.tensor(input_data['attention_mask'], device='cuda')
+            
+            with torch.no_grad(), torch.cuda.amp.autocast():  # 使用自动混合精度
+                outputs = self.model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    max_new_tokens=input_data.get('max_new_tokens', 512),
+                    temperature=input_data.get('temperature', 0.7),
+                    top_p=input_data.get('top_p', 0.9),
+                    do_sample=input_data.get('do_sample', True)
+                )
+            
+
 ---
 
 

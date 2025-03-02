@@ -6,6 +6,7 @@ import logging
 from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM, GenerationConfig
 import time
 from transformers import TextStreamer
+from accelerate import dispatch_model
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -85,14 +86,12 @@ class ModelWorker:
             
             if gpu_count >= 2:
                 # 多 GPU 模式
-                main_gpu = torch.device("cuda:0")
-                infer_gpu = torch.device("cuda:1")
                 logger.info(f"Using GPU 0 for model storage and GPU 1 for inference")
                 
                 # 创建输入张量到推理 GPU
                 logger.info("Moving input tensors to inference GPU...")
-                input_ids = torch.tensor(input_data['input_ids'], device=infer_gpu)
-                attention_mask = torch.tensor(input_data['attention_mask'], device=infer_gpu)
+                input_ids = torch.tensor(input_data['input_ids'], device='cuda:1')
+                attention_mask = torch.tensor(input_data['attention_mask'], device='cuda:1')
                 
                 # 生成参数日志
                 max_new_tokens = input_data.get('max_new_tokens', 50)
@@ -114,23 +113,23 @@ class ModelWorker:
                     logger.info(f"- GPU 0 memory allocated: {torch.cuda.memory_allocated(0)/1024**3:.2f}GB")
                     logger.info(f"- GPU 1 memory allocated: {torch.cuda.memory_allocated(1)/1024**3:.2f}GB")
                     
-                    # 使用 device_map 来分配模型
+                    # 设置设备映射
                     logger.info("- Setting up device map...")
                     num_layers = len(self.model.model.layers)
                     device_map = {
-                        "model.embed_tokens": 0,
-                        "model.norm": 0,
-                        "lm_head": 0,
+                        "model.embed_tokens": "cuda:0",
+                        "model.norm": "cuda:0",
+                        "lm_head": "cuda:0",
                     }
                     # 将一半的层分配到每个 GPU
                     for i in range(num_layers):
                         if i < num_layers // 2:
-                            device_map[f"model.layers.{i}"] = 0
+                            device_map[f"model.layers.{i}"] = "cuda:0"
                         else:
-                            device_map[f"model.layers.{i}"] = 1
+                            device_map[f"model.layers.{i}"] = "cuda:1"
                     
                     logger.info("- Distributing model across GPUs...")
-                    self.model = self.model.to(device_map)
+                    self.model = dispatch_model(self.model, device_map=device_map)
                     logger.info("- Model distributed successfully")
                     
                     # KV cache 信息

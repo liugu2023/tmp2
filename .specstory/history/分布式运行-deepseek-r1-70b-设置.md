@@ -2257,6 +2257,244 @@ ERROR:__main__:Generation error: 'LlamaForCausalLM' object has no attribute 'par
 
 ---
 
+_**Assistant**_
+
+
+
+看来 LlamaForCausalLM 不支持 parallelize 方法。让我们使用另一种方式来实现多 GPU 分布：
+
+```python:ktransformers/worker.py
+def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        logger.info("Received generation request")
+        logger.info(f"Input sequence length: {len(input_data['input_ids'])}")
+        
+        # 检查可用的 GPU 数量
+        gpu_count = torch.cuda.device_count()
+        logger.info(f"Available GPUs: {gpu_count}")
+        
+        if gpu_count >= 2:
+            # 多 GPU 模式
+            main_gpu = torch.device("cuda:0")
+            infer_gpu = torch.device("cuda:1")
+            logger.info(f"Using GPU 0 for model storage and GPU 1 for inference")
+            
+            # 创建输入张量到推理 GPU
+            logger.info("Moving input tensors to inference GPU...")
+            input_ids = torch.tensor(input_data['input_ids'], device=infer_gpu)
+            attention_mask = torch.tensor(input_data['attention_mask'], device=infer_gpu)
+            
+            # 生成参数日志
+            max_new_tokens = input_data.get('max_new_tokens', 50)
+            temperature = input_data.get('temperature', 0.6)
+            top_p = input_data.get('top_p', 0.9)
+            logger.info(f"Generation parameters: max_new_tokens={max_new_tokens}, "
+                       f"temperature={temperature}, "
+                       f"top_p={top_p}")
+            
+            # 生成文本
+            logger.info("Starting text generation...")
+            start_time = time.time()
+            
+            with torch.no_grad(), torch.amp.autocast('cuda'):
+                logger.info("Initializing generation process...")
+                logger.info("- Checking model state...")
+                logger.info(f"- Model device: {self.model.device}")
+                logger.info(f"- Input shape: {input_ids.shape}")
+                logger.info(f"- GPU 0 memory allocated: {torch.cuda.memory_allocated(0)/1024**3:.2f}GB")
+                logger.info(f"- GPU 1 memory allocated: {torch.cuda.memory_allocated(1)/1024**3:.2f}GB")
+                
+                # 使用 device_map 来分配模型
+                logger.info("- Setting up device map...")
+                num_layers = len(self.model.model.layers)
+                device_map = {
+                    "model.embed_tokens": 0,
+                    "model.norm": 0,
+                    "lm_head": 0,
+                }
+                # 将一半的层分配到每个 GPU
+                for i in range(num_layers):
+                    if i < num_layers // 2:
+                        device_map[f"model.layers.{i}"] = 0
+                    else:
+                        device_map[f"model.layers.{i}"] = 1
+                
+                logger.info("- Distributing model across GPUs...")
+                self.model = self.model.to(device_map)
+                logger.info("- Model distributed successfully")
+                
+                # KV cache 信息
+                hidden_size = self.model.config.hidden_size
+                logger.info(f"- Model architecture:")
+                logger.info(f"  - Number of layers: {num_layers}")
+                logger.info(f"  - Hidden size: {hidden_size}")
+                
+                # 估算 KV cache 大小
+                seq_len = input_ids.shape[1] + max_new_tokens
+                kv_cache_size = 2 * num_layers * seq_len * hidden_size * input_ids.shape[0] * 2 / (1024**3)  # in GB
+                logger.info(f"- Estimated KV cache size: {kv_cache_size:.2f}GB")
+                
+                # 检查是否启用了 flash attention
+                if hasattr(self.model.config, '_attn_implementation'):
+                    logger.info(f"- Attention implementation: {self.model.config._attn_implementation}")
+                
+                logger.info("- Starting token generation...")
+                streamer = TextStreamer(
+                    self.tokenizer, 
+                    skip_prompt=True,
+                    skip_special_tokens=True
+                )
+                
+                outputs = self.model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    do_sample=input_data.get('do_sample', True),
+                    streamer=streamer
+                )
+                
+                # 生成完成后的处理
+                logger.info("- Moving outputs to CPU...")
+                outputs_cpu = outputs.to('cpu', non_blocking=True)
+                torch.cuda.synchronize()
+                
+                # 记录GPU内存使用情况
+                logger.info("- Final GPU memory usage:")
+                logger.info(f"  GPU 0: {torch.cuda.memory_allocated(0)/1024**3:.2f}GB")
+                logger.info(f"  GPU 1: {torch.cuda.memory_allocated(1)/1024**3:.2f}GB")
+                
+                return {
+                    'output_ids': outputs_cpu.numpy().tolist(),
+                    'status': 'success'
+                }
+                
+        else:
+            # 单 GPU 模式代码保持不变...
+
+```
+
+主要改动：
+1. 使用 device_map 字典直接指定模型各部分的设备
+2. 移除了 parallelize 方法的调用
+3. 改进了日志记录
+4. 优化了内存使用监控
+
+运行命令保持不变：
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0,1 python -m ktransformers.worker --worker_address "10.21.22.206:29500"
+```
+
+这种方式应该能更好地支持 LlamaForCausalLM 模型。如果还有问题，请告诉我。
+
+---
+
+_**User**_
+
+WARNING:accelerate.big_modeling:Some parameters are on the meta device because they were offloaded to the cpu.
+INFO:__main__:Model loaded successfully
+INFO:__main__:Received generation request
+INFO:__main__:Input sequence length: 1
+INFO:__main__:Available GPUs: 2
+INFO:__main__:Using GPU 0 for model storage and GPU 1 for inference
+INFO:__main__:Moving input tensors to inference GPU...
+INFO:__main__:Generation parameters: max_new_tokens=50, temperature=0.7, top_p=0.9
+INFO:__main__:Starting text generation...
+INFO:__main__:Initializing generation process...
+INFO:__main__:- Checking model state...
+INFO:__main__:- Model device: cuda:0
+INFO:__main__:- Input shape: torch.Size([1, 7])
+INFO:__main__:- GPU 0 memory allocated: 13.11GB
+INFO:__main__:- GPU 1 memory allocated: 14.34GB
+INFO:__main__:- Setting up device map...
+INFO:__main__:- Distributing model across GPUs...
+ERROR:__main__:Generation error: to() received an invalid combination of arguments - got (dict), but expected one of:
+ * (torch.device device = None, torch.dtype dtype = None, bool non_blocking = False, bool copy = False, *, torch.memory_format memory_format = None)
+ * (torch.dtype dtype, bool non_blocking = False, bool copy = False, *, torch.memory_format memory_format = None)
+ * (Tensor tensor, bool non_blocking = False, bool copy = False, *, torch.memory_format memory_format = None)
+
+---
+
+_**Assistant**_
+
+
+
+
+
+看来我们需要使用 accelerate 来处理模型的设备分配。让我们修改代码：
+
+```python:ktransformers/worker.py
+import torch
+import zmq
+from typing import Dict, Any
+import logging
+from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM, GenerationConfig
+import time
+from transformers import TextStreamer
+from accelerate import dispatch_model
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class ModelWorker:
+    def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            logger.info("Received generation request")
+            logger.info(f"Input sequence length: {len(input_data['input_ids'])}")
+            
+            # 检查可用的 GPU 数量
+            gpu_count = torch.cuda.device_count()
+            logger.info(f"Available GPUs: {gpu_count}")
+            
+            if gpu_count >= 2:
+                # 多 GPU 模式
+                logger.info(f"Using GPU 0 for model storage and GPU 1 for inference")
+                
+                # 创建输入张量到推理 GPU
+                logger.info("Moving input tensors to inference GPU...")
+                input_ids = torch.tensor(input_data['input_ids'], device='cuda:1')
+                attention_mask = torch.tensor(input_data['attention_mask'], device='cuda:1')
+                
+                # 生成参数日志
+                max_new_tokens = input_data.get('max_new_tokens', 50)
+                temperature = input_data.get('temperature', 0.6)
+                top_p = input_data.get('top_p', 0.9)
+                logger.info(f"Generation parameters: max_new_tokens={max_new_tokens}, "
+                           f"temperature={temperature}, "
+                           f"top_p={top_p}")
+                
+                # 生成文本
+                logger.info("Starting text generation...")
+                start_time = time.time()
+                
+                with torch.no_grad(), torch.amp.autocast('cuda'):
+                    logger.info("Initializing generation process...")
+                    logger.info("- Checking model state...")
+                    logger.info(f"- Model device: {self.model.device}")
+                    logger.info(f"- Input shape: {input_ids.shape}")
+                    logger.info(f"- GPU 0 memory allocated: {torch.cuda.memory_allocated(0)/1024**3:.2f}GB")
+                    logger.info(f"- GPU 1 memory allocated: {torch.cuda.memory_allocated(1)/1024**3:.2f}GB")
+                    
+                    # 设置设备映射
+                    logger.info("- Setting up device map...")
+                    num_layers = len(self.model.model.layers)
+                    device_map = {
+                        "model.embed_tokens": "cuda:0",
+                        "model.norm": "cuda:0",
+                        "lm_head": "cuda:0",
+                    }
+                    # 将一半的层分配到每个 GPU
+                    for i in range(num_layers):
+                        if i < num_layers // 2:
+                            device_map[f"model.layers.{i}"] = "cuda:0"
+                        else:
+                            device_map[f"model.layers.{i}"] = "cuda:1"
+                    
+                    logger.info("-
+
+---
+
 
 
 ---

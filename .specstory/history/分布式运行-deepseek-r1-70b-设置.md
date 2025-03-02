@@ -2288,6 +2288,130 @@ PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.local_chat \
 
 ---
 
+_**User**_
+
+客户端在哪里启动
+
+---
+
+_**Assistant**_
+
+
+
+客户端就是 local_chat.py。我们需要修改 local_chat.py 来适配新的分布式架构。让我们更新一下启动流程：
+
+1. 首先在 CPU 机器 (10.21.22.100) 上启动 CPU worker：
+```bash
+# 在 10.21.22.100 上运行
+PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.cpu_worker --address "10.21.22.100:29501"
+```
+
+2. 然后在 GPU 机器 (10.21.22.206) 上启动 GPU worker：
+```bash
+# 在 10.21.22.206 上运行
+PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0 python -m ktransformers.worker \
+    --worker_address "10.21.22.206:29500" \
+    --cpu_worker_address "10.21.22.100:29501"
+```
+
+3. 最后在任意机器上启动客户端（local_chat.py）：
+```bash
+# 可以在任意机器上运行
+PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.local_chat \
+    --model_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/ \
+    --gguf_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/ \
+    --worker_address "10.21.22.206:29500"
+```
+
+建议在 10.21.22.100 上运行客户端，这样可以充分利用其 CPU 资源进行预处理和后处理。这样整个系统的工作流程就是：
+
+1. CPU Worker (10.21.22.100:29501) 处理 CPU 计算任务
+2. GPU Worker (10.21.22.206:29500) 处理 GPU 计算任务
+3. Client (local_chat.py) 处理用户交互和任务协调
+
+需要我提供任何组件的具体代码吗？
+
+---
+
+_**User**_
+
+ERROR:__main__:Error processing message: CUDA out of memory. Tried to allocate 448.00 MiB. GPU 0 has a total capacity of 15.89 GiB of which 2.09 GiB is free. Including non-PyTorch memory, this process has 13.80 GiB memory in use. 13.99 GiB allowed; Of the allocated memory 13.55 GiB is allocated by PyTorch, and 1.77 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+
+---
+
+_**Assistant**_
+
+
+
+看起来还是显存问题。让我们调整 GPU 内存使用策略，将更多层放到 CPU 上：
+
+```python:ktransformers/worker.py
+def load_model(self, model_path: str, gguf_path: str):
+    logger.info("Loading tokenizer...")
+    self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    
+    logger.info("Loading model config...")
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    torch.set_default_dtype(config.torch_dtype)
+    
+    logger.info("Loading model...")
+    num_layers = config.num_hidden_layers
+    device_map = {}
+    
+    # GPU 组件 - 只保留必要的组件在 GPU
+    device_map.update({
+        'model.embed_tokens': 0,
+        'model.norm': 0,
+        'lm_head': 0,
+    })
+    
+    # 分配层 - 减少 GPU 上的层数
+    for i in range(num_layers):
+        if i < num_layers * 0.4:  # 只保留 40% 的层在 GPU 上
+            device_map[f'model.layers.{i}'] = 0  # GPU
+        else:
+            device_map[f'model.layers.{i}'] = 'cpu'  # CPU
+    
+    # 减少 GPU 内存限制
+    max_memory = {0: "12GB"}  # 降低 GPU 内存限制
+    
+    logger.info(f"Using device map: {device_map}")
+    
+    self.model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        config=config,
+        trust_remote_code=True,
+        device_map=device_map,
+        max_memory=max_memory,
+        offload_folder="offload",
+        torch_dtype=torch.float16  # 使用 FP16 来减少内存使用
+    )
+    self.model.eval()
+    
+    # ... rest of the code ...
+```
+
+主要改动：
+1. 将 GPU 上的层数从 70% 减少到 40%
+2. 降低 GPU 内存限制到 12GB
+3. 使用 FP16 精度来减少内存使用
+4. 保持关键组件在 GPU 上
+
+请重新运行：
+
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0 python -m ktransformers.worker \
+    --worker_address "10.21.22.206:29500" \
+    --cpu_worker_address "10.21.22.100:29501"
+```
+
+如果还有问题，我们可以进一步调整：
+1. 继续减少 GPU 上的层数
+2. 降低批处理大小
+3. 使用更激进的内存优化策略
+
+---
+
 
 
 ---

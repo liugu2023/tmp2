@@ -61,21 +61,22 @@ class ModelWorker:
         num_layers = config.num_hidden_layers
         device_map = {}
         
-        # GPU 组件
+        # GPU 组件 - 只保留必要的组件在 GPU
         device_map.update({
             'model.embed_tokens': 0,
             'model.norm': 0,
             'lm_head': 0,
         })
         
-        # 分配层
+        # 分配层 - 减少 GPU 上的层数
         for i in range(num_layers):
-            if i < num_layers * 0.7:
+            if i < num_layers * 0.4:  # 只保留 40% 的层在 GPU 上
                 device_map[f'model.layers.{i}'] = 0  # GPU
             else:
-                device_map[f'model.layers.{i}'] = 'cpu'  # 将在 CPU worker 上处理
+                device_map[f'model.layers.{i}'] = 'cpu'  # CPU
         
-        max_memory = {0: "14GB"}  # 只设置 GPU 内存
+        # 减少 GPU 内存限制
+        max_memory = {0: "12GB"}  # 降低 GPU 内存限制
         
         logger.info(f"Using device map: {device_map}")
         
@@ -85,7 +86,8 @@ class ModelWorker:
             trust_remote_code=True,
             device_map=device_map,
             max_memory=max_memory,
-            offload_folder="offload"
+            offload_folder="offload",
+            torch_dtype=torch.float16  # 使用 FP16 来减少内存使用
         )
         self.model.eval()
         

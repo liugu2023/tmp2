@@ -79,126 +79,197 @@ class ModelWorker:
             logger.info("Received generation request")
             logger.info(f"Input sequence length: {len(input_data['input_ids'])}")
             
-            # 获取可用的 GPU
-            main_gpu = torch.device("cuda:0")  # 存储模型的 GPU
-            infer_gpu = torch.device("cuda:1")  # 用于推理的 GPU
-            logger.info(f"Using GPU 0 for model storage and GPU 1 for inference")
+            # 检查可用的 GPU 数量
+            gpu_count = torch.cuda.device_count()
+            logger.info(f"Available GPUs: {gpu_count}")
             
-            # 创建输入张量到推理 GPU
-            logger.info("Moving input tensors to inference GPU...")
-            input_ids = torch.tensor(input_data['input_ids'], device=infer_gpu)
-            attention_mask = torch.tensor(input_data['attention_mask'], device=infer_gpu)
-            
-            # 生成参数日志
-            max_new_tokens = input_data.get('max_new_tokens', 50)
-            temperature = input_data.get('temperature', 0.6)
-            top_p = input_data.get('top_p', 0.9)
-            logger.info(f"Generation parameters: max_new_tokens={max_new_tokens}, "
-                       f"temperature={temperature}, "
-                       f"top_p={top_p}")
-            
-            # 生成文本
-            logger.info("Starting text generation...")
-            start_time = time.time()
-            
-            with torch.no_grad(), torch.amp.autocast('cuda'):
-                logger.info("Initializing generation process...")
-                # 添加详细的初始化信息
-                logger.info("- Checking model state...")
-                logger.info(f"- Model device: {self.model.device}")
-                logger.info(f"- Input shape: {input_ids.shape}")
-                logger.info(f"- GPU 0 memory allocated: {torch.cuda.memory_allocated(0)/1024**3:.2f}GB")
-                logger.info(f"- GPU 1 memory allocated: {torch.cuda.memory_allocated(1)/1024**3:.2f}GB")
+            if gpu_count >= 2:
+                # 多 GPU 模式
+                main_gpu = torch.device("cuda:0")
+                infer_gpu = torch.device("cuda:1")
+                logger.info(f"Using GPU 0 for model storage and GPU 1 for inference")
                 
-                # 临时将需要的模型层移到推理 GPU
-                logger.info("- Moving necessary model parts to inference GPU...")
+                # 创建输入张量到推理 GPU
+                logger.info("Moving input tensors to inference GPU...")
+                input_ids = torch.tensor(input_data['input_ids'], device=infer_gpu)
+                attention_mask = torch.tensor(input_data['attention_mask'], device=infer_gpu)
                 
-                # KV cache 信息
-                num_layers = len(self.model.model.layers)
-                hidden_size = self.model.config.hidden_size
-                logger.info(f"- Model architecture:")
-                logger.info(f"  - Number of layers: {num_layers}")
-                logger.info(f"  - Hidden size: {hidden_size}")
+                # 生成参数日志
+                max_new_tokens = input_data.get('max_new_tokens', 50)
+                temperature = input_data.get('temperature', 0.6)
+                top_p = input_data.get('top_p', 0.9)
+                logger.info(f"Generation parameters: max_new_tokens={max_new_tokens}, "
+                           f"temperature={temperature}, "
+                           f"top_p={top_p}")
                 
-                # 估算 KV cache 大小
-                seq_len = input_ids.shape[1] + max_new_tokens
-                kv_cache_size = 2 * num_layers * seq_len * hidden_size * input_ids.shape[0] * 2 / (1024**3)  # in GB
-                logger.info(f"- Estimated KV cache size: {kv_cache_size:.2f}GB")
+                # 生成文本
+                logger.info("Starting text generation...")
+                start_time = time.time()
                 
-                # 检查是否启用了 flash attention
-                if hasattr(self.model.config, '_attn_implementation'):
-                    logger.info(f"- Attention implementation: {self.model.config._attn_implementation}")
+                with torch.no_grad(), torch.amp.autocast('cuda'):
+                    logger.info("Initializing generation process...")
+                    logger.info("- Checking model state...")
+                    logger.info(f"- Model device: {self.model.device}")
+                    logger.info(f"- Input shape: {input_ids.shape}")
+                    logger.info(f"- GPU 0 memory allocated: {torch.cuda.memory_allocated(0)/1024**3:.2f}GB")
+                    logger.info(f"- GPU 1 memory allocated: {torch.cuda.memory_allocated(1)/1024**3:.2f}GB")
+                    
+                    # 临时将需要的模型层移到推理 GPU
+                    logger.info("- Moving necessary model parts to inference GPU...")
+                    
+                    # KV cache 信息
+                    num_layers = len(self.model.model.layers)
+                    hidden_size = self.model.config.hidden_size
+                    logger.info(f"- Model architecture:")
+                    logger.info(f"  - Number of layers: {num_layers}")
+                    logger.info(f"  - Hidden size: {hidden_size}")
+                    
+                    # 估算 KV cache 大小
+                    seq_len = input_ids.shape[1] + max_new_tokens
+                    kv_cache_size = 2 * num_layers * seq_len * hidden_size * input_ids.shape[0] * 2 / (1024**3)  # in GB
+                    logger.info(f"- Estimated KV cache size: {kv_cache_size:.2f}GB")
+                    
+                    # 检查是否启用了 flash attention
+                    if hasattr(self.model.config, '_attn_implementation'):
+                        logger.info(f"- Attention implementation: {self.model.config._attn_implementation}")
+                    
+                    # 设置模型的设备映射
+                    device_map = {
+                        'model.embed_tokens': main_gpu,
+                        'model.norm': main_gpu,
+                        'lm_head': main_gpu,
+                    }
+                    # 将部分层移到推理 GPU
+                    for i in range(num_layers):
+                        if i < num_layers // 2:
+                            device_map[f'model.layers.{i}'] = main_gpu
+                        else:
+                            device_map[f'model.layers.{i}'] = infer_gpu
+                    
+                    self.model.parallelize(device_map)
+                    logger.info("- Model parallelized across GPUs")
+                    
+                    # 记录起始时间戳
+                    gen_start_time = time.time()
+                    last_log_time = gen_start_time
+                    
+                    def progress_callback(step: int, token: int):
+                        nonlocal last_log_time
+                        current_time = time.time()
+                        # 每2秒记录一次进度
+                        if current_time - last_log_time >= 2:
+                            tokens_so_far = step - len(input_ids[0])
+                            time_elapsed = current_time - gen_start_time
+                            speed = tokens_so_far / time_elapsed if time_elapsed > 0 else 0
+                            logger.info(f"    - Generated {tokens_so_far} tokens, "
+                                      f"speed: {speed:.2f} tokens/sec, "
+                                      f"time elapsed: {time_elapsed:.2f}s")
+                            last_log_time = current_time
+                    
+                    # 设置 streamer 的回调函数
+                    streamer = TextStreamer(
+                        self.tokenizer, 
+                        skip_prompt=True,
+                        skip_special_tokens=True
+                    )
+                    streamer.on_finalized_text = lambda x: logger.info(f"    - Generated text: {x}")
+                    
+                    logger.info("  - Generation started with following settings:")
+                    logger.info(f"    - Input context length: {len(input_ids[0])} tokens")
+                    logger.info(f"    - Maximum new tokens: {max_new_tokens}")
+                    logger.info(f"    - Temperature: {temperature}")
+                    logger.info(f"    - Top-p sampling: {top_p}")
+                    logger.info(f"    - Do sample: {input_data.get('do_sample', True)}")
+                    
+                    outputs = self.model.generate(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        max_new_tokens=max_new_tokens,
+                        temperature=temperature,
+                        top_p=top_p,
+                        do_sample=input_data.get('do_sample', True),
+                        streamer=streamer
+                    )
+                    
+                    # 生成完成后，将模型恢复到主 GPU
+                    logger.info("- Moving model back to main GPU...")
+                    self.model.to(main_gpu)
+                    
+                    # 记录生成完成的信息
+                    final_time = time.time()
+                    total_gen_time = final_time - gen_start_time
+                    logger.info("  - Generation completed:")
+                    logger.info(f"    - Total generation time: {total_gen_time:.2f} seconds")
+                    logger.info(f"    - Final sequence length: {len(outputs[0])} tokens")
+                    logger.info(f"    - New tokens generated: {len(outputs[0]) - len(input_ids[0])}")
+                    logger.info(f"    - Average speed: {(len(outputs[0]) - len(input_ids[0])) / total_gen_time:.2f} tokens/sec")
                 
-                # 设置模型的设备映射
-                device_map = {
-                    'model.embed_tokens': main_gpu,
-                    'model.norm': main_gpu,
-                    'lm_head': main_gpu,
+                end_time = time.time()
+                generation_time = end_time - start_time
+                tokens_generated = len(outputs[0]) - len(input_ids[0])
+                tokens_per_second = tokens_generated / generation_time
+                
+                logger.info(f"Generation completed in {generation_time:.2f} seconds")
+                logger.info(f"Tokens generated: {tokens_generated}")
+                logger.info(f"Generation speed: {tokens_per_second:.2f} tokens/second")
+                logger.info(f"Final sequence length: {len(outputs[0])}")
+                
+                # 移动到CPU
+                logger.info("Moving outputs to CPU...")
+                outputs_cpu = outputs.to('cpu', non_blocking=True)
+                torch.cuda.synchronize()
+                
+                # 记录GPU内存使用情况
+                allocated = torch.cuda.memory_allocated() / 1024**3
+                reserved = torch.cuda.memory_reserved() / 1024**3
+                logger.info(f"GPU Memory: Allocated={allocated:.2f}GB, Reserved={reserved:.2f}GB")
+                
+                logger.info("Preparing response...")
+                return {
+                    'output_ids': outputs_cpu.numpy().tolist(),
+                    'status': 'success'
                 }
-                # 将部分层移到推理 GPU
-                for i in range(num_layers):
-                    if i < num_layers // 2:
-                        device_map[f'model.layers.{i}'] = main_gpu
-                    else:
-                        device_map[f'model.layers.{i}'] = infer_gpu
+            else:
+                # 单 GPU 模式
+                logger.info("Only one GPU available, using single GPU mode")
+                input_ids = torch.tensor(input_data['input_ids'], device='cuda')
+                attention_mask = torch.tensor(input_data['attention_mask'], device='cuda')
                 
-                self.model.parallelize(device_map)
-                logger.info("- Model parallelized across GPUs")
+                # 生成参数日志
+                max_new_tokens = input_data.get('max_new_tokens', 50)
+                temperature = input_data.get('temperature', 0.6)
+                top_p = input_data.get('top_p', 0.9)
+                logger.info(f"Generation parameters: max_new_tokens={max_new_tokens}, "
+                           f"temperature={temperature}, "
+                           f"top_p={top_p}")
                 
-                # 记录起始时间戳
-                gen_start_time = time.time()
-                last_log_time = gen_start_time
+                # 生成文本
+                logger.info("Starting text generation...")
+                start_time = time.time()
                 
-                def progress_callback(step: int, token: int):
-                    nonlocal last_log_time
-                    current_time = time.time()
-                    # 每2秒记录一次进度
-                    if current_time - last_log_time >= 2:
-                        tokens_so_far = step - len(input_ids[0])
-                        time_elapsed = current_time - gen_start_time
-                        speed = tokens_so_far / time_elapsed if time_elapsed > 0 else 0
-                        logger.info(f"    - Generated {tokens_so_far} tokens, "
-                                  f"speed: {speed:.2f} tokens/sec, "
-                                  f"time elapsed: {time_elapsed:.2f}s")
-                        last_log_time = current_time
-                
-                # 设置 streamer 的回调函数
-                streamer = TextStreamer(
-                    self.tokenizer, 
-                    skip_prompt=True,
-                    skip_special_tokens=True
-                )
-                streamer.on_finalized_text = lambda x: logger.info(f"    - Generated text: {x}")
-                
-                logger.info("  - Generation started with following settings:")
-                logger.info(f"    - Input context length: {len(input_ids[0])} tokens")
-                logger.info(f"    - Maximum new tokens: {max_new_tokens}")
-                logger.info(f"    - Temperature: {temperature}")
-                logger.info(f"    - Top-p sampling: {top_p}")
-                logger.info(f"    - Do sample: {input_data.get('do_sample', True)}")
-                
-                outputs = self.model.generate(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    max_new_tokens=max_new_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    do_sample=input_data.get('do_sample', True),
-                    streamer=streamer
-                )
-                
-                # 生成完成后，将模型恢复到主 GPU
-                logger.info("- Moving model back to main GPU...")
-                self.model.to(main_gpu)
-                
-                # 记录生成完成的信息
-                final_time = time.time()
-                total_gen_time = final_time - gen_start_time
-                logger.info("  - Generation completed:")
-                logger.info(f"    - Total generation time: {total_gen_time:.2f} seconds")
-                logger.info(f"    - Final sequence length: {len(outputs[0])} tokens")
-                logger.info(f"    - New tokens generated: {len(outputs[0]) - len(input_ids[0])}")
-                logger.info(f"    - Average speed: {(len(outputs[0]) - len(input_ids[0])) / total_gen_time:.2f} tokens/sec")
+                with torch.no_grad(), torch.amp.autocast('cuda'):
+                    logger.info("Initializing generation process...")
+                    logger.info("- Checking model state...")
+                    logger.info(f"- Model device: {self.model.device}")
+                    logger.info(f"- Input shape: {input_ids.shape}")
+                    logger.info(f"- Current GPU memory allocated: {torch.cuda.memory_allocated()/1024**3:.2f}GB")
+                    
+                    # 其他初始化信息...
+                    streamer = TextStreamer(
+                        self.tokenizer, 
+                        skip_prompt=True,
+                        skip_special_tokens=True
+                    )
+                    
+                    outputs = self.model.generate(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        max_new_tokens=max_new_tokens,
+                        temperature=temperature,
+                        top_p=top_p,
+                        do_sample=input_data.get('do_sample', True),
+                        streamer=streamer
+                    )
             
             end_time = time.time()
             generation_time = end_time - start_time

@@ -2087,7 +2087,63 @@ def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
                 top_p=top_p,
-                do_sample=input_
+                do_sample=input_data.get('do_sample', True),
+                streamer=streamer
+            )
+            
+            # 生成完成后，将模型恢复到主 GPU
+            logger.info("- Moving model back to main GPU...")
+            self.model.to(main_gpu)
+            
+            # ... 其余代码保持不变 ...
+
+```
+
+
+
+运行命令需要指定使用两个 GPU：
+
+```bash
+# 在 GPU 机器 (10.21.22.206) 上运行
+PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0,1 python -m ktransformers.worker --worker_address "10.21.22.206:29500"
+```
+
+
+
+主要改动：
+1. 使用 GPU 0 存储模型
+2. 使用 GPU 1 进行推理
+3. 将模型层分布在两个 GPU 上
+4. 添加了更详细的 GPU 内存使用监控
+5. 生成完成后将模型恢复到主 GPU
+
+这样可以：
+1. 更好地利用多 GPU 资源
+2. 减少单个 GPU 的内存压力
+3. 保持模型的推理性能
+
+如果需要调整 GPU 分配策略或其他参数，请告诉我。
+
+---
+
+_**User**_
+
+WARNING:accelerate.big_modeling:Some parameters are on the meta device because they were offloaded to the cpu.
+INFO:__main__:Model loaded successfully
+INFO:__main__:Received generation request
+INFO:__main__:Input sequence length: 1
+INFO:__main__:Using GPU 0 for model storage and GPU 1 for inference
+INFO:__main__:Moving input tensors to inference GPU...
+ERROR:__main__:Generation error: CUDA error: invalid device ordinal
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+---
+
+_**Assistant**_
+
+
 
 ---
 

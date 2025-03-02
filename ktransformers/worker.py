@@ -74,10 +74,22 @@ class ModelWorker:
 
     def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
         try:
+            logger.info("Received generation request")
+            logger.info(f"Input sequence length: {len(input_data['input_ids'])}")
+            
+            # 创建输入张量
+            logger.info("Moving input tensors to GPU...")
             input_ids = torch.tensor(input_data['input_ids'], device='cuda')
             attention_mask = torch.tensor(input_data['attention_mask'], device='cuda')
             
-            with torch.no_grad(), torch.amp.autocast('cuda'):  # 修复警告
+            # 生成参数日志
+            logger.info(f"Generation parameters: max_new_tokens={input_data.get('max_new_tokens', 512)}, "
+                       f"temperature={input_data.get('temperature', 0.7)}, "
+                       f"top_p={input_data.get('top_p', 0.9)}")
+            
+            # 生成文本
+            logger.info("Starting text generation...")
+            with torch.no_grad(), torch.amp.autocast('cuda'):
                 outputs = self.model.generate(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
@@ -87,9 +99,14 @@ class ModelWorker:
                     do_sample=input_data.get('do_sample', True)
                 )
             
+            logger.info(f"Generation completed. Output sequence length: {len(outputs[0])}")
+            
+            # 移动到CPU
+            logger.info("Moving outputs to CPU...")
             outputs_cpu = outputs.to('cpu', non_blocking=True)
             torch.cuda.synchronize()
             
+            logger.info("Preparing response...")
             return {
                 'output_ids': outputs_cpu.numpy().tolist(),
                 'status': 'success'

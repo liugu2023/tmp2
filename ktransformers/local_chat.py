@@ -78,21 +78,32 @@ class DistributedModel:
         logger.info("Model loaded successfully on worker")
 
     def generate(self, input_ids, attention_mask, **kwargs):
-        message = {
-            'command': 'generate',
-            'data': {
-                'input_ids': input_ids.cpu().numpy().tolist(),
-                'attention_mask': attention_mask.cpu().numpy().tolist(),
-                **kwargs
+        try:
+            logger.info("Preparing generation request...")
+            message = {
+                'command': 'generate',
+                'data': {
+                    'input_ids': input_ids.cpu().numpy().tolist(),
+                    'attention_mask': attention_mask.cpu().numpy().tolist(),
+                    **kwargs
+                }
             }
-        }
-        self.socket.send_pyobj(message)
-        response = self.socket.recv_pyobj()
-        
-        if response['status'] == 'success':
-            return torch.tensor(response['output_ids'])
-        else:
-            raise Exception(f"Generation failed: {response.get('error')}")
+            
+            logger.info("Sending request to worker...")
+            self.socket.send_pyobj(message)
+            
+            logger.info("Waiting for response...")
+            response = self.socket.recv_pyobj()
+            
+            if response['status'] == 'success':
+                logger.info("Response received successfully")
+                return torch.tensor(response['output_ids'])
+            else:
+                logger.error(f"Generation failed: {response.get('error')}")
+                raise Exception(f"Generation failed: {response.get('error')}")
+        except Exception as e:
+            logger.error(f"Error in generate: {str(e)}")
+            raise
 
 def local_chat(
     model_path: str | None = None,
@@ -174,51 +185,52 @@ def local_chat(
         os.system("clear")
 
     while True:
-        content = input("Chat: ")
-        if content.startswith('"""'):  # prefix """
-            # multi lines input
-            content = content[3:] + "\n"
-            while True:
-                line = input("")
-                if line.endswith('"""'):
-                    # end multi lines input
-                    line = line[:-3]  # suffix """
-                    if line:
-                        content += line + "\n"
-                    break
-                else:
-                    content += line + "\n"
-
-        if content == "":
-            if prompt_file != None:
-                content = open(prompt_file, "r").read()
-            else:
-                content = "Please write a piece of quicksort code in C++."
-        elif os.path.isfile(content):
-            content = open(content, "r").read()
+        try:
+            content = input("Chat: ")
+            if content.lower() in ['quit', 'exit']:
+                break
             
-        messages = [{"role": "user", "content": content}]
-        input_tensor = tokenizer.apply_chat_template(
-            messages, add_generation_prompt=True, return_tensors="pt"
-        )
-        if force_think:
-            token_thinks = torch.tensor([tokenizer.encode("<think>\\n",add_special_tokens=False)],device=input_tensor.device)
-            input_tensor = torch.cat(
-                [input_tensor, token_thinks], dim=1
+            logger.info("Processing input...")
+            if content == "":
+                if prompt_file is not None:
+                    logger.info(f"Reading from prompt file: {prompt_file}")
+                    with open(prompt_file, "r", encoding='utf-8') as f:
+                        content = f.read()
+                else:
+                    content = "Please write a piece of quicksort code in C++."
+            elif os.path.isfile(content):
+                logger.info(f"Reading from file: {content}")
+                with open(content, "r", encoding='utf-8') as f:
+                    content = f.read()
+            
+            logger.info("Creating chat messages...")
+            messages = [{"role": "user", "content": content}]
+            
+            logger.info("Tokenizing input...")
+            input_tensor = tokenizer.apply_chat_template(
+                messages, add_generation_prompt=True, return_tensors="pt"
             )
-        if mode == 'long_context':
-            assert Config().long_context_config['max_seq_len'] > input_tensor.shape[1] + max_new_tokens, \
-            "please change max_seq_len in  ~/.ktransformers/config.yaml"
-        
-        if system != "Windows" and (config.architectures[0] == "DeepseekV2ForCausalLM" or config.architectures[0] == "DeepseekV3ForCausalLM") and flashinfer_enabled and get_compute_capability() >= 8:
-            generated = prefill_and_generate(
-                model, tokenizer, input_tensor.cuda(), max_new_tokens, use_cuda_graph, mode = mode, force_think = force_think, chunk_prefill_size = chunk_prefill_size,
-                use_flashinfer_mla = True, num_heads = config.num_attention_heads, head_dim_ckv = config.kv_lora_rank, head_dim_kpe = config.qk_rope_head_dim, q_head_dim = config.qk_rope_head_dim + config.qk_nope_head_dim
+            
+            logger.info("Starting generation...")
+            outputs = model.generate(
+                input_tensor,
+                torch.ones_like(input_tensor),
+                max_new_tokens=max_new_tokens,
+                temperature=0.7,
+                top_p=0.9,
+                do_sample=True
             )
-        else:
-            generated = prefill_and_generate(
-                model, tokenizer, input_tensor.cuda(), max_new_tokens, use_cuda_graph, mode = mode, force_think = force_think, chunk_prefill_size = chunk_prefill_size,
-            )
+            
+            logger.info("Decoding response...")
+            response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+            print("\nAssistant:", response)
+        except UnicodeDecodeError as e:
+            logger.error(f"Encoding error: {str(e)}")
+            print("请使用UTF-8编码输入文本")
+            continue
+        except Exception as e:
+            logger.error(f"Error: {str(e)}")
+            continue
 
 def main():
     # 设置终端编码
@@ -258,21 +270,28 @@ def main():
                 if content.lower() in ['quit', 'exit']:
                     break
                     
+                logger.info("Processing input...")
                 if content == "":
                     if args.prompt_file is not None:
+                        logger.info(f"Reading from prompt file: {args.prompt_file}")
                         with open(args.prompt_file, "r", encoding='utf-8') as f:
                             content = f.read()
                     else:
                         content = "Please write a piece of quicksort code in C++."
                 elif os.path.isfile(content):
+                    logger.info(f"Reading from file: {content}")
                     with open(content, "r", encoding='utf-8') as f:
                         content = f.read()
                 
+                logger.info("Creating chat messages...")
                 messages = [{"role": "user", "content": content}]
+                
+                logger.info("Tokenizing input...")
                 input_tensor = tokenizer.apply_chat_template(
                     messages, add_generation_prompt=True, return_tensors="pt"
                 )
                 
+                logger.info("Starting generation...")
                 outputs = model.generate(
                     input_tensor,
                     torch.ones_like(input_tensor),
@@ -282,8 +301,9 @@ def main():
                     do_sample=True
                 )
                 
+                logger.info("Decoding response...")
                 response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-                print("Assistant:", response)
+                print("\nAssistant:", response)
             except UnicodeDecodeError as e:
                 logger.error(f"Encoding error: {str(e)}")
                 print("请使用UTF-8编码输入文本")

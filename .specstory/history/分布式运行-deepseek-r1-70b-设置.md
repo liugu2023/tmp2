@@ -1040,7 +1040,241 @@ def main():
         # 分布式模式
         logger.info("Running in distributed mode")
         model = DistributedModel(args.worker_address)
-        model.load_model(args.model_
+        model.load_model(args.model_path, args.gguf_path)
+        tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+        
+        while True:
+            try:
+                content = input("Chat: ")
+                if content.lower() in ['quit', 'exit']:
+                    break
+                    
+                if content == "":
+                    if args.prompt_file is not None:
+                        with open(args.prompt_file, "r", encoding='utf-8') as f:
+                            content = f.read()
+                    else:
+                        content = "Please write a piece of quicksort code in C++."
+                elif os.path.isfile(content):
+                    with open(content, "r", encoding='utf-8') as f:
+                        content = f.read()
+                
+                messages = [{"role": "user", "content": content}]
+                input_tensor = tokenizer.apply_chat_template(
+                    messages, add_generation_prompt=True, return_tensors="pt"
+                )
+                
+                outputs = model.generate(
+                    input_tensor,
+                    torch.ones_like(input_tensor),
+                    max_new_tokens=args.max_new_tokens,
+                    temperature=0.7,
+                    top_p=0.9,
+                    do_sample=True
+                )
+                
+                response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+                print("Assistant:", response)
+            except UnicodeDecodeError as e:
+                logger.error(f"Encoding error: {str(e)}")
+                print("请使用UTF-8编码输入文本")
+                continue
+            except Exception as e:
+                logger.error(f"Error: {str(e)}")
+                continue
+
+    else:
+        # 本地模式保持不变
+        local_chat(
+            model_path=args.model_path,
+            gguf_path=args.gguf_path,
+            max_new_tokens=args.max_new_tokens,
+            cpu_infer=args.cpu_infer,
+            use_cuda_graph=args.use_cuda_graph,
+            prompt_file=args.prompt_file,
+            mode=args.mode,
+            force_think=args.force_think,
+            chunk_prefill_size=args.chunk_prefill_size
+        )
+
+if __name__ == "__main__":
+    fire.Fire(main)
+```
+
+主要改动：
+1. 添加了系统编码设置
+2. 使用 try-except 处理编码错误
+3. 所有文件操作都明确指定 UTF-8 编码
+4. 添加了退出命令支持
+5. 改进了错误处理和用户提示
+
+现在再次运行：
+
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.local_chat \
+    --model_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/ \
+    --gguf_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/ \
+    --worker_address "10.21.22.206:29500"
+```
+
+这样应该能正确处理中文输入了。如果还有问题，请告诉我。
+
+---
+
+_**User**_
+
+/archive/liugu/ds/ktransformers/ktransformers/worker.py:66: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  with torch.no_grad(), torch.cuda.amp.autocast():
+Setting `pad_token_id` to `eos_token_id`:128001 for open-end generation.
+
+---
+
+_**Assistant**_
+
+
+
+让我们修复这个警告，并优化一下 worker.py 中的代码：
+
+```python:ktransformers/worker.py
+import torch
+import zmq
+from typing import Dict, Any
+import logging
+from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class ModelWorker:
+    def __init__(self, address: str):
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.REP)
+        host, port = address.split(':')
+        self.socket.bind(f"tcp://0.0.0.0:{port}")
+        self.socket.setsockopt(zmq.RCVHWM, 0)
+        self.socket.setsockopt(zmq.SNDHWM, 0)
+        
+        self.model = None
+        self.tokenizer = None
+        logger.info(f"Worker started at {address}, listening on all interfaces")
+
+    def load_model(self, model_path: str, gguf_path: str):
+        logger.info("Loading tokenizer...")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        
+        logger.info("Loading model config...")
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        torch.set_default_dtype(config.torch_dtype)
+        
+        logger.info("Loading model...")
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            config=config,
+            trust_remote_code=True,
+            device_map="auto"
+        )
+        self.model.eval()
+        
+        # 设置生成配置
+        try:
+            self.model.generation_config = GenerationConfig.from_pretrained(model_path)
+        except Exception as e:
+            logger.warning(f"Generation config can't auto create, making default. Message: {e}")
+            self.model.generation_config = GenerationConfig(
+                temperature=0.7,
+                top_p=0.9,
+                do_sample=True
+            )
+        if self.model.generation_config.pad_token_id is None:
+            self.model.generation_config.pad_token_id = self.model.generation_config.eos_token_id
+            
+        logger.info("Model loaded successfully")
+
+    def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            input_ids = torch.tensor(input_data['input_ids'], device='cuda')
+            attention_mask = torch.tensor(input_data['attention_mask'], device='cuda')
+            
+            with torch.no_grad(), torch.amp.autocast('cuda'):  # 修复警告
+                outputs = self.model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    max_new_tokens=input_data.get('max_new_tokens', 512),
+                    temperature=input_data.get('temperature', 0.7),
+                    top_p=input_data.get('top_p', 0.9),
+                    do_sample=input_data.get('do_sample', True)
+                )
+            
+            outputs_cpu = outputs.to('cpu', non_blocking=True)
+            torch.cuda.synchronize()
+            
+            return {
+                'output_ids': outputs_cpu.numpy().tolist(),
+                'status': 'success'
+            }
+        except Exception as e:
+            logger.error(f"Generation error: {str(e)}")
+            return {
+                'status': 'error',
+                'error': str(e)
+            }
+
+    def run(self):
+        logger.info("Worker ready to receive requests")
+        while True:
+            try:
+                message = self.socket.recv_pyobj()
+                command = message.get('command')
+                
+                if command == 'load_model':
+                    self.load_model(message['model_path'], message['gguf_path'])
+                    self.socket.send_pyobj({'status': 'success'})
+                
+                elif command == 'generate':
+                    result = self.generate(message['data'])
+                    self.socket.send_pyobj(result)
+                
+                elif command == 'shutdown':
+                    logger.info("Shutting down worker")
+                    self.socket.send_pyobj({'status': 'shutdown'})
+                    break
+                
+            except Exception as e:
+                logger.error(f"Error processing message: {str(e)}")
+                self.socket.send_pyobj({'status': 'error', 'error': str(e)})
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--worker_address', type=str, required=True)
+    args = parser.parse_args()
+    
+    worker = ModelWorker(args.worker_address)
+    worker.run()
+
+if __name__ == '__main__':
+    main()
+```
+
+主要改动：
+1. 修复了 `torch.cuda.amp.autocast()` 的弃用警告
+2. 在 worker 端处理了生成配置的设置
+3. 优化了日志记录
+4. 改进了错误处理
+
+现在警告应该消失了。如果还有其他问题，请告诉我。
+
+---
+
+_**User**_
+
+添加详细信息输出：我在输入对话信息后，程序在干什么
+
+---
+
+_**Assistant**_
+
+
 
 ---
 

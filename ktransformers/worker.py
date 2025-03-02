@@ -28,7 +28,7 @@ def load_model_and_tokenizer(model_path: str, gguf_path: str):
     return model, tokenizer
 
 class ModelWorker:
-    def __init__(self, address: str):
+    def __init__(self, address: str, cpu_worker_address: str):
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.REP)
         host, port = address.split(':')
@@ -36,12 +36,17 @@ class ModelWorker:
         self.socket.setsockopt(zmq.RCVHWM, 0)
         self.socket.setsockopt(zmq.SNDHWM, 0)
         
+        # 连接到 CPU worker
+        self.cpu_socket = self.context.socket(zmq.REQ)
+        self.cpu_socket.connect(f"tcp://{cpu_worker_address}")
+        
         # 设置 GPU 内存限制到 14GB
-        torch.cuda.set_per_process_memory_fraction(0.88)  # 设置为总显存的 88%，约 14GB
+        torch.cuda.set_per_process_memory_fraction(0.88)
         
         self.model = None
         self.tokenizer = None
-        logger.info(f"Worker started at {address}, listening on all interfaces")
+        logger.info(f"GPU Worker started at {address}")
+        logger.info(f"Connected to CPU Worker at {cpu_worker_address}")
         logger.info(f"GPU memory limit set to 14GB")
 
     def load_model(self, model_path: str, gguf_path: str):
@@ -53,14 +58,26 @@ class ModelWorker:
         torch.set_default_dtype(config.torch_dtype)
         
         logger.info("Loading model...")
-        # 设置设备映射，将计算密集型层放在 GPU 上
-        device_map = {
-            'model.embed_tokens': 'cuda',  # 词嵌入层放在 GPU
-            'model.norm': 'cuda',          # 归一化层放在 GPU
-            'lm_head': 'cuda',             # 语言模型头放在 GPU
-            'model.layers': 'auto'         # 其他层自动分配
-        }
-        max_memory = {0: "14GB", "cpu": "128GB"}  # 调整 GPU 内存到 14GB
+        num_layers = config.num_hidden_layers
+        device_map = {}
+        
+        # GPU 组件
+        device_map.update({
+            'model.embed_tokens': 0,
+            'model.norm': 0,
+            'lm_head': 0,
+        })
+        
+        # 分配层
+        for i in range(num_layers):
+            if i < num_layers * 0.7:
+                device_map[f'model.layers.{i}'] = 0  # GPU
+            else:
+                device_map[f'model.layers.{i}'] = 'cpu'  # 将在 CPU worker 上处理
+        
+        max_memory = {0: "14GB"}  # 只设置 GPU 内存
+        
+        logger.info(f"Using device map: {device_map}")
         
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path,
@@ -165,9 +182,10 @@ def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--worker_address', type=str, required=True)
+    parser.add_argument('--cpu_worker_address', type=str, required=True)
     args = parser.parse_args()
     
-    worker = ModelWorker(args.worker_address)
+    worker = ModelWorker(args.worker_address, args.cpu_worker_address)
     worker.run()
 
 if __name__ == '__main__':

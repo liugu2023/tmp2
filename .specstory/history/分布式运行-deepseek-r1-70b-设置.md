@@ -634,6 +634,206 @@ class ModelWorker:
                     do_sample=input_data.get('do_sample', True)
                 )
             
+            # 异步传输到CPU
+            outputs_cpu = outputs.to('cpu', non_blocking=True)
+            torch.cuda.synchronize()  # 确保传输完成
+            
+            return {
+                'output_ids': outputs_cpu.numpy().tolist(),
+                'status': 'success'
+            }
+        except Exception as e:
+            logger.error(f"Generation error: {str(e)}")
+            return {
+                'status': 'error',
+                'error': str(e)
+            }
+
+    def run(self):
+        logger.info("Worker ready to receive requests")
+        while True:
+            try:
+                message = self.socket.recv_pyobj()
+                command = message.get('command')
+                
+                if command == 'load_model':
+                    self.load_model(message['model_path'], message['gguf_path'])
+                    self.socket.send_pyobj({'status': 'success'})
+                
+                elif command == 'generate':
+                    result = self.generate(message['data'])
+                    self.socket.send_pyobj(result)
+                
+                elif command == 'shutdown':
+                    logger.info("Shutting down worker")
+                    self.socket.send_pyobj({'status': 'shutdown'})
+                    break
+                
+            except Exception as e:
+                logger.error(f"Error processing message: {str(e)}")
+                self.socket.send_pyobj({'status': 'error', 'error': str(e)})
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--worker_address', type=str, required=True)
+    args = parser.parse_args()
+    
+    worker = ModelWorker(args.worker_address)
+    worker.run()
+
+if __name__ == '__main__':
+    main()
+```
+
+主要优化：
+1. 启用 ZMQ 的 IB 传输模式
+2. 设置无限缓冲区大小，避免大数据传输阻塞
+3. 直接在 GPU 上创建张量，减少 CPU-GPU 传输
+4. 使用自动混合精度加速计算
+5. 使用异步传输将结果返回到 CPU
+
+使用方式保持不变：
+
+1. GPU 机器 (10.21.22.206):
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0 python -m ktransformers.worker --worker_address "10.21.22.206:29500"
+```
+
+2. CPU 机器 (10.21.22.100):
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.local_chat \
+    --model_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/ \
+    --gguf_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/ \
+    --worker_address "10.21.22.206:29500"
+```
+
+这些优化应该能显著提高分布式系统的性能。如果还需要其他优化，请告诉我。
+
+---
+
+_**User**_
+
+(ds) root@login:/archive/liugu/ds/ktransformers# PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0 python -m ktransformers.worker --worker_address "10.21.22.206:29500"
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 125, in <module>
+    main()
+    ^^^^^^
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 121, in main
+    worker = ModelWorker(args.worker_address)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 38, in __init__
+    self.socket.setsockopt(zmq.TCP_IB, 1)
+                           ^^^^^^^^^^
+AttributeError: module 'zmq' has no attribute 'TCP_IB'
+
+---
+
+_**Assistant**_
+
+抱歉，我的错误。看来 ZMQ 的 Python 绑定中没有直接暴露 TCP_IB 选项。让我们修改代码，去掉这个不支持的选项：
+
+```python:ktransformers/worker.py
+class ModelWorker:
+    def __init__(self, address: str):
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.REP)
+        host, port = address.split(':')
+        # 使用 IB 网络的 IP 地址
+        self.socket.bind(f"tcp://*:{port}")
+        # 设置无限缓冲区
+        self.socket.setsockopt(zmq.RCVHWM, 0)  # 无限接收缓冲
+        self.socket.setsockopt(zmq.SNDHWM, 0)  # 无限发送缓冲
+        
+        self.model = None
+        self.tokenizer = None
+        logger.info(f"Worker started at {address} with high-performance network")
+
+    # ... rest of the code remains the same ...
+```
+
+主要改动：
+1. 移除了不支持的 `TCP_IB` 选项
+2. 保留了无限缓冲区设置，这对大数据传输很有帮助
+
+IB 网络会自动被系统使用，不需要我们在应用层特别设置。只要使用 IB 网卡的 IP 地址，系统就会自动使用 IB 网络进行通信。
+
+请再次运行：
+
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0 python -m ktransformers.worker --worker_address "10.21.22.206:29500"
+```
+
+如果还有其他问题，请告诉我。
+
+---
+
+_**User**_
+
+(ds) liugu@login:~/ds/ktransformers$ PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.local_chat     --model_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/     --gguf_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/     --worker_address "10.21.22.206:29500"
+No CUDA runtime is found, using CUDA_HOME='/archive/liugu/cuda'
+2025-03-02 15:18:19,630 - INFO - flashinfer.jit: Prebuilt kernels not found, using JIT backend
+found flashinfer
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/archive/liugu/ds/ktransformers/ktransformers/local_chat.py", line 280, in <module>
+    fire.Fire(main)
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/fire/core.py", line 135, in Fire
+    component_trace = _Fire(component, args, parsed_flag_args, context, name)
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/fire/core.py", line 468, in _Fire
+    component, remaining_args = _CallAndUpdateTrace(
+                                ^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/fire/core.py", line 684, in _CallAndUpdateTrace
+    component = fn(*varargs, **kwargs)
+                ^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ktransformers/ktransformers/local_chat.py", line 234, in main
+    logger.info("Running in distributed mode")
+    ^^^^^^
+NameError: name 'logger' is not defined
+
+---
+
+_**Assistant**_
+
+
+
+需要在 local_chat.py 中添加 logger 的定义。让我修改一下：
+
+```python:ktransformers/local_chat.py
+import logging
+# ... 其他导入 ...
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class DistributedModel:
+    def __init__(self, worker_address: str):
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.REQ)
+        self.socket.connect(f"tcp://{worker_address}")
+        logger.info(f"Connected to worker at {worker_address}")
+        
+    def load_model(self, model_path: str, gguf_path: str):
+        message = {
+            'command': 'load_model',
+            'model_path': model_path,
+            'gguf_path': gguf_path
+        }
+        logger.info("Requesting model load from worker...")
+        self.socket.send_pyobj(message)
+        response = self.socket.recv_pyobj()
+        if response['status'] != 'success':
+            raise Exception(f"Failed to load model: {response.get('error')}")
+        logger.info("Model loaded successfully on worker")
+
+    def generate(self, input_ids, attention_mask, **kwargs):
+        message = {
+            'command': 'generate',
+            'data
 
 ---
 

@@ -10,11 +10,11 @@ import platform
 import sys
 import zmq
 import argparse
+import logging
 
 project_dir = os.path.dirname(os.path.dirname(__file__))
 sys.path.insert(0, project_dir)
 import torch
-import logging
 from transformers import (
     AutoTokenizer,
     AutoConfig,
@@ -53,11 +53,15 @@ default_optimize_rules = {
     "MixtralForCausalLM": ktransformer_rules_dir + "Mixtral.yaml",
 }
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 class DistributedModel:
     def __init__(self, worker_address: str):
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.REQ)
         self.socket.connect(f"tcp://{worker_address}")
+        logger.info(f"Connected to worker at {worker_address}")
         
     def load_model(self, model_path: str, gguf_path: str):
         message = {
@@ -65,10 +69,12 @@ class DistributedModel:
             'model_path': model_path,
             'gguf_path': gguf_path
         }
+        logger.info("Requesting model load from worker...")
         self.socket.send_pyobj(message)
         response = self.socket.recv_pyobj()
         if response['status'] != 'success':
             raise Exception(f"Failed to load model: {response.get('error')}")
+        logger.info("Model loaded successfully on worker")
 
     def generate(self, input_ids, attention_mask, **kwargs):
         message = {
@@ -159,7 +165,6 @@ def local_chat(
     if model.generation_config.pad_token_id is None:
         model.generation_config.pad_token_id = model.generation_config.eos_token_id
     model.eval()
-    logging.basicConfig(level=logging.INFO)
 
     system = platform.system()
     if system == "Windows":

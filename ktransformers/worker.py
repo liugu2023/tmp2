@@ -50,31 +50,14 @@ class ModelWorker:
         config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         torch.set_default_dtype(config.torch_dtype)
         
-        logger.info("Loading model...")
-        # 设置内存优化和设备映射
-        device_map = {
-            'model.embed_tokens': 'cpu',
-            'model.norm': 'cuda:0',
-            'lm_head': 'cpu'
-        }
-        # 为每个transformer层分配设备
-        num_layers = config.num_hidden_layers
-        for i in range(num_layers):
-            # 将一半的层放在CPU上
-            if i < num_layers // 2:
-                device_map[f'model.layers.{i}'] = 'cpu'
-            else:
-                device_map[f'model.layers.{i}'] = 'cuda:0'
-        
+        logger.info("Loading model on CPU...")
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path,
             config=config,
             trust_remote_code=True,
-            device_map=device_map,
+            device_map='cpu',  # 在CPU上加载
             torch_dtype=torch.float16,  # 使用半精度
             low_cpu_mem_usage=True,     # 降低CPU内存使用
-            offload_folder="offload",   # 设置模型权重卸载目录
-            offload_state_dict=True,    # 启用状态字典卸载
         )
         self.model.eval()
         
@@ -91,19 +74,16 @@ class ModelWorker:
         if self.model.generation_config.pad_token_id is None:
             self.model.generation_config.pad_token_id = self.model.generation_config.eos_token_id
         
-        # 清理缓存
-        torch.cuda.empty_cache()
-        logger.info("Model loaded successfully")
-        
-        # 输出内存使用情况
-        allocated = torch.cuda.memory_allocated() / 1024**3
-        reserved = torch.cuda.memory_reserved() / 1024**3
-        logger.info(f"GPU Memory after loading: Allocated={allocated:.2f}GB, Reserved={reserved:.2f}GB")
+        logger.info("Model loaded successfully on CPU")
 
     def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
         try:
             logger.info("Received generation request")
             logger.info(f"Input sequence length: {len(input_data['input_ids'])}")
+            
+            # 将模型移动到GPU
+            logger.info("Moving model to GPU...")
+            self.model = self.model.cuda()
             
             # 创建输入张量
             logger.info("Moving input tensors to GPU...")
@@ -195,27 +175,13 @@ class ModelWorker:
                     do_sample=input_data.get('do_sample', True),
                     streamer=streamer
                 )
-                
-                # 记录生成完成的信息
-                final_time = time.time()
-                total_gen_time = final_time - gen_start_time
-                logger.info("  - Generation completed:")
-                logger.info(f"    - Total generation time: {total_gen_time:.2f} seconds")
-                logger.info(f"    - Final sequence length: {len(outputs[0])} tokens")
-                logger.info(f"    - New tokens generated: {len(outputs[0]) - len(input_ids[0])}")
-                logger.info(f"    - Average speed: {(len(outputs[0]) - len(input_ids[0])) / total_gen_time:.2f} tokens/sec")
             
-            end_time = time.time()
-            generation_time = end_time - start_time
-            tokens_generated = len(outputs[0]) - len(input_ids[0])
-            tokens_per_second = tokens_generated / generation_time
+            # 将模型移回CPU，释放GPU内存
+            logger.info("Moving model back to CPU...")
+            self.model = self.model.cpu()
+            torch.cuda.empty_cache()
             
-            logger.info(f"Generation completed in {generation_time:.2f} seconds")
-            logger.info(f"Tokens generated: {tokens_generated}")
-            logger.info(f"Generation speed: {tokens_per_second:.2f} tokens/second")
-            logger.info(f"Final sequence length: {len(outputs[0])}")
-            
-            # 移动到CPU
+            # 移动输出到CPU
             logger.info("Moving outputs to CPU...")
             outputs_cpu = outputs.to('cpu', non_blocking=True)
             torch.cuda.synchronize()
@@ -231,6 +197,12 @@ class ModelWorker:
                 'status': 'success'
             }
         except Exception as e:
+            # 确保在发生错误时也将模型移回CPU
+            try:
+                self.model = self.model.cpu()
+                torch.cuda.empty_cache()
+            except:
+                pass
             logger.error(f"Generation error: {str(e)}")
             return {
                 'status': 'error',

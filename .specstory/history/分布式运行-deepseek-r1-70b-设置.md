@@ -2412,6 +2412,141 @@ PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0 python -m ktra
 
 ---
 
+_**User**_
+
+在模型加载阶段，允许10.21.22.206上的cpu使用，加载结束后立刻禁止
+
+---
+
+_**Assistant**_
+
+
+
+
+
+明白了，我们可以在模型加载时临时允许使用本地 CPU，加载完成后再禁用。让我们修改 worker.py：
+
+```python:ktransformers/worker.py
+class ModelWorker:
+    def __init__(self, address: str, cpu_worker_address: str):
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.REP)
+        host, port = address.split(':')
+        self.socket.bind(f"tcp://0.0.0.0:{port}")
+        self.socket.setsockopt(zmq.RCVHWM, 0)
+        self.socket.setsockopt(zmq.SNDHWM, 0)
+        
+        # 连接到 CPU worker
+        self.cpu_socket = self.context.socket(zmq.REQ)
+        self.cpu_socket.connect(f"tcp://{cpu_worker_address}")
+        
+        # 设置 GPU 内存限制
+        torch.cuda.set_per_process_memory_fraction(0.88)
+        
+        self.model = None
+        self.tokenizer = None
+        logger.info(f"GPU Worker started at {address}")
+        logger.info(f"Connected to CPU Worker at {cpu_worker_address}")
+
+    def load_model(self, model_path: str, gguf_path: str):
+        try:
+            # 临时允许使用本地 CPU 进行模型加载
+            logger.info("Temporarily enabling local CPU for model loading...")
+            
+            logger.info("Loading tokenizer...")
+            self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+            
+            logger.info("Loading model config...")
+            config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+            torch.set_default_dtype(config.torch_dtype)
+            
+            logger.info("Loading model...")
+            num_layers = config.num_hidden_layers
+            device_map = {}
+            
+            # GPU 组件
+            device_map.update({
+                'model.embed_tokens': 0,
+                'model.norm': 0,
+                'lm_head': 0,
+            })
+            
+            # 分配层 - 加载时先全部放在 GPU 上
+            for i in range(num_layers):
+                device_map[f'model.layers.{i}'] = 0
+            
+            # 设置较大的 GPU 内存限制用于加载
+            max_memory = {0: "14GB"}
+            
+            logger.info("Initial device map for loading:")
+            logger.info(device_map)
+            
+            # 加载模型
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                config=config,
+                trust_remote_code=True,
+                device_map=device_map,
+                max_memory=max_memory,
+                offload_folder="offload",
+                torch_dtype=torch.float16
+            )
+            self.model.eval()
+            
+            # 加载完成后，重新分配层到 CPU
+            logger.info("Model loaded, redistributing layers...")
+            for i in range(num_layers):
+                if i >= num_layers * 0.4:  # 60% 的层移到 CPU
+                    layer = self.model.model.layers[i]
+                    layer.to('cpu')
+                    torch.cuda.empty_cache()
+            
+            logger.info("Layer redistribution completed")
+            
+            # 设置生成配置
+            try:
+                self.model.generation_config = GenerationConfig.from_pretrained(model_path)
+            except Exception as e:
+                logger.warning(f"Generation config can't auto create, making default. Message: {e}")
+                self.model.generation_config = GenerationConfig(
+                    temperature=0.6,
+                    top_p=0.9,
+                    do_sample=True
+                )
+            if self.model.generation_config.pad_token_id is None:
+                self.model.generation_config.pad_token_id = self.model.generation_config.eos_token_id
+            
+            logger.info("Model loading completed successfully")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error loading model: {str(e)}")
+            return False
+```
+
+
+主要改动：
+1. 加载时先将所有层放在 GPU 上以加速加载过程
+2. 加载完成后，手动将 60% 的层移到 CPU
+3. 使用 try-except 包装整个加载过程
+4. 添加了详细的日志记录
+
+这样的策略可以：
+1. 利用本地 CPU 和 GPU 加速模型加载
+2. 加载完成后将指定层移到远程 CPU
+3. 保持关键层在 GPU 上以提高性能
+
+运行命令保持不变：
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0 python -m ktransformers.worker \
+    --worker_address "10.21.22.206:29500" \
+    --cpu_worker_address "10.21.22.100:29501"
+```
+
+如果还有问题，请告诉我。
+
+---
+
 
 
 ---

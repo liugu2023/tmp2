@@ -50,9 +50,6 @@ class ModelWorker:
 
     def load_model(self, model_path: str, gguf_path: str):
         try:
-            # 临时允许使用本地 CPU 进行模型加载
-            logger.info("Temporarily enabling local CPU for model loading...")
-            
             logger.info("Loading tokenizer...")
             self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
             
@@ -62,24 +59,12 @@ class ModelWorker:
             
             logger.info("Loading model...")
             num_layers = config.num_hidden_layers
-            device_map = {}
             
-            # GPU 组件
-            device_map.update({
-                'model.embed_tokens': 0,
-                'model.norm': 0,
-                'lm_head': 0,
-            })
+            # 使用默认的设备映射策略进行初始加载
+            device_map = "auto"
+            max_memory = {0: "14GB", "cpu": "128GB"}
             
-            # 分配层 - 加载时先全部放在 GPU 上
-            for i in range(num_layers):
-                device_map[f'model.layers.{i}'] = 0
-            
-            # 设置较大的 GPU 内存限制用于加载
-            max_memory = {0: "14GB"}
-            
-            logger.info("Initial device map for loading:")
-            logger.info(device_map)
+            logger.info("Using auto device map for initial loading")
             
             # 加载模型
             self.model = AutoModelForCausalLM.from_pretrained(
@@ -93,15 +78,10 @@ class ModelWorker:
             )
             self.model.eval()
             
-            # 加载完成后，重新分配层到 CPU
-            logger.info("Model loaded, redistributing layers...")
-            for i in range(num_layers):
-                if i >= num_layers * 0.4:  # 60% 的层移到 CPU
-                    layer = self.model.model.layers[i]
-                    layer.to('cpu')
-                    torch.cuda.empty_cache()
-            
-            logger.info("Layer redistribution completed")
+            # 记录初始设备分配
+            logger.info("Initial device map:")
+            for name, device in self.model.hf_device_map.items():
+                logger.info(f"{name}: {device}")
             
             # 设置生成配置
             try:

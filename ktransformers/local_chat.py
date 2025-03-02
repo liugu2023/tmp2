@@ -220,17 +220,61 @@ def main():
     parser.add_argument('--gguf_path', type=str, required=True)
     parser.add_argument('--worker_address', type=str, default=None,
                       help='Address of worker for distributed mode (e.g., "10.21.22.206:29500")')
+    parser.add_argument('--max_new_tokens', type=int, default=300)
+    parser.add_argument('--cpu_infer', type=int, default=Config().cpu_infer)
+    parser.add_argument('--use_cuda_graph', type=bool, default=True)
+    parser.add_argument('--prompt_file', type=str, default=None)
+    parser.add_argument('--mode', type=str, default="normal")
+    parser.add_argument('--force_think', type=bool, default=False)
+    parser.add_argument('--chunk_prefill_size', type=int, default=8192)
     args = parser.parse_args()
 
     if args.worker_address:
         # 分布式模式
+        logger.info("Running in distributed mode")
         model = DistributedModel(args.worker_address)
         model.load_model(args.model_path, args.gguf_path)
+        tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+        
+        while True:
+            content = input("Chat: ")
+            if content == "":
+                if args.prompt_file is not None:
+                    content = open(args.prompt_file, "r").read()
+                else:
+                    content = "Please write a piece of quicksort code in C++."
+            elif os.path.isfile(content):
+                content = open(content, "r").read()
+                
+            messages = [{"role": "user", "content": content}]
+            input_tensor = tokenizer.apply_chat_template(
+                messages, add_generation_prompt=True, return_tensors="pt"
+            )
+            
+            outputs = model.generate(
+                input_tensor,
+                torch.ones_like(input_tensor),
+                max_new_tokens=args.max_new_tokens,
+                temperature=0.7,
+                top_p=0.9,
+                do_sample=True
+            )
+            
+            response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+            print("Assistant:", response)
     else:
         # 本地模式
-        model, tokenizer = load_model_and_tokenizer(args.model_path, args.gguf_path)
-
-    # ... 其余的代码保持不变 ...
+        local_chat(
+            model_path=args.model_path,
+            gguf_path=args.gguf_path,
+            max_new_tokens=args.max_new_tokens,
+            cpu_infer=args.cpu_infer,
+            use_cuda_graph=args.use_cuda_graph,
+            prompt_file=args.prompt_file,
+            mode=args.mode,
+            force_think=args.force_think,
+            chunk_prefill_size=args.chunk_prefill_size
+        )
 
 if __name__ == "__main__":
     fire.Fire(main)

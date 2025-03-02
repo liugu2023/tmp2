@@ -438,6 +438,36 @@ class ModelWorker:
         logger.info(f"Worker started at {address}")
 
     def load_model(self, model_path: str, gguf_path: str):
+        self.model, self.tokenizer = load_model_and_tokenizer(model_path, gguf_path)
+        logger.info("Model loaded successfully")
+
+    # ... rest of the existing code ...
+```
+
+主要改动：
+1. 添加了必要的 transformers 导入
+2. 实现了 `load_model_and_tokenizer` 函数
+3. 添加了更详细的日志记录
+
+现在再次运行：
+
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0 python -m ktransformers.worker --worker_address "10.21.22.206:29500"
+```
+
+这样应该能看到模型加载的进度日志了。如果还有问题，请告诉我具体的错误信息。
+
+---
+
+_**User**_
+
+现在是主程序，也就是CPU程序卡在found flashinfer不往下走
+
+---
+
+_**Assistant**_
+
+
 
 ---
 

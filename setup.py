@@ -370,11 +370,17 @@ elif MUSA_HOME is not None:
 else:
     raise ValueError("Unsupported backend: CUDA_HOME and MUSA_HOME are not set.")
 
+install_requires = [
+    # ... existing dependencies ...
+    'pyzmq>=24.0.0',
+]
+
 setup(
     version=VersionInfo().get_package_version(),
     cmdclass={"bdist_wheel":BuildWheelsCommand ,"build_ext": CMakeBuild},
     ext_modules=[
         CMakeExtension("cpuinfer_ext"),
         ops_module,
-    ]
+    ],
+    install_requires=install_requires
 )

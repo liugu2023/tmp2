@@ -8,6 +8,8 @@ Copyright (c) 2024 by KVCache.AI, All Rights Reserved.
 import os
 import platform
 import sys
+import zmq
+import argparse
 
 project_dir = os.path.dirname(os.path.dirname(__file__))
 sys.path.insert(0, project_dir)
@@ -51,6 +53,39 @@ default_optimize_rules = {
     "MixtralForCausalLM": ktransformer_rules_dir + "Mixtral.yaml",
 }
 
+class DistributedModel:
+    def __init__(self, worker_address: str):
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.REQ)
+        self.socket.connect(f"tcp://{worker_address}")
+        
+    def load_model(self, model_path: str, gguf_path: str):
+        message = {
+            'command': 'load_model',
+            'model_path': model_path,
+            'gguf_path': gguf_path
+        }
+        self.socket.send_pyobj(message)
+        response = self.socket.recv_pyobj()
+        if response['status'] != 'success':
+            raise Exception(f"Failed to load model: {response.get('error')}")
+
+    def generate(self, input_ids, attention_mask, **kwargs):
+        message = {
+            'command': 'generate',
+            'data': {
+                'input_ids': input_ids.cpu().numpy().tolist(),
+                'attention_mask': attention_mask.cpu().numpy().tolist(),
+                **kwargs
+            }
+        }
+        self.socket.send_pyobj(message)
+        response = self.socket.recv_pyobj()
+        
+        if response['status'] == 'success':
+            return torch.tensor(response['output_ids'])
+        else:
+            raise Exception(f"Generation failed: {response.get('error')}")
 
 def local_chat(
     model_path: str | None = None,
@@ -179,6 +214,23 @@ def local_chat(
                 model, tokenizer, input_tensor.cuda(), max_new_tokens, use_cuda_graph, mode = mode, force_think = force_think, chunk_prefill_size = chunk_prefill_size,
             )
 
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--model_path', type=str, required=True)
+    parser.add_argument('--gguf_path', type=str, required=True)
+    parser.add_argument('--worker_address', type=str, default=None,
+                      help='Address of worker for distributed mode (e.g., "10.21.22.206:29500")')
+    args = parser.parse_args()
+
+    if args.worker_address:
+        # 分布式模式
+        model = DistributedModel(args.worker_address)
+        model.load_model(args.model_path, args.gguf_path)
+    else:
+        # 本地模式
+        model, tokenizer = load_model_and_tokenizer(args.model_path, args.gguf_path)
+
+    # ... 其余的代码保持不变 ...
 
 if __name__ == "__main__":
-    fire.Fire(local_chat)
+    fire.Fire(main)

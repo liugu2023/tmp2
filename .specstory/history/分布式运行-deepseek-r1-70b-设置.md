@@ -2034,6 +2034,113 @@ class DistributedModel:
 def main():
     # 设置终端编码
     if sys.platform.startswith('win'):
+        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stdin.reconfigure(encoding='utf-8')
+    else:
+        default_encoding = locale.getpreferredencoding()
+        sys.stdout = open(sys.stdout.fileno(), mode='w', encoding='utf-8', buffering=1)
+        sys.stdin = open(sys.stdin.fileno(), mode='r', encoding=default_encoding, buffering=1)
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--model_path', type=str, required=True)
+    parser.add_argument('--gguf_path', type=str, required=True)
+    parser.add_argument('--worker_address', type=str, default=None,
+                      help='Address of worker for distributed mode (e.g., "10.21.22.206:29500")')
+    parser.add_argument('--max_new_tokens', type=int, default=300)
+    args = parser.parse_args()
+
+    if args.worker_address:
+        # 分布式模式
+        logger.info("Running in distributed mode")
+        model = DistributedModel(args.worker_address)
+        model.load_model(args.model_path, args.gguf_path)
+        tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+        
+        while True:
+            try:
+                content = input("Chat: ")
+                if content.lower() in ['quit', 'exit']:
+                    break
+                    
+                logger.info("Processing input...")
+                if content == "":
+                    content = "Please write a piece of quicksort code in C++."
+                elif os.path.isfile(content):
+                    logger.info(f"Reading from file: {content}")
+                    with open(content, "r", encoding='utf-8') as f:
+                        content = f.read()
+                
+                logger.info("Creating chat messages...")
+                messages = [{"role": "user", "content": content}]
+                
+                logger.info("Tokenizing input...")
+                input_tensor = tokenizer.apply_chat_template(
+                    messages, add_generation_prompt=True, return_tensors="pt"
+                )
+                
+                logger.info("Starting generation...")
+                outputs = model.generate(
+                    input_tensor,
+                    torch.ones_like(input_tensor),
+                    max_new_tokens=args.max_new_tokens,
+                    temperature=0.7,
+                    top_p=0.9,
+                    do_sample=True
+                )
+                
+                logger.info("Decoding response...")
+                response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+                print("\nAssistant:", response)
+            except UnicodeDecodeError as e:
+                logger.error(f"Encoding error: {str(e)}")
+                print("请使用UTF-8编码输入文本")
+                continue
+            except Exception as e:
+                logger.error(f"Error: {str(e)}")
+                continue
+
+    else:
+        # 本地模式，动态导入所需模块
+        (optimize_and_load_gguf, DeepseekV2ForCausalLM, Qwen2MoeForCausalLM,
+         DeepseekV3ForCausalLM, LlamaForCausalLM, MixtralForCausalLM,
+         prefill_and_generate, get_compute_capability, Config, flashinfer_enabled) = import_local_modules()
+        
+        # 本地模式的代码...
+        raise NotImplementedError("Local mode is not implemented in this version")
+
+if __name__ == "__main__":
+    main()
+```
+
+主要改动：
+1. 移除了所有不必要的导入
+2. 添加了动态导入函数 `import_local_modules`
+3. 简化了分布式模式的代码
+4. 移除了本地模式的实现（因为我们只使用分布式模式）
+
+现在再次运行：
+
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.local_chat \
+    --model_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/ \
+    --gguf_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/ \
+    --worker_address "10.21.22.206:29500" \
+    --max_new_tokens 50
+```
+
+这样应该就不会出现导入错误了。如果还有其他问题，请告诉我。
+
+---
+
+_**User**_
+
+降低模型加载时的显存使用占比，给模型推理腾地方，降低到50%
+
+---
+
+_**Assistant**_
+
+
 
 ---
 

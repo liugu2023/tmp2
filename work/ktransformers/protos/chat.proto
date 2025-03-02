@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package chat;
+
+service ChatService {
+    rpc Generate (GenerateRequest) returns (GenerateResponse) {}
+}
+
+message GenerateRequest {
+    string prompt = 1;
+    int32 max_new_tokens = 2;
+    string mode = 3;
+    bool force_think = 4;
+}
+
+message GenerateResponse {
+    string text = 1;
+} 

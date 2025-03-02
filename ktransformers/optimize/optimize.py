@@ -30,7 +30,14 @@ def inject(module, local_optimization_dict, model_config:AutoConfig ,gguf_loader
                     import_class_name = import_path[-1]
                     module_cls=getattr(__import__(import_module_name, fromlist=[""]), import_class_name)
                     print(f"Injecting {child_prefix} as", import_module_name, ".", import_class_name)
-                    inject_module=module_cls(key = inject_module_meta["key"], gguf_loader = gguf_loader, config = model_config, orig_module=child, **inject_module_meta["kwargs"])
+                    inject_module = module_cls(
+                        key=inject_module_meta["key"],
+                        gguf_loader=gguf_loader,
+                        config=model_config,
+                        orig_module=child,
+                        **{k: v for k, v in inject_module_meta["kwargs"].items() 
+                           if k not in ['key', 'gguf_loader', 'config', 'orig_module']}
+                    )
                     set_module(module, name, inject_module)
                 elif inject_module_meta["class"] == "default":
                     print(f"Injecting {child_prefix} as default")
@@ -119,11 +126,11 @@ def optimize_and_load_gguf(module: nn.Module, rule_file: str, gguf_path: str, mo
         rule_list = yaml.load(f.read(), Loader=yaml.FullLoader)
     
     optimize_config = dict()
-    gen_optimize_config(module, optimize_config, rule_list, default_device = default_device)
+    gen_optimize_config(module, optimize_config, rule_list, default_device=default_device)
     
     model_config = translate_model_config(model_config)
 
-    gguf_loader=GGUFLoader(gguf_path)
+    gguf_loader = GGUFLoader(gguf_path)
     with torch.device("meta"):
         inject(module, optimize_config, model_config, gguf_loader)
     # pre load lm_head because its big inter result
@@ -132,3 +139,7 @@ def optimize_and_load_gguf(module: nn.Module, rule_file: str, gguf_path: str, mo
     module.gguf_loader = gguf_loader
     del_meta(module)
     torch.cuda.empty_cache()
+
+# 确保导出函数
+__all__ = ['optimize_and_load_gguf']
+

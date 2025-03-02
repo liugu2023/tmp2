@@ -78,7 +78,7 @@ ALL_LAYERNORM_LAYERS.append(LlamaRMSNorm)
 class LlamaRotaryEmbedding(nn.Module):
     def __init__(
         self,
-        dim=None,
+        dim=None,  # 保留这些参数以保持向后兼容
         max_position_embeddings=2048,
         base=10000,
         device=None,
@@ -87,15 +87,12 @@ class LlamaRotaryEmbedding(nn.Module):
         config: Optional[LlamaConfig] = None,
     ):
         super().__init__()
-        self.dim = dim
-        self.max_position_embeddings = max_position_embeddings
-        self.base = base
-        self.device = device
-        self.scaling_factor = scaling_factor
-        self.rope_type = rope_type
+        
+        # 基本配置
         self.config = config
-        # TODO (joao): remove the `if` below, only used for BC
-        self.rope_kwargs = {}
+        self._is_initialized = False
+        
+        # 处理向后兼容性
         if config is None:
             logger.warning_once(
                 "`LlamaRotaryEmbedding` can now be fully parameterized by passing the model config through the "
@@ -108,64 +105,58 @@ class LlamaRotaryEmbedding(nn.Module):
                 "base": base,
                 "max_position_embeddings": max_position_embeddings,
             }
-            self.rope_type = rope_type
-            self.max_seq_len_cached = max_position_embeddings
-            self.original_max_seq_len = max_position_embeddings
         else:
-            # BC: "rope_type" was originally "type"
+            self.rope_kwargs = {}
+            
+        # 设置rope类型
+        if config is not None:
             if config.rope_scaling is not None:
                 self.rope_type = config.rope_scaling.get(
                     "rope_type", config.rope_scaling.get("type")
                 )
             else:
                 self.rope_type = "default"
-            self.max_seq_len_cached = config.max_position_embeddings
-            self.original_max_seq_len = config.max_position_embeddings
+        else:
+            self.rope_type = rope_type
 
-        self.config = config
+        # 获取初始化函数
         self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+        
+        # 延迟初始化的属性
+        self.inv_freq = None
+        self.attention_scaling = None
 
+    def _lazy_init(self, device):
+        """延迟初始化RoPE参数"""
+        if self._is_initialized:
+            return
+            
+        # 避免在meta设备上初始化
+        if str(device) == "meta":
+            raise RuntimeError("RoPE parameters cannot be initialized on meta device")
+            
+        # 执行实际的初始化
         inv_freq, self.attention_scaling = self.rope_init_fn(
-            self.config, device, **self.rope_kwargs
+            self.config,
+            device,
+            **self.rope_kwargs
         )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self.original_inv_freq = self.inv_freq
-
-    def _dynamic_frequency_update(self, position_ids, device):
-        """
-        dynamic RoPE layers should recompute `inv_freq` in the following situations:
-        1 - growing beyond the cached sequence length (allow scaling)
-        2 - the current sequence length is in the original scale (avoid losing precision with small sequences)
-        """
-        seq_len = torch.max(position_ids) + 1
-        # seq_len = position_ids[0, -1] + 1
-        if seq_len > self.max_seq_len_cached:  # growth
-            inv_freq, self.attention_scaling = self.rope_init_fn(
-                self.config, device, seq_len=seq_len, **self.rope_kwargs
-            )
-            self.register_buffer(
-                "inv_freq", inv_freq, persistent=False
-            )  # TODO joao: may break with compilation
-            self.max_seq_len_cached = seq_len
-
-        if (
-            seq_len < self.original_max_seq_len
-            and self.max_seq_len_cached > self.original_max_seq_len
-        ):  # reset
-            self.register_buffer("inv_freq", self.original_inv_freq, persistent=False)
-            self.max_seq_len_cached = self.original_max_seq_len
+        self._is_initialized = True
 
     @torch.no_grad()
     def forward(self, x, position_ids):
-        # if "dynamic" in self.rope_type:
-        #     self._dynamic_frequency_update(position_ids, device=x.device)
+        # 确保参数已初始化
+        if not self._is_initialized:
+            self._lazy_init(x.device)
 
         # Core RoPE block
         inv_freq_expanded = (
             self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
         )
         position_ids_expanded = position_ids[:, None, :].float()
-        # Force float32 (see https://github.com/huggingface/transformers/pull/29285)
+
+        # 强制使用float32以提高精度
         device_type = x.device.type
         device_type = (
             device_type
@@ -180,7 +171,7 @@ class LlamaRotaryEmbedding(nn.Module):
             cos = emb.cos()
             sin = emb.sin()
 
-        # Advanced RoPE types (e.g. yarn) apply a post-processing scaling factor, equivalent to scaling attention
+        # 应用注意力缩放
         cos = cos * self.attention_scaling
         sin = sin * self.attention_scaling
 
@@ -358,9 +349,6 @@ class LlamaAttention(nn.Module):
             self.hidden_size, self.hidden_size, bias=config.attention_bias
         )
 
-        # TODO (joao): remove in v4.45 (RoPE is computed in the model, not in the decoder layers)
-        self.rotary_emb = LlamaRotaryEmbedding(config=self.config)
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -370,9 +358,7 @@ class LlamaAttention(nn.Module):
         output_attentions: bool = False,
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[
-            Tuple[torch.Tensor, torch.Tensor]
-        ] = None,  # will become mandatory in v4.45
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
@@ -420,16 +406,13 @@ class LlamaAttention(nn.Module):
             bsz, q_len, self.num_key_value_heads, self.head_dim
         ).transpose(1, 2)
 
+        # 使用传入的position_embeddings
         if position_embeddings is None:
-            logger.warning_once(
-                "The attention layers in this model are transitioning from computing the RoPE embeddings internally "
-                "through `position_ids` (2D tensor with the indexes of the tokens), to using externally computed "
-                "`position_embeddings` (Tuple of tensors, containing cos and sin). In v4.45 `position_ids` will be "
-                "removed and `position_embeddings` will be mandatory."
+            raise ValueError(
+                "position_embeddings must be provided to LlamaAttention forward method"
             )
-            cos, sin = self.rotary_emb(value_states, position_ids)
-        else:
-            cos, sin = position_embeddings
+        cos, sin = position_embeddings
+        
         query_states, key_states = apply_rotary_pos_emb(
             query_states, key_states, cos, sin
         )
@@ -448,9 +431,8 @@ class LlamaAttention(nn.Module):
             query_states, key_states.transpose(2, 3)
         ) / math.sqrt(self.head_dim)
 
-        if attention_mask is not None:  # no matter the length, we just slice it
-            causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-            attn_weights = attn_weights + causal_mask
+        if attention_mask is not None:
+            attn_weights = attn_weights + attention_mask
 
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(
@@ -468,7 +450,6 @@ class LlamaAttention(nn.Module):
             )
 
         attn_output = attn_output.transpose(1, 2).contiguous()
-
         attn_output = attn_output.reshape(bsz, q_len, -1)
 
         if self.config.pretraining_tp > 1:
@@ -976,19 +957,21 @@ class LlamaModel(LlamaPreTrainedModel):
             ]
         )
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = LlamaRotaryEmbedding(config=config)
+        
+        # 延迟初始化RoPE
+        self.rotary_emb = None
         self.gradient_checkpointing = False
 
         # Initialize weights and apply final processing
         self.post_init()
 
-    def get_input_embeddings(self):
-        return self.embed_tokens
+    def _ensure_rope_initialized(self, device):
+        """确保RoPE已正确初始化"""
+        if self.rotary_emb is None:
+            self.rotary_emb = LlamaRotaryEmbedding(config=self.config)
+            # 确保RoPE在正确的设备上
+            self.rotary_emb.to(device)
 
-    def set_input_embeddings(self, value):
-        self.embed_tokens = value
-
-    @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -1031,17 +1014,10 @@ class LlamaModel(LlamaPreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        return_legacy_cache = False
-        if (
-            use_cache and not isinstance(past_key_values, Cache) and not self.training
-        ):  # kept for BC (non `Cache` `past_key_values` inputs)
-            return_legacy_cache = True
-            past_key_values = DynamicCache.from_legacy_cache(past_key_values)
-            logger.warning_once(
-                "We detected that you are passing `past_key_values` as a tuple and this is deprecated and will be removed in v4.43. "
-                "Please use an appropriate `Cache` class (https://huggingface.co/docs/transformers/v4.41.3/en/internal/generation_utils#transformers.Cache)"
-            )
+        # 确保RoPE已初始化
+        self._ensure_rope_initialized(inputs_embeds.device)
 
+        # 计算position embeddings
         if cache_position is None:
             past_seen_tokens = (
                 past_key_values.get_seq_length() if past_key_values is not None else 0
@@ -1054,17 +1030,10 @@ class LlamaModel(LlamaPreTrainedModel):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        causal_mask = self._update_causal_mask(
-            attention_mask,
-            inputs_embeds,
-            cache_position,
-            past_key_values,
-            output_attentions,
-        )
-        hidden_states = inputs_embeds
+        # 创建position embeddings
+        position_embeddings = self.rotary_emb(inputs_embeds, position_ids)
 
-        # create position embeddings to be shared across the decoder layers
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        hidden_states = inputs_embeds
 
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
@@ -1114,8 +1083,6 @@ class LlamaModel(LlamaPreTrainedModel):
             all_hidden_states += (hidden_states,)
 
         next_cache = next_decoder_cache if use_cache else None
-        if return_legacy_cache:
-            next_cache = next_cache.to_legacy_cache()
 
         if not return_dict:
             return tuple(
@@ -1742,3 +1709,4 @@ class LlamaForTokenClassification(LlamaPreTrainedModel):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+

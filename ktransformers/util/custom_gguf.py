@@ -167,48 +167,54 @@ DATA_TYPES = {
 }
 
 class GGUFLoader:
-    tensor_info: dict
-    gguf_path: str
-    tensor_file_map: dict # {tensor_name: tensor_file_path}
-    gguf_file_meta: dict
-    safetensor_loader: SafeTensorLoader
     def __init__(self, gguf_path: str):
-        # Check dir exist
-        if not os.path.exists(gguf_path):
-            raise FileNotFoundError(f"GGUF dir not found: {gguf_path}")
-        if os.path.isfile(gguf_path):
-            gguf_path = os.path.dirname(gguf_path)
-
-        self.safetensor_loader = None
-        
+        # 初始化成员变量
         self.tensor_info = {}
         self.gguf_path = gguf_path
         self.tensor_file_map = {}
         self.file_data_map = {}
         self.gguf_file_meta = {}
         self.tensor_device_map = {}
+        self.safetensor_loader = None
 
-        # I know this is ugly, but I don't want to change the original code too much
-        # TODO: merge gguf load and other loads.
-        safetensor_loader = SafeTensorLoader(gguf_path)
-        if safetensor_loader.tensor_file_map:
-            self.safetensor_loader = safetensor_loader
-            return
-        # Walk through all the .gguf files in the directory
-        found_gguf = False
-        for root, dirs, files in os.walk(gguf_path):
-            for file in files:
-                if file.endswith(".gguf"):
-                    found_gguf = True
-                    file_name = os.path.join(root, file)
-                    with open(file_name, "rb") as f:
-                        self.load_gguf(f)
-                        if file_name not in self.file_data_map:
-                            self.file_data_map[file_name] = np.memmap(file_name, mode = 'r')
-        if not found_gguf:
-            raise FileNotFoundError(f"Cannot find any .gguf files in: {gguf_path}")
-                            
+        # 检查路径是否存在
+        if not os.path.exists(gguf_path):
+            raise FileNotFoundError(f"GGUF path not found: {gguf_path}")
+
+        # 如果是目录，遍历查找 .gguf 文件
+        if os.path.isdir(gguf_path):
+            found_gguf = False
+            for root, _, files in os.walk(gguf_path):
+                for file in files:
+                    if file.endswith(".gguf"):
+                        found_gguf = True
+                        file_path = os.path.join(root, file)
+                        with open(file_path, "rb") as f:
+                            # 检查 GGUF 魔数
+                            first_four_bytes = f.read(4)
+                            if first_four_bytes != b'GGUF':
+                                print(f"Warning: Invalid GGUF file {file_path}, skipping")
+                                continue
+                            f.seek(0)  # 重置文件指针
+                            self.load_gguf(f)
+                            if file_path not in self.file_data_map:
+                                self.file_data_map[file_path] = np.memmap(file_path, mode='r')
+            if not found_gguf:
+                raise FileNotFoundError(f"No .gguf files found in directory: {gguf_path}")
+        else:
+            # 如果是文件，直接加载
+            with open(gguf_path, 'rb') as f:
+                first_four_bytes = f.read(4)
+                if first_four_bytes != b'GGUF':
+                    raise ValueError(f"Invalid GGUF file format. Expected magic number 'GGUF', got {first_four_bytes}")
+                f.seek(0)  # 重置文件指针
+                self.load_gguf(f)
+                if gguf_path not in self.file_data_map:
+                    self.file_data_map[gguf_path] = np.memmap(gguf_path, mode='r')
+
     def load_gguf(self, f):
+        # 文件指针已经移动到了magic number之后
+        # ... 其他代码保持不变 ...
         f.seek(0)
         assert f.read(4) == b'GGUF'
         values = struct.unpack("<IQQ", f.read(4+8+8))
@@ -937,4 +943,5 @@ if __name__ == '__main__':
     gguf_path = '/mnt/data/model/DeepSeek-Coder-V2-GGUF-WJH'
     loader = GGUFLoader(gguf_path)
     loader.load_gguf_tensor('token_embd.weight')
+
 

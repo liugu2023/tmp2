@@ -966,9 +966,13 @@ class KLlamaModel(BaseInjectedModule):
         transfer_map: dict = None,
         **kwargs,
     ):
-
-        BaseInjectedModule.__init__(
-            self, key, gguf_loader, config, orig_module, device, **kwargs
+        super().__init__(
+            key=key,
+            gguf_loader=gguf_loader,
+            config=config,
+            orig_module=orig_module,
+            device=device,
+            **{k: v for k, v in kwargs.items() if k not in ['device']}
         )
         self.per_layer_prefill_intput_threshold = per_layer_prefill_intput_threshold
         self.transfer_map = transfer_map
@@ -1348,3 +1352,4 @@ class KLlamaModel(BaseInjectedModule):
             )
 
         return causal_mask
+

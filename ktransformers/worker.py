@@ -3,9 +3,29 @@ import zmq
 import pickle
 from typing import Dict, Any
 import logging
+from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+def load_model_and_tokenizer(model_path: str, gguf_path: str):
+    logger.info("Loading tokenizer...")
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    
+    logger.info("Loading model config...")
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    torch.set_default_dtype(config.torch_dtype)
+    
+    logger.info("Loading model...")
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        config=config,
+        trust_remote_code=True,
+        device_map="auto"
+    )
+    model.eval()
+    
+    return model, tokenizer
 
 class ModelWorker:
     def __init__(self, address: str):
@@ -18,7 +38,6 @@ class ModelWorker:
         logger.info(f"Worker started at {address}")
 
     def load_model(self, model_path: str, gguf_path: str):
-        from ktransformers.local_chat import load_model_and_tokenizer
         self.model, self.tokenizer = load_model_and_tokenizer(model_path, gguf_path)
         logger.info("Model loaded successfully")
 

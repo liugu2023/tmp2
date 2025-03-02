@@ -2142,6 +2142,274 @@ _**Assistant**_
 
 
 
+让我们修改 worker.py 中的模型加载部分，通过设置 device_map 和内存优化来控制显存使用：
+
+```python:ktransformers/worker.py
+def load_model(self, model_path: str, gguf_path: str):
+    logger.info("Loading tokenizer...")
+    self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    
+    logger.info("Loading model config...")
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    torch.set_default_dtype(config.torch_dtype)
+    
+    logger.info("Loading model...")
+    # 设置内存优化和设备映射
+    device_map = {
+        'model.embed_tokens': 'cpu',
+        'model.norm': 'cuda:0',
+        'lm_head': 'cpu'
+    }
+    # 为每个transformer层分配设备
+    num_layers = config.num_hidden_layers
+    for i in range(num_layers):
+        # 将一半的层放在CPU上
+        if i < num_layers // 2:
+            device_map[f'model.layers.{i}'] = 'cpu'
+        else:
+            device_map[f'model.layers.{i}'] = 'cuda:0'
+    
+    self.model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        config=config,
+        trust_remote_code=True,
+        device_map=device_map,
+        torch_dtype=torch.float16,  # 使用半精度
+        low_cpu_mem_usage=True,     # 降低CPU内存使用
+        offload_folder="offload",   # 设置模型权重卸载目录
+        offload_state_dict=True,    # 启用状态字典卸载
+    )
+    self.model.eval()
+    
+    # 设置生成配置
+    try:
+        self.model.generation_config = GenerationConfig.from_pretrained(model_path)
+    except Exception as e:
+        logger.warning(f"Generation config can't auto create, making default. Message: {e}")
+        self.model.generation_config = GenerationConfig(
+            temperature=0.6,
+            top_p=0.9,
+            do_sample=True
+        )
+    if self.model.generation_config.pad_token_id is None:
+        self.model.generation_config.pad_token_id = self.model.generation_config.eos_token_id
+    
+    # 清理缓存
+    torch.cuda.empty_cache()
+    logger.info("Model loaded successfully")
+    
+    # 输出内存使用情况
+    allocated = torch.cuda.memory_allocated() / 1024**3
+    reserved = torch.cuda.memory_reserved() / 1024**3
+    logger.info(f"GPU Memory after loading: Allocated={allocated:.2f}GB, Reserved={reserved:.2f}GB")
+```
+
+主要优化：
+1. 使用 device_map 将模型分布在 CPU 和 GPU 上
+   - 嵌入层放在 CPU 上
+   - 一半的 transformer 层放在 CPU 上
+   - 另一半放在 GPU 上
+2. 使用半精度 (float16) 加载模型
+3. 启用低 CPU 内存使用模式
+4. 启用模型权重卸载
+5. 添加内存使用情况的日志
+
+运行命令保持不变：
+
+1. GPU 机器 (10.21.22.206):
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0 python -m ktransformers.worker --worker_address "10.21.22.206:29500"
+```
+
+2. CPU 机器 (10.21.22.100):
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.local_chat \
+    --model_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/ \
+    --gguf_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/ \
+    --worker_address "10.21.22.206:29500" \
+    --max_new_tokens 50
+```
+
+这样应该能将模型加载时的显存使用降到 50% 左右。如果还需要进一步优化，我们可以：
+1. 调整更多层到 CPU
+2. 使用更激进的量化方法
+3. 启用更多的内存优化选项
+
+请告诉我运行结果和显存使用情况。
+
+---
+
+_**User**_
+
+我要是在cpu上加载模型，在gpu上使用模型推理呢
+
+---
+
+_**Assistant**_
+
+
+
+
+
+让我们修改代码来实现在 CPU 上加载模型，然后在需要推理时将模型移动到 GPU。修改 worker.py：
+
+```python:ktransformers/worker.py
+def load_model(self, model_path: str, gguf_path: str):
+    logger.info("Loading tokenizer...")
+    self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    
+    logger.info("Loading model config...")
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    torch.set_default_dtype(config.torch_dtype)
+    
+    logger.info("Loading model on CPU...")
+    self.model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        config=config,
+        trust_remote_code=True,
+        device_map='cpu',  # 在CPU上加载
+        torch_dtype=torch.float16,  # 使用半精度
+        low_cpu_mem_usage=True,     # 降低CPU内存使用
+    )
+    self.model.eval()
+    
+    # 设置生成配置
+    try:
+        self.model.generation_config = GenerationConfig.from_pretrained(model_path)
+    except Exception as e:
+        logger.warning(f"Generation config can't auto create, making default. Message: {e}")
+        self.model.generation_config = GenerationConfig(
+            temperature=0.6,
+            top_p=0.9,
+            do_sample=True
+        )
+    if self.model.generation_config.pad_token_id is None:
+        self.model.generation_config.pad_token_id = self.model.generation_config.eos_token_id
+    
+    logger.info("Model loaded successfully on CPU")
+
+def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        logger.info("Received generation request")
+        logger.info(f"Input sequence length: {len(input_data['input_ids'])}")
+        
+        # 将模型移动到GPU
+        logger.info("Moving model to GPU...")
+        self.model = self.model.cuda()
+        
+        # 创建输入张量
+        logger.info("Moving input tensors to GPU...")
+        input_ids = torch.tensor(input_data['input_ids'], device='cuda')
+        attention_mask = torch.tensor(input_data['attention_mask'], device='cuda')
+        
+        # 生成参数日志
+        max_new_tokens = input_data.get('max_new_tokens', 512)
+        temperature = input_data.get('temperature', 0.6)
+        top_p = input_data.get('top_p', 0.9)
+        logger.info(f"Generation parameters: max_new_tokens={max_new_tokens}, "
+                   f"temperature={temperature}, "
+                   f"top_p={top_p}")
+        
+        # 生成文本
+        logger.info("Starting text generation...")
+        start_time = time.time()
+        with torch.no_grad(), torch.amp.autocast('cuda'):
+            logger.info("Initializing generation process...")
+            # ... 其他日志保持不变 ...
+            
+            outputs = self.model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                do_sample=input_data.get('do_sample', True),
+                streamer=streamer
+            )
+        
+        # 将模型移回CPU，释放GPU内存
+        logger.info("Moving model back to CPU...")
+        self.model = self.model.cpu()
+        torch.cuda.empty_cache()
+        
+        # 移动输出到CPU
+        logger.info("Moving outputs to CPU...")
+        outputs_cpu = outputs.to('cpu', non_blocking=True)
+        torch.cuda.synchronize()
+        
+        # 记录GPU内存使用情况
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        logger.info(f"GPU Memory: Allocated={allocated:.2f}GB, Reserved={reserved:.2f}GB")
+        
+        logger.info("Preparing response...")
+        return {
+            'output_ids': outputs_cpu.numpy().tolist(),
+            'status': 'success'
+        }
+    except Exception as e:
+        # 确保在发生错误时也将模型移回CPU
+        try:
+            self.model = self.model.cpu()
+            torch.cuda.empty_cache()
+        except:
+            pass
+        logger.error(f"Generation error: {str(e)}")
+        return {
+            'status': 'error',
+            'error': str(e)
+        }
+```
+
+
+主要改动：
+1. 在 CPU 上加载模型
+2. 在生成时将模型移动到 GPU
+3. 生成完成后将模型移回 CPU
+4. 添加错误处理以确保模型总是回到 CPU
+5. 每次生成后清理 GPU 缓存
+
+运行命令保持不变：
+
+1. GPU 机器 (10.21.22.206):
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0 python -m ktransformers.worker --worker_address "10.21.22.206:29500"
+```
+
+
+2. CPU 机器 (10.21.22.100):
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.local_chat \
+    --model_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/ \
+    --gguf_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/ \
+    --worker_address "10.21.22.206:29500" \
+    --max_new_tokens 50
+```
+
+
+这种方式的优点：
+1. 加载模型时不占用 GPU 内存
+2. 只在推理时使用 GPU
+3. 每次推理后释放 GPU 内存
+
+缺点：
+1. 每次推理需要额外的 CPU-GPU 传输时间
+2. 可能会增加一些延迟
+
+如果延迟太大，我们可以考虑只移动必要的层到 GPU，而不是整个模型。请告诉我运行效果如何。
+
+---
+
+_**User**_
+
+让显卡直接从内存里读取数据，不要将加载好的模型移动到显存里，显卡的作用只是模型推理
+
+---
+
+_**Assistant**_
+
+
+
 ---
 
 

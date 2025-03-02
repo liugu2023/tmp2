@@ -1740,6 +1740,160 @@ _**Assistant**_
 
 
 
+
+
+让我们修改代码，在推理阶段动态管理模型层的设备分配：
+
+```python:ktransformers/worker.py
+class ModelWorker:
+    def __init__(self, address: str):
+        # ... 现有代码保持不变 ...
+        self.device_map = None  # 添加设备映射跟踪
+        self.n_layers = None    # 添加层数跟踪
+
+    def load_model(self, model_path: str, gguf_path: str):
+        logger.info("Loading tokenizer...")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        
+        logger.info("Loading model config...")
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        torch.set_default_dtype(config.torch_dtype)
+        self.n_layers = config.num_hidden_layers
+        
+        logger.info("Loading model with default device mapping...")
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            config=config,
+            trust_remote_code=True,
+            device_map="auto",
+            torch_dtype=torch.float16
+        )
+        self.model.eval()
+        
+        # ... 其他加载代码保持不变 ...
+
+    def _optimize_memory(self, input_length: int):
+        """根据输入长度动态调整模型层的设备分配"""
+        if input_length > 512:  # 对于长输入，将更多层移到 CPU
+            n_layers_gpu = int(self.n_layers * 0.5)  # 50% 的层在 GPU
+        else:
+            n_layers_gpu = int(self.n_layers * 0.7)  # 70% 的层在 GPU
+        
+        new_device_map = {
+            'model.embed_tokens': 'cuda',
+            'model.norm': 'cuda',
+            'lm_head': 'cuda',
+        }
+        
+        for i in range(self.n_layers):
+            if i < n_layers_gpu:
+                new_device_map[f'model.layers.{i}'] = 'cuda'
+            else:
+                new_device_map[f'model.layers.{i}'] = 'cpu'
+        
+        # 只在设备映射发生变化时才重新分配
+        if new_device_map != self.device_map:
+            logger.info("Adjusting model layer distribution...")
+            logger.info(f"Moving {self.n_layers - n_layers_gpu} layers to CPU")
+            
+            # 记录调整前的内存
+            before_mem = torch.cuda.memory_allocated() / 1024**2
+            
+            # 移动层到新设备
+            for name, device in new_device_map.items():
+                if hasattr(self.model, name):
+                    module = getattr(self.model, name)
+                    module.to(device)
+                else:
+                    try:
+                        module = self.model.get_submodule(name)
+                        module.to(device)
+                    except AttributeError:
+                        continue
+            
+            # 记录调整后的内存
+            after_mem = torch.cuda.memory_allocated() / 1024**2
+            logger.info(f"Memory change: {after_mem - before_mem:.1f}MB")
+            
+            self.device_map = new_device_map
+            torch.cuda.empty_cache()
+
+    def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            logger.info("Received generation request")
+            input_length = len(input_data['input_ids'])
+            logger.info(f"Input sequence length: {input_length}")
+            
+            # 根据输入长度优化内存
+            self._optimize_memory(input_length)
+            
+            # 创建输入张量
+            logger.info("Moving input tensors to GPU...")
+            input_ids = torch.tensor(input_data['input_ids'], device='cuda')
+            attention_mask = torch.tensor(input_data['attention_mask'], device='cuda')
+            
+            # ... 其余生成代码保持不变 ...
+
+```
+
+
+主要改动：
+1. 模型加载时使用默认的 "auto" 设备映射
+2. 添加了动态内存优化函数 `_optimize_memory`
+3. 根据输入长度动态调整模型层的分布
+4. 只在必要时才重新分配设备
+5. 添加了内存变化跟踪
+
+使用方式不变：
+
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0 python -m ktransformers.worker --worker_address "10.21.22.206:29500" --num_threads 10
+```
+
+
+这样的好处是：
+1. 初始加载使用 transformers 的自动设备映射
+2. 在推理时根据实际需求动态调整
+3. 对于短输入保持更多层在 GPU 以提高速度
+4. 对于长输入自动将更多层移到 CPU 以节省显存
+
+如果还需要其他优化，请告诉我。
+
+---
+
+_**User**_
+
+INFO:__main__:Initial memory usage after model loading:
+INFO:__main__:GPU Memory Usage:
+INFO:__main__:  GPU 0: Allocated: 11796.2MB, Reserved: 11798.0MB
+INFO:__main__:Model loaded successfully
+INFO:__main__:Received generation request
+INFO:__main__:Input sequence length: 1
+INFO:__main__:Adjusting model layer distribution...
+INFO:__main__:Moving 24 layers to CPU
+ERROR:__main__:Generation error: Cannot copy out of meta tensor; no data! Please use torch.nn.Module.to_empty() instead of torch.nn.Module.to() when moving module from meta to a different device.
+ERROR:__main__:Detailed traceback:
+Traceback (most recent call last):
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 141, in generate
+    self._optimize_memory(input_length)
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 123, in _optimize_memory
+    module.to(device)
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1340, in to
+    return self._apply(convert)
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/torch/nn/modules/module.py", line 927, in _apply
+    param_applied = fn(param)
+                    ^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1333, in convert
+    raise NotImplementedError(
+NotImplementedError: Cannot copy out of meta tensor; no data! Please use torch.nn.Module.to_empty() instead of torch.nn.Module.to() when moving module from meta to a different device.
+
+---
+
+_**Assistant**_
+
+
+
 ---
 
 

@@ -58,7 +58,8 @@ class ModelWorker:
             config=config,
             trust_remote_code=True,
             device_map="auto",
-            torch_dtype=torch.float16
+            torch_dtype=torch.float16,
+            low_cpu_mem_usage=True  # 添加这个参数
         )
         self.model.eval()
         
@@ -87,49 +88,55 @@ class ModelWorker:
 
     def _optimize_memory(self, input_length: int):
         """根据输入长度动态调整模型层的设备分配"""
-        if input_length > 512:  # 对于长输入，将更多层移到 CPU
-            n_layers_gpu = int(self.n_layers * 0.5)  # 50% 的层在 GPU
-        else:
-            n_layers_gpu = int(self.n_layers * 0.7)  # 70% 的层在 GPU
-        
-        new_device_map = {
-            'model.embed_tokens': 'cuda',
-            'model.norm': 'cuda',
-            'lm_head': 'cuda',
-        }
-        
-        for i in range(self.n_layers):
-            if i < n_layers_gpu:
-                new_device_map[f'model.layers.{i}'] = 'cuda'
+        try:
+            if input_length > 512:  # 对于长输入，将更多层移到 CPU
+                n_layers_gpu = int(self.n_layers * 0.5)  # 50% 的层在 GPU
             else:
-                new_device_map[f'model.layers.{i}'] = 'cpu'
-        
-        # 只在设备映射发生变化时才重新分配
-        if new_device_map != self.device_map:
-            logger.info("Adjusting model layer distribution...")
-            logger.info(f"Moving {self.n_layers - n_layers_gpu} layers to CPU")
+                n_layers_gpu = int(self.n_layers * 0.7)  # 70% 的层在 GPU
             
-            # 记录调整前的内存
-            before_mem = torch.cuda.memory_allocated() / 1024**2
+            new_device_map = {
+                'model.embed_tokens': 'cuda',
+                'model.norm': 'cuda',
+                'lm_head': 'cuda',
+            }
             
-            # 移动层到新设备
-            for name, device in new_device_map.items():
-                if hasattr(self.model, name):
-                    module = getattr(self.model, name)
-                    module.to(device)
+            for i in range(self.n_layers):
+                if i < n_layers_gpu:
+                    new_device_map[f'model.layers.{i}'] = 'cuda'
                 else:
-                    try:
-                        module = self.model.get_submodule(name)
-                        module.to(device)
-                    except AttributeError:
-                        continue
+                    new_device_map[f'model.layers.{i}'] = 'cpu'
             
-            # 记录调整后的内存
-            after_mem = torch.cuda.memory_allocated() / 1024**2
-            logger.info(f"Memory change: {after_mem - before_mem:.1f}MB")
-            
-            self.device_map = new_device_map
-            torch.cuda.empty_cache()
+            # 只在设备映射发生变化时才重新分配
+            if new_device_map != self.device_map:
+                logger.info("Adjusting model layer distribution...")
+                logger.info(f"Moving {self.n_layers - n_layers_gpu} layers to CPU")
+                
+                # 记录调整前的内存
+                before_mem = torch.cuda.memory_allocated() / 1024**2
+                
+                # 使用 device_map 参数重新加载模型
+                logger.info("Reloading model with new device mapping...")
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    self.model.name_or_path,
+                    config=self.model.config,
+                    trust_remote_code=True,
+                    device_map=new_device_map,
+                    torch_dtype=torch.float16
+                )
+                self.model.eval()
+                
+                # 记录调整后的内存
+                after_mem = torch.cuda.memory_allocated() / 1024**2
+                logger.info(f"Memory change: {after_mem - before_mem:.1f}MB")
+                
+                self.device_map = new_device_map
+                torch.cuda.empty_cache()
+                
+        except Exception as e:
+            logger.error(f"Error in memory optimization: {str(e)}")
+            logger.exception("Detailed traceback:")
+            # 如果优化失败，继续使用当前模型状态
+            pass
 
     def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
         try:

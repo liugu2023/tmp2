@@ -10,6 +10,8 @@ from ktransformers.models.modeling_qwen2_moe import Qwen2MoeForCausalLM
 from ktransformers.models.modeling_deepseek_v3 import DeepseekV3ForCausalLM
 from ktransformers.models.modeling_llama import LlamaForCausalLM
 from ktransformers.models.modeling_mixtral import MixtralForCausalLM
+import multiprocessing as mp
+import os
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -32,14 +34,17 @@ default_optimize_rules = {
 }
 
 class ModelWorker:
-    def __init__(self, address: str):
+    def __init__(self, address: str, worker_id: int):
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.REP)
         host, port = address.split(':')
+        # 每个worker使用不同的端口
+        port = int(port) + worker_id
         self.socket.bind(f"tcp://0.0.0.0:{port}")
         self.model = None
         self.tokenizer = None
-        logger.info(f"Worker started at {address}")
+        self.worker_id = worker_id
+        logger.info(f"Worker {worker_id} started at {host}:{port}")
 
     def load_model(self, model_path: str, gguf_path: str):
         logger.info("Loading tokenizer...")
@@ -118,7 +123,7 @@ class ModelWorker:
             }
 
     def run(self):
-        logger.info("Worker ready to receive requests")
+        logger.info(f"Worker {self.worker_id} ready to receive requests")
         while True:
             try:
                 message = self.socket.recv_pyobj()
@@ -133,22 +138,38 @@ class ModelWorker:
                     self.socket.send_pyobj(result)
                 
                 elif command == 'shutdown':
-                    logger.info("Shutting down worker")
+                    logger.info(f"Shutting down worker {self.worker_id}")
                     self.socket.send_pyobj({'status': 'shutdown'})
                     break
                 
             except Exception as e:
-                logger.error(f"Error processing message: {str(e)}")
+                logger.error(f"Error in worker {self.worker_id}: {str(e)}")
                 self.socket.send_pyobj({'status': 'error', 'error': str(e)})
+
+def run_worker(address: str, worker_id: int):
+    # 设置进程亲和性
+    os.sched_setaffinity(0, {worker_id})
+    worker = ModelWorker(address, worker_id)
+    worker.run()
 
 def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--worker_address', type=str, required=True)
+    parser.add_argument('--num_workers', type=int, default=10)
     args = parser.parse_args()
     
-    worker = ModelWorker(args.worker_address)
-    worker.run()
+    # 创建多个worker进程
+    processes = []
+    for i in range(args.num_workers):
+        p = mp.Process(target=run_worker, args=(args.worker_address, i))
+        p.start()
+        processes.append(p)
+        logger.info(f"Started worker process {i}")
+    
+    # 等待所有进程完成
+    for p in processes:
+        p.join()
 
 if __name__ == '__main__':
     main() 

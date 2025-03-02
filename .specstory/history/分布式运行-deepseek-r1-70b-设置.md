@@ -1554,7 +1554,7 @@ PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.local_chat \
 
 _**User**_
 
-得了，把cpu也改到10.21.22.206上，因为现在本身就在上面运行，10.21.22.100根本啥也没干好像
+Starting text generation这一步太慢了，怎么优化一下，我有两块gpu，cuda0,1
 
 ---
 
@@ -1562,76 +1562,103 @@ _**Assistant**_
 
 
 
-明白了，确实没必要分开运行，因为主程序的 CPU 负载很小。让我们在同一台机器上运行，这样可以减少网络开销：
-
-1. 首先在 10.21.22.206 上启动 worker：
-```bash
-PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0 python -m ktransformers.worker --worker_address "127.0.0.1:29500"
-```
-
-2. 然后在同一台机器（10.21.22.206）上运行主程序：
-```bash
-PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.local_chat \
-    --model_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/ \
-    --gguf_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/ \
-    --worker_address "127.0.0.1:29500"
-```
-
-主要优点：
-1. 避免了网络延迟
-2. 不需要处理跨机器通信的问题
-3. 更简单的部署和维护
-4. 更好的性能
-
-这样应该会比之前的跨机器通信快很多。如果还需要其他优化，请告诉我。
-
----
-
-_**User**_
-
-Starting text generation这一步卡的时间太长了
-
----
-
-_**Assistant**_
-
-
-
-让我们优化一下生成参数和模型配置，以加快生成速度：
+让我们使用两块 GPU 来优化模型加载和生成。我们需要修改 worker.py 来利用多 GPU：
 
 ```python:ktransformers/worker.py
+def load_model(self, model_path: str, gguf_path: str):
+    logger.info("Loading tokenizer...")
+    self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    
+    logger.info("Loading model config...")
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    torch.set_default_dtype(config.torch_dtype)
+    
+    logger.info("Loading model...")
+    # 设置设备映射，将模型分布到两个 GPU 上
+    device_map = {
+        'model.embed_tokens': 0,
+        'model.layers.0': 0,
+        'model.layers.1': 0,
+        'model.layers.2': 0,
+        'model.layers.3': 0,
+        'model.layers.4': 0,
+        'model.layers.5': 0,
+        'model.layers.6': 0,
+        'model.layers.7': 0,
+        'model.layers.8': 0,
+        'model.layers.9': 0,
+        'model.layers.10': 0,
+        'model.layers.11': 0,
+        'model.layers.12': 0,
+        'model.layers.13': 0,
+        'model.layers.14': 0,
+        'model.layers.15': 1,
+        'model.layers.16': 1,
+        'model.layers.17': 1,
+        'model.layers.18': 1,
+        'model.layers.19': 1,
+        'model.layers.20': 1,
+        'model.layers.21': 1,
+        'model.layers.22': 1,
+        'model.layers.23': 1,
+        'model.layers.24': 1,
+        'model.layers.25': 1,
+        'model.layers.26': 1,
+        'model.layers.27': 1,
+        'model.layers.28': 1,
+        'model.layers.29': 1,
+        'model.layers.30': 1,
+        'model.norm': 1,
+        'lm_head': 1
+    }
+    
+    self.model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        config=config,
+        trust_remote_code=True,
+        device_map=device_map,  # 使用自定义设备映射
+        torch_dtype=torch.bfloat16  # 使用 bfloat16 进一步优化性能
+    )
+    self.model.eval()
+    
+    # 设置生成配置
+    try:
+        self.model.generation_config = GenerationConfig.from_pretrained(model_path)
+    except Exception as e:
+        logger.warning(f"Generation config can't auto create, making default. Message: {e}")
+        self.model.generation_config = GenerationConfig(
+            temperature=0.6,
+            top_p=0.9,
+            do_sample=True
+        )
+    if self.model.generation_config.pad_token_id is None:
+        self.model.generation_config.pad_token_id = self.model.generation_config.eos_token_id
+        
+    logger.info("Model loaded successfully")
+
 def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
     try:
         logger.info("Received generation request")
         logger.info(f"Input sequence length: {len(input_data['input_ids'])}")
         
-        input_ids = torch.tensor(input_data['input_ids'], device='cuda')
-        attention_mask = torch.tensor(input_data['attention_mask'], device='cuda')
+        # 将输入放在第一个 GPU 上
+        input_ids = torch.tensor(input_data['input_ids'], device='cuda:0')
+        attention_mask = torch.tensor(input_data['attention_mask'], device='cuda:0')
         
-        # 优化生成参数
-        generation_config = {
-            'max_new_tokens': input_data.get('max_new_tokens', 512),
-            'temperature': input_data.get('temperature', 0.6),
-            'top_p': input_data.get('top_p', 0.9),
-            'do_sample': input_data.get('do_sample', True),
-            # 添加以下参数来加速生成
-            'num_beams': 1,  # 禁用 beam search
-            'early_stopping': True,
-            'repetition_penalty': 1.0,  # 禁用重复惩罚
-            'length_penalty': 1.0,  # 中性长度惩罚
-            'use_cache': True,  # 启用 KV 缓存
-            'pad_token_id': self.model.generation_config.pad_token_id,
-            'eos_token_id': self.model.generation_config.eos_token_id,
-        }
-        
-        logger.info(f"Generation parameters: {generation_config}")
+        logger.info(f"Generation parameters: max_new_tokens={input_data.get('max_new_tokens', 512)}, "
+                   f"temperature={input_data.get('temperature', 0.6)}, "
+                   f"top_p={input_data.get('top_p', 0.9)}")
         
         logger.info("Starting text generation...")
-        with torch.no_grad(), torch.amp.autocast('cuda', dtype=torch.float16):  # 使用 FP16
+        with torch.no_grad(), torch.amp.autocast('cuda'):
             outputs = self.model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                **generation_config
+                max_new_tokens=input_data.get('max_new_tokens', 512),
+                temperature=input_data.get('temperature', 0.6),
+                top_p=input_data.get('top_p', 0.9),
+                do_sample=input_data.get('do_sample', True),
+                use_cache=True  # 启用 KV 缓存
             )
         
         logger.info(f"Generation completed. Output sequence length: {len(outputs[0])}")
@@ -1649,203 +1676,27 @@ def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
             'status': 'error',
             'error': str(e)
         }
-
-def load_model(self, model_path: str, gguf_path: str):
-    logger.info("Loading tokenizer...")
-    self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    
-    logger.info("Loading model config...")
-    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-    
-    # 优化模型配置
-    config.use_cache = True  # 启用 KV 缓存
-    config.pretraining_tp = 1  # 禁用张量并行
-    config.torch_dtype = torch.float16  # 使用 FP16
-    torch.set_default_dtype(torch.float16)
-    
-    logger.info("Loading model...")
-    self.model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        config=config,
-        trust_remote_code=True,
-        device_map="auto",
-        torch_dtype=torch.float16,  # 使用 FP16
-        low_cpu_mem_usage=True
-    )
-    self.model.eval()
-    
-    # 优化生成配置
-    try:
-        self.model.generation_config = GenerationConfig.from_pretrained(model_path)
-    except Exception as e:
-        logger.warning(f"Generation config can't auto create, making default. Message: {e}")
-        self.model.generation_config = GenerationConfig(
-            temperature=0.6,
-            top_p=0.9,
-            do_sample=True,
-            num_beams=1,
-            early_stopping=True,
-            use_cache=True
-        )
-    if self.model.generation_config.pad_token_id is None:
-        self.model.generation_config.pad_token_id = self.model.generation_config.eos_token_id
-        
-    logger.info("Model loaded successfully")
 ```
 
 主要优化：
-1. 使用 FP16 精度
-2. 启用 KV 缓存
-3. 禁用不必要的功能（beam search、重复惩罚等）
-4. 优化模型配置（禁用张量并行、低 CPU 内存使用等）
-5. 使用更激进的生成参数
+1. 将模型分层加载到两个 GPU 上，前半部分在 GPU 0，后半部分在 GPU 1
+2. 使用 bfloat16 精度
+3. 启用 KV 缓存
+4. 使用非阻塞传输
 
-这些优化应该能显著提高生成速度。如果还是太慢，我们可以：
-1. 减小 max_new_tokens
-2. 进一步降低 temperature
-3. 使用更激进的量化策略
-4. 尝试使用 Flash Attention
-
-请告诉我优化后的效果如何。
-
----
-
-_**User**_
-
-206上还有另一块gpu，也用上
-
----
-
-_**Assistant**_
-
-
-
-
-
-好的，让我们修改代码以使用多个 GPU。我们需要修改 worker.py 来支持多 GPU 并行：
-
-```python:ktransformers/worker.py
-class ModelWorker:
-    def __init__(self, address: str):
-        self.context = zmq.Context()
-        self.socket = self.context.socket(zmq.REP)
-        host, port = address.split(':')
-        self.socket.bind(f"tcp://0.0.0.0:{port}")
-        self.socket.setsockopt(zmq.RCVHWM, 0)
-        self.socket.setsockopt(zmq.SNDHWM, 0)
-        
-        # 设置 CPU 线程数
-        torch.set_num_threads(10)
-        
-        self.model = None
-        self.tokenizer = None
-        
-        # 获取可用的 GPU
-        self.num_gpus = torch.cuda.device_count()
-        logger.info(f"Found {self.num_gpus} GPUs")
-        
-        logger.info(f"Worker started at {address}, listening on all interfaces")
-        logger.info(f"CPU threads set to: {torch.get_num_threads()}")
-
-    def load_model(self, model_path: str, gguf_path: str):
-        logger.info("Loading tokenizer...")
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        
-        logger.info("Loading model config...")
-        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-        
-        # 优化模型配置
-        config.use_cache = True
-        config.pretraining_tp = 1
-        config.torch_dtype = torch.float16
-        torch.set_default_dtype(torch.float16)
-        
-        # 创建设备映射
-        if self.num_gpus > 1:
-            # 在多个 GPU 之间平均分配模型层
-            device_map = "auto"
-            max_memory = {i: "40GiB" for i in range(self.num_gpus)}  # 为每个 GPU 分配内存
-            logger.info(f"Using device map: auto with max_memory: {max_memory}")
-        else:
-            device_map = "auto"
-            max_memory = None
-        
-        logger.info("Loading model...")
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            config=config,
-            trust_remote_code=True,
-            device_map=device_map,
-            max_memory=max_memory,
-            torch_dtype=torch.float16,
-            low_cpu_mem_usage=True
-        )
-        self.model.eval()
-        
-        # 优化生成配置
-        try:
-            self.model.generation_config = GenerationConfig.from_pretrained(model_path)
-        except Exception as e:
-            logger.warning(f"Generation config can't auto create, making default. Message: {e}")
-            self.model.generation_config = GenerationConfig(
-                temperature=0.6,
-                top_p=0.9,
-                do_sample=True,
-                num_beams=1,
-                early_stopping=True,
-                use_cache=True
-            )
-        if self.model.generation_config.pad_token_id is None:
-            self.model.generation_config.pad_token_id = self.model.generation_config.eos_token_id
-            
-        logger.info("Model loaded successfully")
-        if self.num_gpus > 1:
-            logger.info("Model distributed across multiple GPUs")
-            for name, param in self.model.named_parameters():
-                logger.info(f"Parameter {name} on device: {param.device}")
-
-    # ... rest of the code remains the same ...
-```
-
-
-现在运行时：
-
+运行命令：
 ```bash
-# 使用所有可用的 GPU
-CUDA_VISIBLE_DEVICES=0,1 python -m ktransformers.worker --worker_address "127.0.0.1:29500"
+# 在 GPU 机器上运行
+PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0,1 python -m ktransformers.worker --worker_address "10.21.22.206:29500"
 ```
 
+这样应该能显著提高生成速度。如果还是觉得慢，我们可以：
+1. 调整层的分配比例
+2. 减小 max_new_tokens
+3. 进一步调整生成参数
+4. 使用更激进的量化策略
 
-主要改动：
-1. 自动检测可用的 GPU 数量
-2. 在多个 GPU 之间自动分配模型层
-3. 为每个 GPU 分配合适的内存限制
-4. 添加了详细的设备分配日志
-
-这样应该能充分利用两块 GPU 的性能。模型的不同层会被自动分配到不同的 GPU 上，可以：
-1. 增加总可用显存
-2. 在某些情况下提高推理速度
-3. 更好地利用硬件资源
-
-如果需要更细粒度的控制或其他优化，请告诉我。
-
----
-
-_**User**_
-
-现在可以识别到俩gpu，但只使用了一块
-
----
-
-_**Assistant**_
-
-
-
-让我们修改代码来强制使用两块 GPU。问题可能出在设备映射上，我们需要明确指定模型层的分布：
-
-```python:ktransformers/worker.py
-def load_model(self, model_path: str, gguf_path: str):
-    logger.info
+请告诉我运行效果如何。
 
 ---
 

@@ -37,15 +37,10 @@ class ModelWorker:
         self.socket.setsockopt(zmq.SNDHWM, 0)
         
         # 设置 CPU 线程数
-        torch.set_num_threads(10)
+        torch.set_num_threads(10)  # 限制 CPU 线程数为 10
         
         self.model = None
         self.tokenizer = None
-        
-        # 获取可用的 GPU
-        self.num_gpus = torch.cuda.device_count()
-        logger.info(f"Found {self.num_gpus} GPUs")
-        
         logger.info(f"Worker started at {address}, listening on all interfaces")
         logger.info(f"CPU threads set to: {torch.get_num_threads()}")
 
@@ -55,50 +50,57 @@ class ModelWorker:
         
         logger.info("Loading model config...")
         config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-        
-        # 优化模型配置
-        config.use_cache = True
-        config.pretraining_tp = 1
-        config.torch_dtype = torch.float16
-        torch.set_default_dtype(torch.float16)
-        
-        # 创建设备映射
-        if self.num_gpus > 1:
-            # 手动创建设备映射，确保使用所有 GPU
-            num_layers = config.num_hidden_layers
-            layers_per_gpu = num_layers // self.num_gpus
-            
-            device_map = {
-                'model.embed_tokens': 0,
-                'model.norm': self.num_gpus - 1,
-                'lm_head': self.num_gpus - 1,
-            }
-            
-            # 分配 transformer 层到不同 GPU
-            for i in range(num_layers):
-                gpu_id = min(i // layers_per_gpu, self.num_gpus - 1)
-                device_map[f'model.layers.{i}'] = gpu_id
-                
-            max_memory = {i: "40GiB" for i in range(self.num_gpus)}
-            logger.info(f"Using custom device map across {self.num_gpus} GPUs")
-            logger.info(f"Device map: {device_map}")
-        else:
-            device_map = "auto"
-            max_memory = None
+        torch.set_default_dtype(config.torch_dtype)
         
         logger.info("Loading model...")
+        # 设置设备映射，将模型分布到两个 GPU 上
+        device_map = {
+            'model.embed_tokens': 0,
+            'model.layers.0': 0,
+            'model.layers.1': 0,
+            'model.layers.2': 0,
+            'model.layers.3': 0,
+            'model.layers.4': 0,
+            'model.layers.5': 0,
+            'model.layers.6': 0,
+            'model.layers.7': 0,
+            'model.layers.8': 0,
+            'model.layers.9': 0,
+            'model.layers.10': 0,
+            'model.layers.11': 0,
+            'model.layers.12': 0,
+            'model.layers.13': 0,
+            'model.layers.14': 0,
+            'model.layers.15': 1,
+            'model.layers.16': 1,
+            'model.layers.17': 1,
+            'model.layers.18': 1,
+            'model.layers.19': 1,
+            'model.layers.20': 1,
+            'model.layers.21': 1,
+            'model.layers.22': 1,
+            'model.layers.23': 1,
+            'model.layers.24': 1,
+            'model.layers.25': 1,
+            'model.layers.26': 1,
+            'model.layers.27': 1,
+            'model.layers.28': 1,
+            'model.layers.29': 1,
+            'model.layers.30': 1,
+            'model.norm': 1,
+            'lm_head': 1
+        }
+        
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path,
             config=config,
             trust_remote_code=True,
-            device_map=device_map,
-            max_memory=max_memory,
-            torch_dtype=torch.float16,
-            low_cpu_mem_usage=True
+            device_map=device_map,  # 使用自定义设备映射
+            torch_dtype=torch.bfloat16  # 使用 bfloat16 进一步优化性能
         )
         self.model.eval()
         
-        # 优化生成配置
+        # 设置生成配置
         try:
             self.model.generation_config = GenerationConfig.from_pretrained(model_path)
         except Exception as e:
@@ -106,54 +108,36 @@ class ModelWorker:
             self.model.generation_config = GenerationConfig(
                 temperature=0.6,
                 top_p=0.9,
-                do_sample=True,
-                num_beams=1,
-                early_stopping=True,
-                use_cache=True
+                do_sample=True
             )
         if self.model.generation_config.pad_token_id is None:
             self.model.generation_config.pad_token_id = self.model.generation_config.eos_token_id
             
         logger.info("Model loaded successfully")
-        if self.num_gpus > 1:
-            logger.info("Model distributed across multiple GPUs")
-            for name, param in self.model.named_parameters():
-                logger.info(f"Parameter {name} on device: {param.device}")
 
     def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
         try:
             logger.info("Received generation request")
             logger.info(f"Input sequence length: {len(input_data['input_ids'])}")
             
-            # 对于多 GPU，我们使用第一个 GPU 作为输入设备
-            input_device = "cuda:0"
-            input_ids = torch.tensor(input_data['input_ids'], device=input_device)
-            attention_mask = torch.tensor(input_data['attention_mask'], device=input_device)
+            # 将输入放在第一个 GPU 上
+            input_ids = torch.tensor(input_data['input_ids'], device='cuda:0')
+            attention_mask = torch.tensor(input_data['attention_mask'], device='cuda:0')
             
-            # 优化生成参数
-            generation_config = {
-                'max_new_tokens': input_data.get('max_new_tokens', 512),
-                'temperature': input_data.get('temperature', 0.6),
-                'top_p': input_data.get('top_p', 0.9),
-                'do_sample': input_data.get('do_sample', True),
-                # 添加以下参数来加速生成
-                'num_beams': 1,  # 禁用 beam search
-                'early_stopping': True,
-                'repetition_penalty': 1.0,  # 禁用重复惩罚
-                'length_penalty': 1.0,  # 中性长度惩罚
-                'use_cache': True,  # 启用 KV 缓存
-                'pad_token_id': self.model.generation_config.pad_token_id,
-                'eos_token_id': self.model.generation_config.eos_token_id,
-            }
-            
-            logger.info(f"Generation parameters: {generation_config}")
+            logger.info(f"Generation parameters: max_new_tokens={input_data.get('max_new_tokens', 512)}, "
+                       f"temperature={input_data.get('temperature', 0.6)}, "
+                       f"top_p={input_data.get('top_p', 0.9)}")
             
             logger.info("Starting text generation...")
-            with torch.no_grad(), torch.amp.autocast('cuda', dtype=torch.float16):  # 使用 FP16
+            with torch.no_grad(), torch.amp.autocast('cuda'):
                 outputs = self.model.generate(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
-                    **generation_config
+                    max_new_tokens=input_data.get('max_new_tokens', 512),
+                    temperature=input_data.get('temperature', 0.6),
+                    top_p=input_data.get('top_p', 0.9),
+                    do_sample=input_data.get('do_sample', True),
+                    use_cache=True  # 启用 KV 缓存
                 )
             
             logger.info(f"Generation completed. Output sequence length: {len(outputs[0])}")

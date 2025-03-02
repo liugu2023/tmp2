@@ -7,6 +7,7 @@ from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM, Genera
 import time
 from transformers import TextStreamer
 from accelerate import dispatch_model
+from ktransformers import optimize_and_load_gguf
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -20,13 +21,29 @@ def load_model_and_tokenizer(model_path: str, gguf_path: str):
     torch.set_default_dtype(config.torch_dtype)
     
     logger.info("Loading model...")
-    # 明确指定模型加载到 cuda:0
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        config=config,
-        trust_remote_code=True,
-        device_map="cuda:0"  # 修改这里，强制加载到 cuda:0
-    )
+    if config.architectures[0] in custom_models:
+        logger.info("Using custom modeling_xxx.py")
+        if "Qwen2Moe" in config.architectures[0]:
+            config._attn_implementation = "flash_attention_2"
+        if "Llama" in config.architectures[0]:
+            config._attn_implementation = "eager"
+        if "Mixtral" in config.architectures[0]:
+            config._attn_implementation = "flash_attention_2"
+            
+        model = custom_models[config.architectures[0]](config)
+    else:
+        model = AutoModelForCausalLM.from_config(
+            config, trust_remote_code=True, attn_implementation="flash_attention_2"
+        )
+    
+    # 使用 ktransformers 的优化
+    if config.architectures[0] in default_optimize_rules:
+        logger.info(f"Using default_optimize_rule for {config.architectures[0]}")
+        optimize_config_path = default_optimize_rules[config.architectures[0]]
+    else:
+        optimize_config_path = input("Please input optimize rules path: ")
+    
+    optimize_and_load_gguf(model, optimize_config_path, gguf_path, config)
     model.eval()
     
     return model, tokenizer

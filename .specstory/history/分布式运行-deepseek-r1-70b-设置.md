@@ -2578,6 +2578,165 @@ _**Assistant**_
 
 
 
+
+
+
+
+让我们修改代码，使 cuda:0 只用于存储模型，cuda:1 专门用于推理：
+
+```python:ktransformers/worker.py
+def load_model_and_tokenizer(model_path: str, gguf_path: str):
+    logger.info("Loading tokenizer...")
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    
+    logger.info("Loading model config...")
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    torch.set_default_dtype(config.torch_dtype)
+    
+    logger.info("Loading model...")
+    # 明确指定模型加载到 cuda:0
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        config=config,
+        trust_remote_code=True,
+        device_map="cuda:0"  # 修改这里，强制加载到 cuda:0
+    )
+    model.eval()
+    
+    return model, tokenizer
+
+def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        logger.info("Received generation request")
+        logger.info(f"Input sequence length: {len(input_data['input_ids'])}")
+        
+        # 检查可用的 GPU 数量
+        gpu_count = torch.cuda.device_count()
+        logger.info(f"Available GPUs: {gpu_count}")
+        
+        if gpu_count >= 2:
+            # 多 GPU 模式
+            logger.info(f"Using GPU 0 for model storage and GPU 1 for inference")
+            
+            # 创建输入张量到推理 GPU
+            logger.info("Moving input tensors to inference GPU...")
+            input_ids = torch.tensor(input_data['input_ids'], device='cuda:1')
+            attention_mask = torch.tensor(input_data['attention_mask'], device='cuda:1')
+            
+            # 生成参数日志
+            max_new_tokens = input_data.get('max_new_tokens', 50)
+            temperature = input_data.get('temperature', 0.6)
+            top_p = input_data.get('top_p', 0.9)
+            logger.info(f"Generation parameters: max_new_tokens={max_new_tokens}, "
+                       f"temperature={temperature}, "
+                       f"top_p={top_p}")
+            
+            # 生成文本
+            logger.info("Starting text generation...")
+            start_time = time.time()
+            
+            with torch.no_grad(), torch.amp.autocast('cuda'):
+                logger.info("Initializing generation process...")
+                logger.info("- Checking model state...")
+                logger.info(f"- Model device: {self.model.device}")
+                logger.info(f"- Input shape: {input_ids.shape}")
+                logger.info(f"- GPU 0 memory allocated: {torch.cuda.memory_allocated(0)/1024**3:.2f}GB")
+                logger.info(f"- GPU 1 memory allocated: {torch.cuda.memory_allocated(1)/1024**3:.2f}GB")
+                
+                # 将模型的生成部分移到 cuda:1
+                logger.info("- Moving generation components to inference GPU...")
+                self.model.lm_head = self.model.lm_head.to('cuda:1')
+                
+                # KV cache 信息
+                num_layers = len(self.model.model.layers)
+                hidden_size = self.model.config.hidden_size
+                logger.info(f"- Model architecture:")
+                logger.info(f"  - Number of layers: {num_layers}")
+                logger.info(f"  - Hidden size: {hidden_size}")
+                
+                # 估算 KV cache 大小
+                seq_len = input_ids.shape[1] + max_new_tokens
+                kv_cache_size = 2 * num_layers * seq_len * hidden_size * input_ids.shape[0] * 2 / (1024**3)  # in GB
+                logger.info(f"- Estimated KV cache size: {kv_cache_size:.2f}GB")
+                
+                # 检查是否启用了 flash attention
+                if hasattr(self.model.config, '_attn_implementation'):
+                    logger.info(f"- Attention implementation: {self.model.config._attn_implementation}")
+                
+                logger.info("- Starting token generation...")
+                streamer = TextStreamer(
+                    self.tokenizer, 
+                    skip_prompt=True,
+                    skip_special_tokens=True
+                )
+                
+                outputs = self.model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    do_sample=input_data.get('do_sample', True),
+                    streamer=streamer
+                )
+                
+                # 生成完成后，将 lm_head 移回 cuda:0
+                logger.info("- Moving generation components back to storage GPU...")
+                self.model.lm_head = self.model.lm_head.to('cuda:0')
+                
+                # 生成完成后的处理
+                logger.info("- Moving outputs to CPU...")
+                outputs_cpu = outputs.to('cpu', non_blocking=True)
+                torch.cuda.synchronize()
+                
+                # 记录GPU内存使用情况
+                logger.info("- Final GPU memory usage:")
+                logger.info(f"  GPU 0: {torch.cuda.memory_allocated(0)/1024**3:.2f}GB")
+                logger.info(f"  GPU 1: {torch.cuda.memory_allocated(1)/1024**3:.2f}GB")
+                
+                return {
+                    'output_ids': outputs_cpu.numpy().tolist(),
+                    'status': 'success'
+                }
+```
+
+
+主要改动：
+1. 在加载模型时明确指定使用 cuda:0
+2. 移除了模型分布式部分
+3. 只将生成必需的 lm_head 移到 cuda:1
+4. 生成完成后将 lm_head 移回 cuda:0
+
+运行命令保持不变：
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0,1 python -m ktransformers.worker --worker_address "10.21.22.206:29500"
+```
+
+
+这样应该能更好地管理显存使用。如果还有问题，请告诉我。
+
+---
+
+_**User**_
+
+你这一套玩意使用ktransformers了吗
+
+---
+
+_**Assistant**_
+
+
+
+抱歉，我忽略了这一点。您说得对，我们应该使用 ktransformers 的特性。让我重新设计一下代码：
+
+```python:ktransformers/worker.py
+def load_model_and_tokenizer(model_path: str, gguf_path: str):
+    logger.info("Loading tokenizer...")
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    
+    logger.info("Loading model config...")
+    config
+
 ---
 
 

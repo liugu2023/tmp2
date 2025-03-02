@@ -45,9 +45,7 @@ class ModelWorker:
         logger.info(f"CPU threads set to: {torch.get_num_threads()}")
 
     def load_model(self, model_path: str, gguf_path: str):
-        logger.info("Loading tokenizer...")
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        
+        # 在 GPU 机器上只加载模型，不加载 tokenizer
         logger.info("Loading model config...")
         config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         torch.set_default_dtype(config.torch_dtype)
@@ -67,7 +65,7 @@ class ModelWorker:
         except Exception as e:
             logger.warning(f"Generation config can't auto create, making default. Message: {e}")
             self.model.generation_config = GenerationConfig(
-                temperature=0.7,
+                temperature=0.6,
                 top_p=0.9,
                 do_sample=True
             )
@@ -81,26 +79,28 @@ class ModelWorker:
             logger.info("Received generation request")
             logger.info(f"Input sequence length: {len(input_data['input_ids'])}")
             
+            # 直接接收已经处理好的 input_ids，减少 GPU 机器上的 CPU 负载
             input_ids = torch.tensor(input_data['input_ids'], device='cuda')
             attention_mask = torch.tensor(input_data['attention_mask'], device='cuda')
             
             logger.info(f"Generation parameters: max_new_tokens={input_data.get('max_new_tokens', 512)}, "
-                       f"temperature={input_data.get('temperature', 0.6)}, "  # 修改默认温度
+                       f"temperature={input_data.get('temperature', 0.6)}, "
                        f"top_p={input_data.get('top_p', 0.9)}")
             
+            # 纯 GPU 计算部分
             logger.info("Starting text generation...")
             with torch.no_grad(), torch.amp.autocast('cuda'):
                 outputs = self.model.generate(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     max_new_tokens=input_data.get('max_new_tokens', 512),
-                    temperature=input_data.get('temperature', 0.6),  # 修改默认温度
+                    temperature=input_data.get('temperature', 0.6),
                     top_p=input_data.get('top_p', 0.9),
                     do_sample=input_data.get('do_sample', True)
                 )
             
+            # 只返回生成的 token ids，让 CPU 机器处理解码
             logger.info(f"Generation completed. Output sequence length: {len(outputs[0])}")
-            
             outputs_cpu = outputs.to('cpu', non_blocking=True)
             torch.cuda.synchronize()
             

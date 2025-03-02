@@ -1589,7 +1589,7 @@ PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.local_chat \
 
 _**User**_
 
-但100上的cpu比206上的好，cpu部分放到100上会更快
+Starting text generation这一步卡的时间太长了
 
 ---
 

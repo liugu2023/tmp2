@@ -45,21 +45,30 @@ class ModelWorker:
         logger.info(f"CPU threads set to: {torch.get_num_threads()}")
 
     def load_model(self, model_path: str, gguf_path: str):
-        # 在 GPU 机器上只加载模型，不加载 tokenizer
+        logger.info("Loading tokenizer...")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        
         logger.info("Loading model config...")
         config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-        torch.set_default_dtype(config.torch_dtype)
+        
+        # 优化模型配置
+        config.use_cache = True  # 启用 KV 缓存
+        config.pretraining_tp = 1  # 禁用张量并行
+        config.torch_dtype = torch.float16  # 使用 FP16
+        torch.set_default_dtype(torch.float16)
         
         logger.info("Loading model...")
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path,
             config=config,
             trust_remote_code=True,
-            device_map="auto"
+            device_map="auto",
+            torch_dtype=torch.float16,  # 使用 FP16
+            low_cpu_mem_usage=True
         )
         self.model.eval()
         
-        # 设置生成配置
+        # 优化生成配置
         try:
             self.model.generation_config = GenerationConfig.from_pretrained(model_path)
         except Exception as e:
@@ -67,7 +76,10 @@ class ModelWorker:
             self.model.generation_config = GenerationConfig(
                 temperature=0.6,
                 top_p=0.9,
-                do_sample=True
+                do_sample=True,
+                num_beams=1,
+                early_stopping=True,
+                use_cache=True
             )
         if self.model.generation_config.pad_token_id is None:
             self.model.generation_config.pad_token_id = self.model.generation_config.eos_token_id
@@ -79,28 +91,37 @@ class ModelWorker:
             logger.info("Received generation request")
             logger.info(f"Input sequence length: {len(input_data['input_ids'])}")
             
-            # 直接接收已经处理好的 input_ids，减少 GPU 机器上的 CPU 负载
             input_ids = torch.tensor(input_data['input_ids'], device='cuda')
             attention_mask = torch.tensor(input_data['attention_mask'], device='cuda')
             
-            logger.info(f"Generation parameters: max_new_tokens={input_data.get('max_new_tokens', 512)}, "
-                       f"temperature={input_data.get('temperature', 0.6)}, "
-                       f"top_p={input_data.get('top_p', 0.9)}")
+            # 优化生成参数
+            generation_config = {
+                'max_new_tokens': input_data.get('max_new_tokens', 512),
+                'temperature': input_data.get('temperature', 0.6),
+                'top_p': input_data.get('top_p', 0.9),
+                'do_sample': input_data.get('do_sample', True),
+                # 添加以下参数来加速生成
+                'num_beams': 1,  # 禁用 beam search
+                'early_stopping': True,
+                'repetition_penalty': 1.0,  # 禁用重复惩罚
+                'length_penalty': 1.0,  # 中性长度惩罚
+                'use_cache': True,  # 启用 KV 缓存
+                'pad_token_id': self.model.generation_config.pad_token_id,
+                'eos_token_id': self.model.generation_config.eos_token_id,
+            }
             
-            # 纯 GPU 计算部分
+            logger.info(f"Generation parameters: {generation_config}")
+            
             logger.info("Starting text generation...")
-            with torch.no_grad(), torch.amp.autocast('cuda'):
+            with torch.no_grad(), torch.amp.autocast('cuda', dtype=torch.float16):  # 使用 FP16
                 outputs = self.model.generate(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
-                    max_new_tokens=input_data.get('max_new_tokens', 512),
-                    temperature=input_data.get('temperature', 0.6),
-                    top_p=input_data.get('top_p', 0.9),
-                    do_sample=input_data.get('do_sample', True)
+                    **generation_config
                 )
             
-            # 只返回生成的 token ids，让 CPU 机器处理解码
             logger.info(f"Generation completed. Output sequence length: {len(outputs[0])}")
+            
             outputs_cpu = outputs.to('cpu', non_blocking=True)
             torch.cuda.synchronize()
             

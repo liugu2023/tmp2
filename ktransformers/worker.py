@@ -6,6 +6,7 @@ import logging
 from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM, GenerationConfig
 import time
 from transformers import TextStreamer
+import math
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -40,6 +41,11 @@ class ModelWorker:
         
         self.model = None
         self.tokenizer = None
+        # 添加缓存字典
+        self.layer_cache = {}
+        self.embedding_cache = None
+        self.norm_cache = None
+        self.lm_head_cache = None
         logger.info(f"Worker started at {address}, listening on all interfaces")
 
     def load_model(self, model_path: str, gguf_path: str):
@@ -61,6 +67,10 @@ class ModelWorker:
         )
         self.model.eval()
         
+        # 预处理并缓存模型的各个部分
+        logger.info("Preprocessing and caching model components...")
+        self.preprocess_model()
+        
         # 设置生成配置
         try:
             self.model.generation_config = GenerationConfig.from_pretrained(model_path)
@@ -74,7 +84,120 @@ class ModelWorker:
         if self.model.generation_config.pad_token_id is None:
             self.model.generation_config.pad_token_id = self.model.generation_config.eos_token_id
         
-        logger.info("Model loaded successfully on CPU")
+        logger.info("Model loaded and cached successfully")
+
+    def preprocess_model(self):
+        """预处理模型并缓存各个组件"""
+        logger.info("Caching model components...")
+        
+        # 缓存嵌入层
+        self.embedding_cache = {
+            'weight': self.model.model.embed_tokens.weight.cpu(),
+            'device': self.model.model.embed_tokens.weight.device
+        }
+        
+        # 缓存每个transformer层
+        for i, layer in enumerate(self.model.model.layers):
+            self.layer_cache[i] = {
+                'self_attn': {
+                    'q_proj': {'weight': layer.self_attn.q_proj.weight.cpu(), 'bias': layer.self_attn.q_proj.bias.cpu() if layer.self_attn.q_proj.bias is not None else None},
+                    'k_proj': {'weight': layer.self_attn.k_proj.weight.cpu(), 'bias': layer.self_attn.k_proj.bias.cpu() if layer.self_attn.k_proj.bias is not None else None},
+                    'v_proj': {'weight': layer.self_attn.v_proj.weight.cpu(), 'bias': layer.self_attn.v_proj.bias.cpu() if layer.self_attn.v_proj.bias is not None else None},
+                    'o_proj': {'weight': layer.self_attn.o_proj.weight.cpu(), 'bias': layer.self_attn.o_proj.bias.cpu() if layer.self_attn.o_proj.bias is not None else None},
+                },
+                'mlp': {
+                    'gate_proj': {'weight': layer.mlp.gate_proj.weight.cpu()},
+                    'up_proj': {'weight': layer.mlp.up_proj.weight.cpu()},
+                    'down_proj': {'weight': layer.mlp.down_proj.weight.cpu()},
+                },
+                'input_layernorm': {'weight': layer.input_layernorm.weight.cpu()},
+                'post_attention_layernorm': {'weight': layer.post_attention_layernorm.weight.cpu()}
+            }
+        
+        # 缓存最终的norm层
+        self.norm_cache = {
+            'weight': self.model.model.norm.weight.cpu()
+        }
+        
+        # 缓存语言模型头
+        self.lm_head_cache = {
+            'weight': self.model.lm_head.weight.cpu()
+        }
+        
+        logger.info("Model components cached successfully")
+
+    def custom_forward_with_cache(self, input_ids, attention_mask):
+        """使用缓存的模型组件进行前向传播"""
+        # 使用缓存的嵌入层
+        hidden_states = torch.nn.functional.embedding(
+            input_ids.cuda(),
+            self.embedding_cache['weight'].cuda()
+        )
+        
+        # 逐层处理
+        for i in range(len(self.layer_cache)):
+            layer_cache = self.layer_cache[i]
+            
+            # 自注意力处理
+            qkv_states = []
+            for proj in ['q_proj', 'k_proj', 'v_proj']:
+                proj_cache = layer_cache['self_attn'][proj]
+                states = torch.nn.functional.linear(
+                    hidden_states.cuda(),
+                    proj_cache['weight'].cuda(),
+                    proj_cache['bias'].cuda() if proj_cache['bias'] is not None else None
+                )
+                qkv_states.append(states)
+            
+            # 计算注意力
+            q, k, v = qkv_states
+            attention_output = self.compute_attention(q, k, v, attention_mask)
+            
+            # 输出投影
+            attention_output = torch.nn.functional.linear(
+                attention_output,
+                layer_cache['self_attn']['o_proj']['weight'].cuda(),
+                layer_cache['self_attn']['o_proj']['bias'].cuda() if layer_cache['self_attn']['o_proj']['bias'] is not None else None
+            )
+            
+            # 残差连接和层标准化
+            hidden_states = attention_output + hidden_states
+            hidden_states = self.apply_layernorm(hidden_states, layer_cache['input_layernorm']['weight'].cuda())
+            
+            # MLP处理
+            mlp_output = self.compute_mlp(hidden_states, layer_cache['mlp'])
+            hidden_states = mlp_output + hidden_states
+            hidden_states = self.apply_layernorm(hidden_states, layer_cache['post_attention_layernorm']['weight'].cuda())
+            
+            # 将中间结果移回CPU以节省GPU内存
+            hidden_states = hidden_states.cpu()
+        
+        # 最终的norm和语言模型头
+        hidden_states = self.apply_layernorm(hidden_states.cuda(), self.norm_cache['weight'].cuda())
+        logits = torch.nn.functional.linear(hidden_states, self.lm_head_cache['weight'].cuda())
+        
+        return logits
+
+    def compute_attention(self, q, k, v, attention_mask):
+        """计算注意力"""
+        attention_scores = torch.matmul(q, k.transpose(-1, -2))
+        attention_scores = attention_scores / math.sqrt(k.size(-1))
+        attention_scores = attention_scores + attention_mask
+        attention_probs = torch.nn.functional.softmax(attention_scores, dim=-1)
+        return torch.matmul(attention_probs, v)
+
+    def compute_mlp(self, hidden_states, mlp_cache):
+        """计算MLP层"""
+        gate_output = torch.nn.functional.linear(hidden_states, mlp_cache['gate_proj']['weight'].cuda())
+        up_output = torch.nn.functional.linear(hidden_states, mlp_cache['up_proj']['weight'].cuda())
+        activated = torch.nn.functional.silu(gate_output) * up_output
+        return torch.nn.functional.linear(activated, mlp_cache['down_proj']['weight'].cuda())
+
+    def apply_layernorm(self, hidden_states, weight):
+        """应用层标准化"""
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + 1e-5)
+        return hidden_states * weight
 
     def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
         try:
@@ -131,47 +254,24 @@ class ModelWorker:
                     logger.info(f"    - Temperature: {temperature}")
                     logger.info(f"    - Top-p sampling: {top_p}")
                     
-                    # 使用自定义前向传播，让模型权重保持在CPU上
-                    def custom_forward(input_ids, attention_mask):
-                        # 逐层处理，每层的权重从CPU读取，计算在GPU上进行
-                        hidden_states = self.model.model.embed_tokens(input_ids)
-                        
-                        for layer in self.model.model.layers:
-                            # 将当前层的输入移到GPU
-                            hidden_states = hidden_states.cuda()
-                            # 层的计算在GPU上进行，但权重从CPU读取
-                            hidden_states = layer(hidden_states, attention_mask)[0]
-                            # 将结果移回CPU，释放GPU内存
-                            hidden_states = hidden_states.cpu()
-                        
-                        # 最后的处理
-                        hidden_states = hidden_states.cuda()
-                        hidden_states = self.model.model.norm(hidden_states)
-                        logits = self.model.lm_head(hidden_states)
-                        return logits
-                    
-                    # 使用自定义生成函数
+                    # 使用带缓存的自定义前向传播
                     outputs = []
                     current_input_ids = input_ids
                     current_attention_mask = attention_mask
                     
                     for _ in range(max_new_tokens):
-                        # 获取下一个token
-                        logits = custom_forward(current_input_ids, current_attention_mask)
+                        logits = self.custom_forward_with_cache(current_input_ids, current_attention_mask)
                         next_token_logits = logits[:, -1, :]
                         
-                        # 采样下一个token
                         if input_data.get('do_sample', True):
                             probs = torch.nn.functional.softmax(next_token_logits / temperature, dim=-1)
                             next_token = torch.multinomial(probs, num_samples=1)
                         else:
                             next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
                         
-                        # 添加到输出序列
                         current_input_ids = torch.cat([current_input_ids, next_token], dim=1)
                         current_attention_mask = torch.cat([current_attention_mask, torch.ones_like(next_token)], dim=1)
                         
-                        # 检查是否生成了结束标记
                         if next_token[0].item() == self.model.generation_config.eos_token_id:
                             break
                     

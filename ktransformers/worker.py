@@ -12,6 +12,8 @@ from ktransformers.models.modeling_llama import LlamaForCausalLM
 from ktransformers.models.modeling_mixtral import MixtralForCausalLM
 import multiprocessing as mp
 import os
+from queue import Empty
+from multiprocessing import Queue
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -34,17 +36,13 @@ default_optimize_rules = {
 }
 
 class ModelWorker:
-    def __init__(self, address: str, worker_id: int):
-        self.context = zmq.Context()
-        self.socket = self.context.socket(zmq.REP)
-        host, port = address.split(':')
-        # 每个worker使用不同的端口
-        port = int(port) + worker_id
-        self.socket.bind(f"tcp://0.0.0.0:{port}")
+    def __init__(self, worker_id: int, task_queue: Queue, result_queue: Queue):
+        self.worker_id = worker_id
+        self.task_queue = task_queue
+        self.result_queue = result_queue
         self.model = None
         self.tokenizer = None
-        self.worker_id = worker_id
-        logger.info(f"Worker {worker_id} started at {host}:{port}")
+        logger.info(f"Worker {worker_id} initialized")
 
     def load_model(self, model_path: str, gguf_path: str):
         logger.info("Loading tokenizer...")
@@ -123,34 +121,86 @@ class ModelWorker:
             }
 
     def run(self):
-        logger.info(f"Worker {self.worker_id} ready to receive requests")
+        logger.info(f"Worker {self.worker_id} ready to process tasks")
         while True:
             try:
-                message = self.socket.recv_pyobj()
-                command = message.get('command')
+                task = self.task_queue.get()
+                if task is None:  # 停止信号
+                    break
+                
+                command = task.get('command')
+                task_id = task.get('task_id')
                 
                 if command == 'load_model':
-                    self.load_model(message['model_path'], message['gguf_path'])
-                    self.socket.send_pyobj({'status': 'success'})
+                    self.load_model(task['model_path'], task['gguf_path'])
+                    self.result_queue.put({
+                        'task_id': task_id,
+                        'status': 'success'
+                    })
                 
                 elif command == 'generate':
-                    result = self.generate(message['data'])
-                    self.socket.send_pyobj(result)
-                
-                elif command == 'shutdown':
-                    logger.info(f"Shutting down worker {self.worker_id}")
-                    self.socket.send_pyobj({'status': 'shutdown'})
-                    break
+                    result = self.generate(task['data'])
+                    result['task_id'] = task_id
+                    self.result_queue.put(result)
                 
             except Exception as e:
                 logger.error(f"Error in worker {self.worker_id}: {str(e)}")
-                self.socket.send_pyobj({'status': 'error', 'error': str(e)})
+                self.result_queue.put({
+                    'task_id': task.get('task_id'),
+                    'status': 'error',
+                    'error': str(e)
+                })
 
-def run_worker(address: str, worker_id: int):
+def run_worker(worker_id: int, task_queue: Queue, result_queue: Queue):
     # 设置进程亲和性
     os.sched_setaffinity(0, {worker_id})
-    worker = ModelWorker(address, worker_id)
+    worker = ModelWorker(worker_id, task_queue, result_queue)
     worker.run()
+
+class ModelServer:
+    def __init__(self, address: str, num_workers: int):
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.REP)
+        self.socket.bind(f"tcp://{address}")
+        self.num_workers = num_workers
+        self.task_queue = Queue()
+        self.result_queue = Queue()
+        self.task_id = 0
+        self.workers = []
+        
+        # 启动工作进程
+        for i in range(num_workers):
+            p = mp.Process(target=run_worker, args=(i, self.task_queue, self.result_queue))
+            p.start()
+            self.workers.append(p)
+            logger.info(f"Started worker process {i}")
+
+    def run(self):
+        logger.info("Server started, waiting for requests")
+        try:
+            while True:
+                message = self.socket.recv_pyobj()
+                self.task_id += 1
+                message['task_id'] = self.task_id
+                
+                # 发送任务给工作进程
+                self.task_queue.put(message)
+                
+                # 等待结果
+                result = self.result_queue.get()
+                self.socket.send_pyobj(result)
+                
+                if message.get('command') == 'shutdown':
+                    break
+                    
+        finally:
+            # 发送停止信号给所有工作进程
+            for _ in range(self.num_workers):
+                self.task_queue.put(None)
+            
+            # 等待所有工作进程结束
+            for p in self.workers:
+                p.join()
 
 def main():
     import argparse
@@ -159,17 +209,8 @@ def main():
     parser.add_argument('--num_workers', type=int, default=10)
     args = parser.parse_args()
     
-    # 创建多个worker进程
-    processes = []
-    for i in range(args.num_workers):
-        p = mp.Process(target=run_worker, args=(args.worker_address, i))
-        p.start()
-        processes.append(p)
-        logger.info(f"Started worker process {i}")
-    
-    # 等待所有进程完成
-    for p in processes:
-        p.join()
+    server = ModelServer(args.worker_address, args.num_workers)
+    server.run()
 
 if __name__ == '__main__':
     main() 

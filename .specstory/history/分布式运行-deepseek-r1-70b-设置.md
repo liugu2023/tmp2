@@ -1423,7 +1423,7 @@ python -m ktransformers.local_chat \
 
 _**User**_
 
-生成太慢了，查看逻辑，CPU内核分配10个，temperature设置为0.6
+CPU内核分配10个，temperature设置为0.6
 
 ---
 
@@ -1431,68 +1431,66 @@ _**Assistant**_
 
 
 
-好的，让我们优化生成参数和资源分配。我们需要修改两个文件：
+让我们修改代码以设置 CPU 核心数和温度参数：
 
 ```python:ktransformers/worker.py
-def __init__(self, address: str):
-    self.context = zmq.Context()
-    self.socket = self.context.socket(zmq.REP)
-    host, port = address.split(':')
-    self.socket.bind(f"tcp://0.0.0.0:{port}")
-    self.socket.setsockopt(zmq.RCVHWM, 0)
-    self.socket.setsockopt(zmq.SNDHWM, 0)
+import os
+# ... 其他导入 ...
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--worker_address', type=str, required=True)
+    parser.add_argument('--num_threads', type=int, default=10)
+    args = parser.parse_args()
     
     # 设置 CPU 线程数
-    torch.set_num_threads(10)  # 限制 CPU 线程数为 10
+    torch.set_num_threads(args.num_threads)
+    logger.info(f"Set CPU threads to {args.num_threads}")
     
-    self.model = None
-    self.tokenizer = None
-    logger.info(f"Worker started at {address}, listening on all interfaces")
-    logger.info(f"CPU threads set to: {torch.get_num_threads()}")
+    worker = ModelWorker(args.worker_address)
+    worker.run()
 
-def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
-    try:
-        logger.info("Received generation request")
-        logger.info(f"Input sequence length: {len(input_data['input_ids'])}")
-        
-        input_ids = torch.tensor(input_data['input_ids'], device='cuda')
-        attention_mask = torch.tensor(input_data['attention_mask'], device='cuda')
-        
-        logger.info(f"Generation parameters: max_new_tokens={input_data.get('max_new_tokens', 512)}, "
-                   f"temperature={input_data.get('temperature', 0.6)}, "  # 修改默认温度
-                   f"top_p={input_data.get('top_p', 0.9)}")
-        
-        logger.info("Starting text generation...")
-        with torch.no_grad(), torch.amp.autocast('cuda'):
-            outputs = self.model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_new_tokens=input_data.get('max_new_tokens', 512),
-                temperature=input_data.get('temperature', 0.6),  # 修改默认温度
-                top_p=input_data.get('top_p', 0.9),
-                do_sample=input_data.get('do_sample', True)
-            )
-        
-        logger.info(f"Generation completed. Output sequence length: {len(outputs[0])}")
-        
-        outputs_cpu = outputs.to('cpu', non_blocking=True)
-        torch.cuda.synchronize()
-        
-        return {
-            'output_ids': outputs_cpu.numpy().tolist(),
-            'status': 'success'
-        }
-    except Exception as e:
-        logger.error(f"Generation error: {str(e)}")
-        return {
-            'status': 'error',
-            'error': str(e)
-        }
+class ModelWorker:
+    # ... 其他代码 ...
+
+    def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            logger.info("Received generation request")
+            logger.info(f"Input sequence length: {len(input_data['input_ids'])}")
+            
+            # 创建输入张量
+            logger.info("Moving input tensors to GPU...")
+            input_ids = torch.tensor(input_data['input_ids'], device='cuda')
+            attention_mask = torch.tensor(input_data['attention_mask'], device='cuda')
+            
+            # 生成参数日志
+            temperature = input_data.get('temperature', 0.6)  # 默认温度改为 0.6
+            logger.info(f"Generation parameters: max_new_tokens={input_data.get('max_new_tokens', 512)}, "
+                       f"temperature={temperature}, "
+                       f"top_p={input_data.get('top_p', 0.9)}")
+            
+            # 生成文本
+            logger.info("Starting text generation...")
+            with torch.no_grad(), torch.amp.autocast('cuda'):
+                outputs = self.model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    max_new_tokens=input_data.get('max_new_tokens', 512),
+                    temperature=temperature,  # 使用设置的温度
+                    top_p=input_data.get('top_p', 0.9),
+                    do_sample=input_data.get('do_sample', True)
+                )
+            
+            # ... 其余代码保持不变 ...
 ```
+
+
+同时修改 local_chat.py 中的温度设置：
 
 ```python:ktransformers/local_chat.py
 def main():
-    # ... 其他代码保持不变 ...
+    # ... 其他代码 ...
 
     if args.worker_address:
         # 分布式模式
@@ -1501,38 +1499,31 @@ def main():
         model.load_model(args.model_path, args.gguf_path)
         tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
         
-        # 设置 CPU 线程数
-        torch.set_num_threads(10)
-        logger.info(f"CPU threads set to: {torch.get_num_threads()}")
-        
         while True:
             try:
-                # ... 其他代码保持不变 ...
+                # ... 其他代码 ...
                 
                 logger.info("Starting generation...")
                 outputs = model.generate(
                     input_tensor,
                     torch.ones_like(input_tensor),
                     max_new_tokens=args.max_new_tokens,
-                    temperature=0.6,  # 修改温度
+                    temperature=0.6,  # 修改温度为 0.6
                     top_p=0.9,
                     do_sample=True
                 )
                 
-                # ... 其他代码保持不变 ...
+                # ... 其他代码 ...
 ```
 
-主要改动：
-1. 设置 CPU 线程数为 10
-2. 将 temperature 从 0.7 降低到 0.6，这会使生成更加确定性，通常会加快生成速度
-3. 在两端都添加了 CPU 线程数的设置和日志
 
-使用方式保持不变：
+现在运行命令时指定 CPU 线程数：
 
 1. GPU 机器 (10.21.22.206):
 ```bash
-PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0 python -m ktransformers.worker --worker_address "10.21.22.206:29500"
+PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0 python -m ktransformers.worker --worker_address "10.21.22.206:29500" --num_threads 10
 ```
+
 
 2. CPU 机器 (10.21.22.100):
 ```bash
@@ -1542,19 +1533,19 @@ PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.local_chat \
     --worker_address "10.21.22.206:29500"
 ```
 
-这些修改应该能提高生成速度。如果还需要进一步优化，我们可以：
-1. 调整 batch_size
-2. 减小 max_new_tokens
-3. 进一步调整 temperature 和 top_p
-4. 使用更激进的 torch.cuda.amp 设置
 
-请告诉我运行效果如何。
+这样设置后：
+1. worker 进程会使用 10 个 CPU 线程
+2. 生成时的温度参数设置为 0.6，使输出更加确定性
+3. 其他参数保持不变
+
+如果需要调整其他参数，请告诉我。
 
 ---
 
 _**User**_
 
-Starting text generation这一步太慢了，怎么优化一下，我有两块gpu，cuda0,1
+同时，我要查看Starting text generation这一步的详细输出
 
 ---
 
@@ -1562,141 +1553,86 @@ _**Assistant**_
 
 
 
-让我们使用两块 GPU 来优化模型加载和生成。我们需要修改 worker.py 来利用多 GPU：
+让我们在 worker.py 中添加更详细的生成过程日志：
 
 ```python:ktransformers/worker.py
-def load_model(self, model_path: str, gguf_path: str):
-    logger.info("Loading tokenizer...")
-    self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    
-    logger.info("Loading model config...")
-    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-    torch.set_default_dtype(config.torch_dtype)
-    
-    logger.info("Loading model...")
-    # 设置设备映射，将模型分布到两个 GPU 上
-    device_map = {
-        'model.embed_tokens': 0,
-        'model.layers.0': 0,
-        'model.layers.1': 0,
-        'model.layers.2': 0,
-        'model.layers.3': 0,
-        'model.layers.4': 0,
-        'model.layers.5': 0,
-        'model.layers.6': 0,
-        'model.layers.7': 0,
-        'model.layers.8': 0,
-        'model.layers.9': 0,
-        'model.layers.10': 0,
-        'model.layers.11': 0,
-        'model.layers.12': 0,
-        'model.layers.13': 0,
-        'model.layers.14': 0,
-        'model.layers.15': 1,
-        'model.layers.16': 1,
-        'model.layers.17': 1,
-        'model.layers.18': 1,
-        'model.layers.19': 1,
-        'model.layers.20': 1,
-        'model.layers.21': 1,
-        'model.layers.22': 1,
-        'model.layers.23': 1,
-        'model.layers.24': 1,
-        'model.layers.25': 1,
-        'model.layers.26': 1,
-        'model.layers.27': 1,
-        'model.layers.28': 1,
-        'model.layers.29': 1,
-        'model.layers.30': 1,
-        'model.norm': 1,
-        'lm_head': 1
-    }
-    
-    self.model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        config=config,
-        trust_remote_code=True,
-        device_map=device_map,  # 使用自定义设备映射
-        torch_dtype=torch.bfloat16  # 使用 bfloat16 进一步优化性能
-    )
-    self.model.eval()
-    
-    # 设置生成配置
-    try:
-        self.model.generation_config = GenerationConfig.from_pretrained(model_path)
-    except Exception as e:
-        logger.warning(f"Generation config can't auto create, making default. Message: {e}")
-        self.model.generation_config = GenerationConfig(
-            temperature=0.6,
-            top_p=0.9,
-            do_sample=True
-        )
-    if self.model.generation_config.pad_token_id is None:
-        self.model.generation_config.pad_token_id = self.model.generation_config.eos_token_id
-        
-    logger.info("Model loaded successfully")
-
 def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
     try:
         logger.info("Received generation request")
         logger.info(f"Input sequence length: {len(input_data['input_ids'])}")
         
-        # 将输入放在第一个 GPU 上
-        input_ids = torch.tensor(input_data['input_ids'], device='cuda:0')
-        attention_mask = torch.tensor(input_data['attention_mask'], device='cuda:0')
+        # 创建输入张量
+        logger.info("Moving input tensors to GPU...")
+        input_ids = torch.tensor(input_data['input_ids'], device='cuda')
+        attention_mask = torch.tensor(input_data['attention_mask'], device='cuda')
         
+        # 生成参数日志
+        temperature = input_data.get('temperature', 0.6)
         logger.info(f"Generation parameters: max_new_tokens={input_data.get('max_new_tokens', 512)}, "
-                   f"temperature={input_data.get('temperature', 0.6)}, "
+                   f"temperature={temperature}, "
                    f"top_p={input_data.get('top_p', 0.9)}")
         
+        # 生成文本
         logger.info("Starting text generation...")
+        logger.info("Model configuration:")
+        logger.info(f"  Model dtype: {self.model.dtype}")
+        logger.info(f"  Device: {self.model.device}")
+        logger.info(f"  Generation config: {self.model.generation_config}")
+        
+        def log_callback(step: int, token_ids: torch.Tensor, scores: torch.Tensor):
+            logger.info(f"Generation step {step}: Generated {len(token_ids[0])} tokens")
+            if scores is not None:
+                logger.info(f"  Top token score: {scores[0].max().item():.3f}")
+        
         with torch.no_grad(), torch.amp.autocast('cuda'):
             outputs = self.model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 max_new_tokens=input_data.get('max_new_tokens', 512),
-                temperature=input_data.get('temperature', 0.6),
+                temperature=temperature,
                 top_p=input_data.get('top_p', 0.9),
                 do_sample=input_data.get('do_sample', True),
-                use_cache=True  # 启用 KV 缓存
+                callback=log_callback,  # 添加回调函数
+                callback_interval=50    # 每生成50个token记录一次
             )
         
         logger.info(f"Generation completed. Output sequence length: {len(outputs[0])}")
+        logger.info(f"New tokens generated: {len(outputs[0]) - len(input_ids[0])}")
         
+        # 移动到CPU
+        logger.info("Moving outputs to CPU...")
         outputs_cpu = outputs.to('cpu', non_blocking=True)
         torch.cuda.synchronize()
         
+        # 记录内存使用情况
+        logger.info("GPU Memory Usage:")
+        for i in range(torch.cuda.device_count()):
+            mem_allocated = torch.cuda.memory_allocated(i) / 1024**2
+            mem_reserved = torch.cuda.memory_reserved(i) / 1024**2
+            logger.info(f"  GPU {i}: Allocated: {mem_allocated:.1f}MB, Reserved: {mem_reserved:.1f}MB")
+        
+        logger.info("Preparing response...")
         return {
             'output_ids': outputs_cpu.numpy().tolist(),
             'status': 'success'
         }
     except Exception as e:
         logger.error(f"Generation error: {str(e)}")
+        logger.exception("Detailed traceback:")  # 添加详细的错误追踪
         return {
             'status': 'error',
             'error': str(e)
         }
 ```
 
-主要优化：
-1. 将模型分层加载到两个 GPU 上，前半部分在 GPU 0，后半部分在 GPU 1
-2. 使用 bfloat16 精度
-3. 启用 KV 缓存
-4. 使用非阻塞传输
+主要添加了：
+1. 模型配置信息输出
+2. 生成过程的回调函数，每50个token记录一次进度
+3. GPU 内存使用情况监控
+4. 更详细的错误追踪
+5. 输入输出token数量的对比
 
-运行命令：
-```bash
-# 在 GPU 机器上运行
-PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0,1 python -m ktransformers.worker --worker_address "10.21.22.206:29500"
-```
-
-这样应该能显著提高生成速度。如果还是觉得慢，我们可以：
-1. 调整层的分配比例
-2. 减小 max_new_tokens
-3. 进一步调整生成参数
-4. 使用更激进的量化策略
-
-请告诉我运行效果如何。
+现在运行时，您将看到更详细的生成过程信息。如果需要调整日志的详细程度或添加其他监控指标，请告诉我。
 
 ---
 

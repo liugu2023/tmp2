@@ -4,6 +4,7 @@ import pickle
 from typing import Dict, Any
 import logging
 from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM, GenerationConfig
+import os
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -83,28 +84,49 @@ class ModelWorker:
             attention_mask = torch.tensor(input_data['attention_mask'], device='cuda')
             
             # 生成参数日志
+            temperature = input_data.get('temperature', 0.6)
             logger.info(f"Generation parameters: max_new_tokens={input_data.get('max_new_tokens', 512)}, "
-                       f"temperature={input_data.get('temperature', 0.7)}, "
+                       f"temperature={temperature}, "
                        f"top_p={input_data.get('top_p', 0.9)}")
             
             # 生成文本
             logger.info("Starting text generation...")
+            logger.info("Model configuration:")
+            logger.info(f"  Model dtype: {self.model.dtype}")
+            logger.info(f"  Device: {self.model.device}")
+            logger.info(f"  Generation config: {self.model.generation_config}")
+            
+            def log_callback(step: int, token_ids: torch.Tensor, scores: torch.Tensor):
+                logger.info(f"Generation step {step}: Generated {len(token_ids[0])} tokens")
+                if scores is not None:
+                    logger.info(f"  Top token score: {scores[0].max().item():.3f}")
+            
             with torch.no_grad(), torch.amp.autocast('cuda'):
                 outputs = self.model.generate(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     max_new_tokens=input_data.get('max_new_tokens', 512),
-                    temperature=input_data.get('temperature', 0.7),
+                    temperature=temperature,
                     top_p=input_data.get('top_p', 0.9),
-                    do_sample=input_data.get('do_sample', True)
+                    do_sample=input_data.get('do_sample', True),
+                    callback=log_callback,
+                    callback_interval=50
                 )
             
             logger.info(f"Generation completed. Output sequence length: {len(outputs[0])}")
+            logger.info(f"New tokens generated: {len(outputs[0]) - len(input_ids[0])}")
             
             # 移动到CPU
             logger.info("Moving outputs to CPU...")
             outputs_cpu = outputs.to('cpu', non_blocking=True)
             torch.cuda.synchronize()
+            
+            # 记录内存使用情况
+            logger.info("GPU Memory Usage:")
+            for i in range(torch.cuda.device_count()):
+                mem_allocated = torch.cuda.memory_allocated(i) / 1024**2
+                mem_reserved = torch.cuda.memory_reserved(i) / 1024**2
+                logger.info(f"  GPU {i}: Allocated: {mem_allocated:.1f}MB, Reserved: {mem_reserved:.1f}MB")
             
             logger.info("Preparing response...")
             return {
@@ -113,6 +135,7 @@ class ModelWorker:
             }
         except Exception as e:
             logger.error(f"Generation error: {str(e)}")
+            logger.exception("Detailed traceback:")
             return {
                 'status': 'error',
                 'error': str(e)
@@ -146,7 +169,12 @@ def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--worker_address', type=str, required=True)
+    parser.add_argument('--num_threads', type=int, default=10)
     args = parser.parse_args()
+    
+    # 设置 CPU 线程数
+    torch.set_num_threads(args.num_threads)
+    logger.info(f"Set CPU threads to {args.num_threads}")
     
     worker = ModelWorker(args.worker_address)
     worker.run()

@@ -216,7 +216,7 @@ def local_chat(
                 input_tensor,
                 torch.ones_like(input_tensor),
                 max_new_tokens=max_new_tokens,
-                temperature=0.7,
+                temperature=0.6,
                 top_p=0.9,
                 do_sample=True
             )
@@ -296,7 +296,7 @@ def main():
                     input_tensor,
                     torch.ones_like(input_tensor),
                     max_new_tokens=args.max_new_tokens,
-                    temperature=0.7,
+                    temperature=0.6,
                     top_p=0.9,
                     do_sample=True
                 )

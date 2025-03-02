@@ -4,6 +4,8 @@ import pickle
 from typing import Dict, Any
 import logging
 from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM, GenerationConfig
+import time
+from transformers import TextStreamer
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -83,33 +85,38 @@ class ModelWorker:
             attention_mask = torch.tensor(input_data['attention_mask'], device='cuda')
             
             # 生成参数日志
-            logger.info(f"Generation parameters: max_new_tokens={input_data.get('max_new_tokens', 512)}, "
-                       f"temperature={input_data.get('temperature', 0.6)}, "
-                       f"top_p={input_data.get('top_p', 0.9)}")
+            max_new_tokens = input_data.get('max_new_tokens', 512)
+            temperature = input_data.get('temperature', 0.6)
+            top_p = input_data.get('top_p', 0.9)
+            logger.info(f"Generation parameters: max_new_tokens={max_new_tokens}, "
+                       f"temperature={temperature}, "
+                       f"top_p={top_p}")
             
             # 生成文本
             logger.info("Starting text generation...")
+            start_time = time.time()
             with torch.no_grad(), torch.amp.autocast('cuda'):
-                # 添加生成过程的详细日志
                 logger.info("Initializing generation process...")
-                
-                def logging_callback(step: int, token_id: int, token_str: str):
-                    if step % 10 == 0:  # 每10个token记录一次
-                        logger.info(f"Generated {step} tokens...")
                 
                 outputs = self.model.generate(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
-                    max_new_tokens=input_data.get('max_new_tokens', 512),
-                    temperature=input_data.get('temperature', 0.6),
-                    top_p=input_data.get('top_p', 0.9),
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
                     do_sample=input_data.get('do_sample', True),
-                    callback=logging_callback,  # 添加回调函数
-                    callback_interval=1  # 每生成一个token调用一次
+                    streamer=TextStreamer(self.tokenizer, skip_prompt=True)  # 添加实时输出
                 )
-                
-                logger.info(f"Generation completed. Total tokens generated: {len(outputs[0]) - len(input_ids[0])}")
-                logger.info(f"Final sequence length: {len(outputs[0])}")
+            
+            end_time = time.time()
+            generation_time = end_time - start_time
+            tokens_generated = len(outputs[0]) - len(input_ids[0])
+            tokens_per_second = tokens_generated / generation_time
+            
+            logger.info(f"Generation completed in {generation_time:.2f} seconds")
+            logger.info(f"Tokens generated: {tokens_generated}")
+            logger.info(f"Generation speed: {tokens_per_second:.2f} tokens/second")
+            logger.info(f"Final sequence length: {len(outputs[0])}")
             
             # 移动到CPU
             logger.info("Moving outputs to CPU...")

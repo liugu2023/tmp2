@@ -1440,7 +1440,140 @@ def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
         logger.info(f"Input sequence length: {len(input_data['input_ids'])}")
         
         # 创建输入张量
-        logger.info("Moving
+        logger.info("Moving input tensors to GPU...")
+        input_ids = torch.tensor(input_data['input_ids'], device='cuda')
+        attention_mask = torch.tensor(input_data['attention_mask'], device='cuda')
+        
+        # 生成参数日志
+        logger.info(f"Generation parameters: max_new_tokens={input_data.get('max_new_tokens', 512)}, "
+                   f"temperature={input_data.get('temperature', 0.6)}, "
+                   f"top_p={input_data.get('top_p', 0.9)}")
+        
+        # 生成文本
+        logger.info("Starting text generation...")
+        with torch.no_grad(), torch.amp.autocast('cuda'):
+            # 添加生成过程的详细日志
+            logger.info("Initializing generation process...")
+            
+            def logging_callback(step: int, token_id: int, token_str: str):
+                if step % 10 == 0:  # 每10个token记录一次
+                    logger.info(f"Generated {step} tokens...")
+            
+            outputs = self.model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=input_data.get('max_new_tokens', 512),
+                temperature=input_data.get('temperature', 0.6),
+                top_p=input_data.get('top_p', 0.9),
+                do_sample=input_data.get('do_sample', True),
+                callback=logging_callback,  # 添加回调函数
+                callback_interval=1  # 每生成一个token调用一次
+            )
+            
+            logger.info(f"Generation completed. Total tokens generated: {len(outputs[0]) - len(input_ids[0])}")
+            logger.info(f"Final sequence length: {len(outputs[0])}")
+        
+        # 移动到CPU
+        logger.info("Moving outputs to CPU...")
+        outputs_cpu = outputs.to('cpu', non_blocking=True)
+        torch.cuda.synchronize()
+        
+        # 记录GPU内存使用情况
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        logger.info(f"GPU Memory: Allocated={allocated:.2f}GB, Reserved={reserved:.2f}GB")
+        
+        logger.info("Preparing response...")
+        return {
+            'output_ids': outputs_cpu.numpy().tolist(),
+            'status': 'success'
+        }
+    except Exception as e:
+        logger.error(f"Generation error: {str(e)}")
+        return {
+            'status': 'error',
+            'error': str(e)
+        }
+```
+
+主要改动：
+1. 添加了生成过程的回调函数，显示生成进度
+2. 记录了更多的生成细节，包括：
+   - 生成的token数量
+   - 序列长度变化
+   - GPU内存使用情况
+3. 每个阶段都添加了详细的日志
+
+这样您就能看到模型在生成过程中的具体进展，包括：
+1. 生成了多少token
+2. 当前的GPU资源使用情况
+3. 整个生成过程的各个阶段
+
+如果您想看到更多细节，我们还可以添加：
+1. 生成速度统计
+2. 每个token的概率分布
+3. 更多的GPU性能指标
+
+请告诉我是否需要添加其他信息。
+
+---
+
+_**User**_
+
+给出运行命令
+
+---
+
+_**Assistant**_
+
+
+
+让我们分别在两台机器上运行程序。
+
+1. 首先在 GPU 机器 (10.21.22.206) 上运行 worker：
+```bash
+# 确保已安装依赖
+pip install pyzmq>=24.0.0
+
+# 设置 PYTHONPATH 并运行 worker
+PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0 python -m ktransformers.worker --worker_address "10.21.22.206:29500"
+```
+
+
+2. 然后在 CPU 机器 (10.21.22.100) 上运行主程序：
+```bash
+# 确保已安装依赖
+pip install pyzmq>=24.0.0
+
+# 设置 PYTHONPATH 并运行主程序
+PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.local_chat \
+    --model_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/ \
+    --gguf_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/ \
+    --worker_address "10.21.22.206:29500"
+```
+
+
+现在您应该能看到详细的日志输出，包括：
+1. 模型加载过程
+2. 每生成10个token的进度
+3. GPU内存使用情况
+4. 生成完成后的统计信息
+
+如果需要退出程序：
+- 在对话界面输入 "quit" 或 "exit"
+- 或使用 Ctrl+C 终止程序
+
+---
+
+_**User**_
+
+ERROR:__main__:Generation error: The following `model_kwargs` are not used by the model: ['callback', 'callback_interval'] (note: typos in the generate arguments will also show up in this list)
+
+---
+
+_**Assistant**_
+
+
 
 ---
 

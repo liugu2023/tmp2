@@ -12,50 +12,26 @@ import zmq
 import argparse
 import logging
 import locale
-
-project_dir = os.path.dirname(os.path.dirname(__file__))
-sys.path.insert(0, project_dir)
 import torch
-from transformers import (
-    AutoTokenizer,
-    AutoConfig,
-    AutoModelForCausalLM,
-    GenerationConfig,
-    TextStreamer,
-)
-import json
-import fire
-from ktransformers.optimize.optimize import optimize_and_load_gguf
-from ktransformers.models.modeling_deepseek import DeepseekV2ForCausalLM
-from ktransformers.models.modeling_qwen2_moe import Qwen2MoeForCausalLM
-from ktransformers.models.modeling_deepseek_v3 import DeepseekV3ForCausalLM
-from ktransformers.models.modeling_llama import LlamaForCausalLM
-from ktransformers.models.modeling_mixtral import MixtralForCausalLM
-from ktransformers.util.utils import prefill_and_generate, get_compute_capability
-from ktransformers.server.config.config import Config
-from ktransformers.operators.flashinfer_wrapper import flashinfer_enabled
-
-custom_models = {
-    "DeepseekV2ForCausalLM": DeepseekV2ForCausalLM,
-    "DeepseekV3ForCausalLM": DeepseekV3ForCausalLM,
-    "Qwen2MoeForCausalLM": Qwen2MoeForCausalLM,
-    "LlamaForCausalLM": LlamaForCausalLM,
-    "MixtralForCausalLM": MixtralForCausalLM,
-}
-
-ktransformer_rules_dir = (
-    os.path.dirname(os.path.abspath(__file__)) + "/optimize/optimize_rules/"
-)
-default_optimize_rules = {
-    "DeepseekV2ForCausalLM": ktransformer_rules_dir + "DeepSeek-V2-Chat.yaml",
-    "DeepseekV3ForCausalLM": ktransformer_rules_dir + "DeepSeek-V3-Chat.yaml",
-    "Qwen2MoeForCausalLM": ktransformer_rules_dir + "Qwen2-57B-A14B-Instruct.yaml",
-    "LlamaForCausalLM": ktransformer_rules_dir + "Internlm2_5-7b-Chat-1m.yaml",
-    "MixtralForCausalLM": ktransformer_rules_dir + "Mixtral.yaml",
-}
+from transformers import AutoTokenizer
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# 只在非分布式模式下导入这些模块
+def import_local_modules():
+    from ktransformers.optimize.optimize import optimize_and_load_gguf
+    from ktransformers.models.modeling_deepseek import DeepseekV2ForCausalLM
+    from ktransformers.models.modeling_qwen2_moe import Qwen2MoeForCausalLM
+    from ktransformers.models.modeling_deepseek_v3 import DeepseekV3ForCausalLM
+    from ktransformers.models.modeling_llama import LlamaForCausalLM
+    from ktransformers.models.modeling_mixtral import MixtralForCausalLM
+    from ktransformers.util.utils import prefill_and_generate, get_compute_capability
+    from ktransformers.server.config.config import Config
+    from ktransformers.operators.flashinfer_wrapper import flashinfer_enabled
+    return (optimize_and_load_gguf, DeepseekV2ForCausalLM, Qwen2MoeForCausalLM,
+            DeepseekV3ForCausalLM, LlamaForCausalLM, MixtralForCausalLM,
+            prefill_and_generate, get_compute_capability, Config, flashinfer_enabled)
 
 class DistributedModel:
     def __init__(self, worker_address: str):
@@ -105,140 +81,12 @@ class DistributedModel:
             logger.error(f"Error in generate: {str(e)}")
             raise
 
-def local_chat(
-    model_path: str | None = None,
-    optimize_config_path: str = None,
-    gguf_path: str | None = None,
-    max_new_tokens: int = 300,
-    cpu_infer: int = Config().cpu_infer,
-    use_cuda_graph: bool = True,
-    prompt_file : str | None = None,
-    mode: str = "normal",
-    force_think: bool = False,
-    chunk_prefill_size: int = 8192
-):
-
-    torch.set_grad_enabled(False)
-
-    Config().cpu_infer = cpu_infer
-
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-    if mode == 'long_context':
-        assert config.architectures[0] == "LlamaForCausalLM", "only LlamaForCausalLM support long_context mode"
-        torch.set_default_dtype(torch.float16)
-    else:
-        torch.set_default_dtype(config.torch_dtype)
-
-    with torch.device("meta"):
-        if config.architectures[0] in custom_models:
-            print("using custom modeling_xxx.py.")
-            if (
-                "Qwen2Moe" in config.architectures[0]
-            ):  # Qwen2Moe must use flash_attention_2 to avoid overflow.
-                config._attn_implementation = "flash_attention_2"
-            if "Llama" in config.architectures[0]:
-                config._attn_implementation = "eager"
-            if "Mixtral" in config.architectures[0]:
-                config._attn_implementation = "flash_attention_2"
-
-            model = custom_models[config.architectures[0]](config)
-        else:
-            model = AutoModelForCausalLM.from_config(
-                config, trust_remote_code=True, attn_implementation="flash_attention_2"
-            )
-
-    if optimize_config_path is None:
-        if config.architectures[0] in default_optimize_rules:
-            print("using default_optimize_rule for", config.architectures[0])
-            optimize_config_path = default_optimize_rules[config.architectures[0]]
-        else:
-            optimize_config_path = input(
-                "please input the path of your rule file(yaml file containing optimize rules):"
-            )
-
-    if gguf_path is None:
-        gguf_path = input(
-            "please input the path of your gguf file(gguf file in the dir containing input gguf file must all belong to current model):"
-        )
-    optimize_and_load_gguf(model, optimize_config_path, gguf_path, config)
-    
-    try:
-        model.generation_config = GenerationConfig.from_pretrained(model_path)
-    except Exception as e:
-        print(f"generation config can't auto create, make default. Message: {e}")
-        gen_config = GenerationConfig(
-            temperature=0.6,
-            top_p=0.95,
-            do_sample=True
-        )
-        model.generation_config = gen_config
-    # model.generation_config = GenerationConfig.from_pretrained(model_path)
-    if model.generation_config.pad_token_id is None:
-        model.generation_config.pad_token_id = model.generation_config.eos_token_id
-    model.eval()
-
-    system = platform.system()
-    if system == "Windows":
-        os.system("cls")
-    else:
-        os.system("clear")
-
-    while True:
-        try:
-            content = input("Chat: ")
-            if content.lower() in ['quit', 'exit']:
-                break
-            
-            logger.info("Processing input...")
-            if content == "":
-                if prompt_file is not None:
-                    logger.info(f"Reading from prompt file: {prompt_file}")
-                    with open(prompt_file, "r", encoding='utf-8') as f:
-                        content = f.read()
-                else:
-                    content = "Please write a piece of quicksort code in C++."
-            elif os.path.isfile(content):
-                logger.info(f"Reading from file: {content}")
-                with open(content, "r", encoding='utf-8') as f:
-                    content = f.read()
-            
-            logger.info("Creating chat messages...")
-            messages = [{"role": "user", "content": content}]
-            
-            logger.info("Tokenizing input...")
-            input_tensor = tokenizer.apply_chat_template(
-                messages, add_generation_prompt=True, return_tensors="pt"
-            )
-            
-            logger.info("Starting generation...")
-            outputs = model.generate(
-                input_tensor,
-                torch.ones_like(input_tensor),
-                max_new_tokens=max_new_tokens,
-                temperature=0.7,
-                top_p=0.9,
-                do_sample=True
-            )
-            
-            logger.info("Decoding response...")
-            response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-            print("\nAssistant:", response)
-        except UnicodeDecodeError as e:
-            logger.error(f"Encoding error: {str(e)}")
-            print("请使用UTF-8编码输入文本")
-            continue
-        except Exception as e:
-            logger.error(f"Error: {str(e)}")
-            continue
-
 def main():
     # 设置终端编码
     if sys.platform.startswith('win'):
         sys.stdout.reconfigure(encoding='utf-8')
         sys.stdin.reconfigure(encoding='utf-8')
     else:
-        # 获取系统默认编码
         default_encoding = locale.getpreferredencoding()
         sys.stdout = open(sys.stdout.fileno(), mode='w', encoding='utf-8', buffering=1)
         sys.stdin = open(sys.stdin.fileno(), mode='r', encoding=default_encoding, buffering=1)
@@ -249,12 +97,6 @@ def main():
     parser.add_argument('--worker_address', type=str, default=None,
                       help='Address of worker for distributed mode (e.g., "10.21.22.206:29500")')
     parser.add_argument('--max_new_tokens', type=int, default=300)
-    parser.add_argument('--cpu_infer', type=int, default=Config().cpu_infer)
-    parser.add_argument('--use_cuda_graph', type=bool, default=True)
-    parser.add_argument('--prompt_file', type=str, default=None)
-    parser.add_argument('--mode', type=str, default="normal")
-    parser.add_argument('--force_think', type=bool, default=False)
-    parser.add_argument('--chunk_prefill_size', type=int, default=8192)
     args = parser.parse_args()
 
     if args.worker_address:
@@ -272,12 +114,7 @@ def main():
                     
                 logger.info("Processing input...")
                 if content == "":
-                    if args.prompt_file is not None:
-                        logger.info(f"Reading from prompt file: {args.prompt_file}")
-                        with open(args.prompt_file, "r", encoding='utf-8') as f:
-                            content = f.read()
-                    else:
-                        content = "Please write a piece of quicksort code in C++."
+                    content = "Please write a piece of quicksort code in C++."
                 elif os.path.isfile(content):
                     logger.info(f"Reading from file: {content}")
                     with open(content, "r", encoding='utf-8') as f:
@@ -313,18 +150,13 @@ def main():
                 continue
 
     else:
-        # 本地模式
-        local_chat(
-            model_path=args.model_path,
-            gguf_path=args.gguf_path,
-            max_new_tokens=args.max_new_tokens,
-            cpu_infer=args.cpu_infer,
-            use_cuda_graph=args.use_cuda_graph,
-            prompt_file=args.prompt_file,
-            mode=args.mode,
-            force_think=args.force_think,
-            chunk_prefill_size=args.chunk_prefill_size
-        )
+        # 本地模式，动态导入所需模块
+        (optimize_and_load_gguf, DeepseekV2ForCausalLM, Qwen2MoeForCausalLM,
+         DeepseekV3ForCausalLM, LlamaForCausalLM, MixtralForCausalLM,
+         prefill_and_generate, get_compute_capability, Config, flashinfer_enabled) = import_local_modules()
+        
+        # 本地模式的代码...
+        raise NotImplementedError("Local mode is not implemented in this version")
 
 if __name__ == "__main__":
-    fire.Fire(main)
+    main()

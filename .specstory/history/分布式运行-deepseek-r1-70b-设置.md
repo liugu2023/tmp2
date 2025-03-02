@@ -1936,7 +1936,15 @@ PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.local_chat \
 
 _**User**_
 
-降低最大token为50
+(ds) liugu@login:~/ds/ktransformers$ PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.local_chat     --model_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/     --gguf_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/     --worker_address "10.21.22.206:29500"     --max_new_tokens 50
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/archive/liugu/ds/ktransformers/ktransformers/local_chat.py", line 28, in <module>
+    from ktransformers.optimize.optimize import optimize_and_load_gguf
+  File "/archive/liugu/ds/ktransformers/ktransformers/optimize/optimize.py", line 15, in <module>
+    from ktransformers.util.custom_gguf import GGUFLoader, translate_name_to_gguf
+ImportError: cannot import name 'GGUFLoader' from 'ktransformers.util.custom_gguf' (/archive/liugu/ds/ktransformers/ktransformers/util/custom_gguf.py)
 
 ---
 
@@ -1944,64 +1952,88 @@ _**Assistant**_
 
 
 
+看起来是分布式模式下不需要加载这些优化模块。让我们修改 local_chat.py，在分布式模式下跳过这些导入和优化：
 
+```python:ktransformers/local_chat.py
+import os
+import platform
+import sys
+import zmq
+import argparse
+import logging
+import locale
+import torch
+from transformers import AutoTokenizer
 
-让我们修改代码，将默认的最大生成 token 数设置为 50：
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-```python:ktransformers/worker.py
-def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
-    try:
-        logger.info("Received generation request")
-        logger.info(f"Input sequence length: {len(input_data['input_ids'])}")
+# 只在非分布式模式下导入这些模块
+def import_local_modules():
+    from ktransformers.optimize.optimize import optimize_and_load_gguf
+    from ktransformers.models.modeling_deepseek import DeepseekV2ForCausalLM
+    from ktransformers.models.modeling_qwen2_moe import Qwen2MoeForCausalLM
+    from ktransformers.models.modeling_deepseek_v3 import DeepseekV3ForCausalLM
+    from ktransformers.models.modeling_llama import LlamaForCausalLM
+    from ktransformers.models.modeling_mixtral import MixtralForCausalLM
+    from ktransformers.util.utils import prefill_and_generate, get_compute_capability
+    from ktransformers.server.config.config import Config
+    from ktransformers.operators.flashinfer_wrapper import flashinfer_enabled
+    return (optimize_and_load_gguf, DeepseekV2ForCausalLM, Qwen2MoeForCausalLM,
+            DeepseekV3ForCausalLM, LlamaForCausalLM, MixtralForCausalLM,
+            prefill_and_generate, get_compute_capability, Config, flashinfer_enabled)
+
+class DistributedModel:
+    def __init__(self, worker_address: str):
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.REQ)
+        self.socket.connect(f"tcp://{worker_address}")
+        logger.info(f"Connected to worker at {worker_address}")
         
-        # 创建输入张量
-        logger.info("Moving input tensors to GPU...")
-        input_ids = torch.tensor(input_data['input_ids'], device='cuda')
-        attention_mask = torch.tensor(input_data['attention_mask'], device='cuda')
-        
-        # 生成参数日志 - 修改默认 max_new_tokens 为 50
-        max_new_tokens = input_data.get('max_new_tokens', 50)  # 改为默认50
-        temperature = input_data.get('temperature', 0.6)
-        top_p = input_data.get('top_p', 0.9)
-        logger.info(f"Generation parameters: max_new_tokens={max_new_tokens}, "
-                   f"temperature={temperature}, "
-                   f"top_p={top_p}")
-        
-        # ... 其余代码保持不变 ...
-```
+    def load_model(self, model_path: str, gguf_path: str):
+        message = {
+            'command': 'load_model',
+            'model_path': model_path,
+            'gguf_path': gguf_path
+        }
+        logger.info("Requesting model load from worker...")
+        self.socket.send_pyobj(message)
+        response = self.socket.recv_pyobj()
+        if response['status'] != 'success':
+            raise Exception(f"Failed to load model: {response.get('error')}")
+        logger.info("Model loaded successfully on worker")
 
+    def generate(self, input_ids, attention_mask, **kwargs):
+        try:
+            logger.info("Preparing generation request...")
+            message = {
+                'command': 'generate',
+                'data': {
+                    'input_ids': input_ids.cpu().numpy().tolist(),
+                    'attention_mask': attention_mask.cpu().numpy().tolist(),
+                    **kwargs
+                }
+            }
+            
+            logger.info("Sending request to worker...")
+            self.socket.send_pyobj(message)
+            
+            logger.info("Waiting for response...")
+            response = self.socket.recv_pyobj()
+            
+            if response['status'] == 'success':
+                logger.info("Response received successfully")
+                return torch.tensor(response['output_ids'])
+            else:
+                logger.error(f"Generation failed: {response.get('error')}")
+                raise Exception(f"Generation failed: {response.get('error')}")
+        except Exception as e:
+            logger.error(f"Error in generate: {str(e)}")
+            raise
 
-同时，在运行主程序时也可以指定这个参数：
-
-```bash
-# 在 CPU 机器 (10.21.22.100) 上运行
-PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.local_chat \
-    --model_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/ \
-    --gguf_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/ \
-    --worker_address "10.21.22.206:29500" \
-    --max_new_tokens 50
-```
-
-
-GPU 机器 (10.21.22.206) 的运行命令保持不变：
-```bash
-PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0 python -m ktransformers.worker --worker_address "10.21.22.206:29500"
-```
-
-
-这样模型每次生成时最多只会生成 50 个新 token。如果需要调整其他参数，请告诉我。
-
----
-
-_**User**_
-
-看看
-
----
-
-_**Assistant**_
-
-
+def main():
+    # 设置终端编码
+    if sys.platform.startswith('win'):
 
 ---
 

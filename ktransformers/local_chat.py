@@ -11,6 +11,7 @@ import sys
 import zmq
 import argparse
 import logging
+import locale
 
 project_dir = os.path.dirname(os.path.dirname(__file__))
 sys.path.insert(0, project_dir)
@@ -220,6 +221,16 @@ def local_chat(
             )
 
 def main():
+    # 设置终端编码
+    if sys.platform.startswith('win'):
+        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stdin.reconfigure(encoding='utf-8')
+    else:
+        # 获取系统默认编码
+        default_encoding = locale.getpreferredencoding()
+        sys.stdout = open(sys.stdout.fileno(), mode='w', encoding='utf-8', buffering=1)
+        sys.stdin = open(sys.stdin.fileno(), mode='r', encoding=default_encoding, buffering=1)
+
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_path', type=str, required=True)
     parser.add_argument('--gguf_path', type=str, required=True)
@@ -242,31 +253,45 @@ def main():
         tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
         
         while True:
-            content = input("Chat: ")
-            if content == "":
-                if args.prompt_file is not None:
-                    content = open(args.prompt_file, "r").read()
-                else:
-                    content = "Please write a piece of quicksort code in C++."
-            elif os.path.isfile(content):
-                content = open(content, "r").read()
+            try:
+                content = input("Chat: ")
+                if content.lower() in ['quit', 'exit']:
+                    break
+                    
+                if content == "":
+                    if args.prompt_file is not None:
+                        with open(args.prompt_file, "r", encoding='utf-8') as f:
+                            content = f.read()
+                    else:
+                        content = "Please write a piece of quicksort code in C++."
+                elif os.path.isfile(content):
+                    with open(content, "r", encoding='utf-8') as f:
+                        content = f.read()
                 
-            messages = [{"role": "user", "content": content}]
-            input_tensor = tokenizer.apply_chat_template(
-                messages, add_generation_prompt=True, return_tensors="pt"
-            )
-            
-            outputs = model.generate(
-                input_tensor,
-                torch.ones_like(input_tensor),
-                max_new_tokens=args.max_new_tokens,
-                temperature=0.7,
-                top_p=0.9,
-                do_sample=True
-            )
-            
-            response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-            print("Assistant:", response)
+                messages = [{"role": "user", "content": content}]
+                input_tensor = tokenizer.apply_chat_template(
+                    messages, add_generation_prompt=True, return_tensors="pt"
+                )
+                
+                outputs = model.generate(
+                    input_tensor,
+                    torch.ones_like(input_tensor),
+                    max_new_tokens=args.max_new_tokens,
+                    temperature=0.7,
+                    top_p=0.9,
+                    do_sample=True
+                )
+                
+                response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+                print("Assistant:", response)
+            except UnicodeDecodeError as e:
+                logger.error(f"Encoding error: {str(e)}")
+                print("请使用UTF-8编码输入文本")
+                continue
+            except Exception as e:
+                logger.error(f"Error: {str(e)}")
+                continue
+
     else:
         # 本地模式
         local_chat(

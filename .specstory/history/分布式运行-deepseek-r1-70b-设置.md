@@ -946,6 +946,102 @@ _**Assistant**_
 
 
 
+看起来端口没有被正确监听。让我们尝试使用 "0.0.0.0" 来监听所有网络接口：
+
+```python:ktransformers/worker.py
+class ModelWorker:
+    def __init__(self, address: str):
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.REP)
+        host, port = address.split(':')
+        # 修改：使用 0.0.0.0 监听所有接口
+        self.socket.bind(f"tcp://0.0.0.0:{port}")
+        self.socket.setsockopt(zmq.RCVHWM, 0)
+        self.socket.setsockopt(zmq.SNDHWM, 0)
+        
+        self.model = None
+        self.tokenizer = None
+        logger.info(f"Worker started at {address}, listening on all interfaces")
+
+    # ... rest of the code ...
+```
+
+然后重新运行：
+
+1. 在 GPU 机器 (10.21.22.206) 上运行：
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0 python -m ktransformers.worker --worker_address "10.21.22.206:29500"
+```
+
+运行后，再次检查端口：
+```bash
+netstat -tunlp | grep 29500
+```
+
+这样应该能看到端口被监听了。如果还是不行，我们可以尝试：
+1. 使用更高的端口号（比如 50000）
+2. 检查是否有权限问题（可能需要 sudo）
+3. 确认 ZMQ 的安装状态
+
+请告诉我修改后的结果。
+
+---
+
+_**User**_
+
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/archive/liugu/ds/ktransformers/ktransformers/local_chat.py", line 285, in <module>
+    fire.Fire(main)
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/fire/core.py", line 135, in Fire
+    component_trace = _Fire(component, args, parsed_flag_args, context, name)
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/fire/core.py", line 468, in _Fire
+    component, remaining_args = _CallAndUpdateTrace(
+                                ^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/fire/core.py", line 684, in _CallAndUpdateTrace
+    component = fn(*varargs, **kwargs)
+                ^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ktransformers/ktransformers/local_chat.py", line 245, in main
+    content = input("Chat: ")
+              ^^^^^^^^^^^^^^^
+UnicodeDecodeError: 'utf-8' codec can't decode byte 0xe5 in position 3: invalid continuation byte
+
+---
+
+_**Assistant**_
+
+
+
+这是一个字符编码问题。让我们修改代码以正确处理输入输出的编码：
+
+```python:ktransformers/local_chat.py
+import sys
+import locale
+
+# ... 其他导入 ...
+
+def main():
+    # 设置终端编码
+    if sys.platform.startswith('win'):
+        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stdin.reconfigure(encoding='utf-8')
+    else:
+        # 获取系统默认编码
+        default_encoding = locale.getpreferredencoding()
+        sys.stdout = open(sys.stdout.fileno(), mode='w', encoding='utf-8', buffering=1)
+        sys.stdin = open(sys.stdin.fileno(), mode='r', encoding=default_encoding, buffering=1)
+
+    parser = argparse.ArgumentParser()
+    # ... 参数设置保持不变 ...
+
+    if args.worker_address:
+        # 分布式模式
+        logger.info("Running in distributed mode")
+        model = DistributedModel(args.worker_address)
+        model.load_model(args.model_
+
 ---
 
 

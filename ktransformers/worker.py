@@ -37,10 +37,15 @@ class ModelWorker:
         self.socket.setsockopt(zmq.SNDHWM, 0)
         
         # 设置 CPU 线程数
-        torch.set_num_threads(10)  # 限制 CPU 线程数为 10
+        torch.set_num_threads(10)
         
         self.model = None
         self.tokenizer = None
+        
+        # 获取可用的 GPU
+        self.num_gpus = torch.cuda.device_count()
+        logger.info(f"Found {self.num_gpus} GPUs")
+        
         logger.info(f"Worker started at {address}, listening on all interfaces")
         logger.info(f"CPU threads set to: {torch.get_num_threads()}")
 
@@ -52,18 +57,29 @@ class ModelWorker:
         config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         
         # 优化模型配置
-        config.use_cache = True  # 启用 KV 缓存
-        config.pretraining_tp = 1  # 禁用张量并行
-        config.torch_dtype = torch.float16  # 使用 FP16
+        config.use_cache = True
+        config.pretraining_tp = 1
+        config.torch_dtype = torch.float16
         torch.set_default_dtype(torch.float16)
+        
+        # 创建设备映射
+        if self.num_gpus > 1:
+            # 在多个 GPU 之间平均分配模型层
+            device_map = "auto"
+            max_memory = {i: "40GiB" for i in range(self.num_gpus)}  # 为每个 GPU 分配内存
+            logger.info(f"Using device map: auto with max_memory: {max_memory}")
+        else:
+            device_map = "auto"
+            max_memory = None
         
         logger.info("Loading model...")
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path,
             config=config,
             trust_remote_code=True,
-            device_map="auto",
-            torch_dtype=torch.float16,  # 使用 FP16
+            device_map=device_map,
+            max_memory=max_memory,
+            torch_dtype=torch.float16,
             low_cpu_mem_usage=True
         )
         self.model.eval()
@@ -85,6 +101,10 @@ class ModelWorker:
             self.model.generation_config.pad_token_id = self.model.generation_config.eos_token_id
             
         logger.info("Model loaded successfully")
+        if self.num_gpus > 1:
+            logger.info("Model distributed across multiple GPUs")
+            for name, param in self.model.named_parameters():
+                logger.info(f"Parameter {name} on device: {param.device}")
 
     def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
         try:

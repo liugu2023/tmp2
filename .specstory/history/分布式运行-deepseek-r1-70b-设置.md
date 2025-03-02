@@ -1597,6 +1597,129 @@ _**Assistant**_
 
 
 
+让我们优化一下生成参数和模型配置，以加快生成速度：
+
+```python:ktransformers/worker.py
+def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        logger.info("Received generation request")
+        logger.info(f"Input sequence length: {len(input_data['input_ids'])}")
+        
+        input_ids = torch.tensor(input_data['input_ids'], device='cuda')
+        attention_mask = torch.tensor(input_data['attention_mask'], device='cuda')
+        
+        # 优化生成参数
+        generation_config = {
+            'max_new_tokens': input_data.get('max_new_tokens', 512),
+            'temperature': input_data.get('temperature', 0.6),
+            'top_p': input_data.get('top_p', 0.9),
+            'do_sample': input_data.get('do_sample', True),
+            # 添加以下参数来加速生成
+            'num_beams': 1,  # 禁用 beam search
+            'early_stopping': True,
+            'repetition_penalty': 1.0,  # 禁用重复惩罚
+            'length_penalty': 1.0,  # 中性长度惩罚
+            'use_cache': True,  # 启用 KV 缓存
+            'pad_token_id': self.model.generation_config.pad_token_id,
+            'eos_token_id': self.model.generation_config.eos_token_id,
+        }
+        
+        logger.info(f"Generation parameters: {generation_config}")
+        
+        logger.info("Starting text generation...")
+        with torch.no_grad(), torch.amp.autocast('cuda', dtype=torch.float16):  # 使用 FP16
+            outputs = self.model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                **generation_config
+            )
+        
+        logger.info(f"Generation completed. Output sequence length: {len(outputs[0])}")
+        
+        outputs_cpu = outputs.to('cpu', non_blocking=True)
+        torch.cuda.synchronize()
+        
+        return {
+            'output_ids': outputs_cpu.numpy().tolist(),
+            'status': 'success'
+        }
+    except Exception as e:
+        logger.error(f"Generation error: {str(e)}")
+        return {
+            'status': 'error',
+            'error': str(e)
+        }
+
+def load_model(self, model_path: str, gguf_path: str):
+    logger.info("Loading tokenizer...")
+    self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    
+    logger.info("Loading model config...")
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    
+    # 优化模型配置
+    config.use_cache = True  # 启用 KV 缓存
+    config.pretraining_tp = 1  # 禁用张量并行
+    config.torch_dtype = torch.float16  # 使用 FP16
+    torch.set_default_dtype(torch.float16)
+    
+    logger.info("Loading model...")
+    self.model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        config=config,
+        trust_remote_code=True,
+        device_map="auto",
+        torch_dtype=torch.float16,  # 使用 FP16
+        low_cpu_mem_usage=True
+    )
+    self.model.eval()
+    
+    # 优化生成配置
+    try:
+        self.model.generation_config = GenerationConfig.from_pretrained(model_path)
+    except Exception as e:
+        logger.warning(f"Generation config can't auto create, making default. Message: {e}")
+        self.model.generation_config = GenerationConfig(
+            temperature=0.6,
+            top_p=0.9,
+            do_sample=True,
+            num_beams=1,
+            early_stopping=True,
+            use_cache=True
+        )
+    if self.model.generation_config.pad_token_id is None:
+        self.model.generation_config.pad_token_id = self.model.generation_config.eos_token_id
+        
+    logger.info("Model loaded successfully")
+```
+
+主要优化：
+1. 使用 FP16 精度
+2. 启用 KV 缓存
+3. 禁用不必要的功能（beam search、重复惩罚等）
+4. 优化模型配置（禁用张量并行、低 CPU 内存使用等）
+5. 使用更激进的生成参数
+
+这些优化应该能显著提高生成速度。如果还是太慢，我们可以：
+1. 减小 max_new_tokens
+2. 进一步降低 temperature
+3. 使用更激进的量化策略
+4. 尝试使用 Flash Attention
+
+请告诉我优化后的效果如何。
+
+---
+
+_**User**_
+
+206上还有另一块gpu，也用上
+
+---
+
+_**Assistant**_
+
+
+
 ---
 
 

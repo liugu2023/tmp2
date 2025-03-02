@@ -1944,6 +1944,151 @@ _**Assistant**_
 
 
 
+
+
+让我们修改代码，将默认的最大生成 token 数设置为 50：
+
+```python:ktransformers/worker.py
+def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        logger.info("Received generation request")
+        logger.info(f"Input sequence length: {len(input_data['input_ids'])}")
+        
+        # 创建输入张量
+        logger.info("Moving input tensors to GPU...")
+        input_ids = torch.tensor(input_data['input_ids'], device='cuda')
+        attention_mask = torch.tensor(input_data['attention_mask'], device='cuda')
+        
+        # 生成参数日志 - 修改默认 max_new_tokens 为 50
+        max_new_tokens = input_data.get('max_new_tokens', 50)  # 改为默认50
+        temperature = input_data.get('temperature', 0.6)
+        top_p = input_data.get('top_p', 0.9)
+        logger.info(f"Generation parameters: max_new_tokens={max_new_tokens}, "
+                   f"temperature={temperature}, "
+                   f"top_p={top_p}")
+        
+        # ... 其余代码保持不变 ...
+```
+
+
+同时，在运行主程序时也可以指定这个参数：
+
+```bash
+# 在 CPU 机器 (10.21.22.100) 上运行
+PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.local_chat \
+    --model_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/ \
+    --gguf_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/ \
+    --worker_address "10.21.22.206:29500" \
+    --max_new_tokens 50
+```
+
+
+GPU 机器 (10.21.22.206) 的运行命令保持不变：
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0 python -m ktransformers.worker --worker_address "10.21.22.206:29500"
+```
+
+
+这样模型每次生成时最多只会生成 50 个新 token。如果需要调整其他参数，请告诉我。
+
+---
+
+_**User**_
+
+我们能不能使用另一块gpu来推理，当前gpu用来存储模型数据，不然显存不够
+
+---
+
+_**Assistant**_
+
+
+
+
+
+我们可以修改代码来实现跨 GPU 的模型推理。让我们修改 worker.py：
+
+```python:ktransformers/worker.py
+def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        logger.info("Received generation request")
+        logger.info(f"Input sequence length: {len(input_data['input_ids'])}")
+        
+        # 获取可用的 GPU
+        main_gpu = torch.device("cuda:0")  # 存储模型的 GPU
+        infer_gpu = torch.device("cuda:1")  # 用于推理的 GPU
+        logger.info(f"Using GPU 0 for model storage and GPU 1 for inference")
+        
+        # 创建输入张量到推理 GPU
+        logger.info("Moving input tensors to inference GPU...")
+        input_ids = torch.tensor(input_data['input_ids'], device=infer_gpu)
+        attention_mask = torch.tensor(input_data['attention_mask'], device=infer_gpu)
+        
+        # 生成参数日志
+        max_new_tokens = input_data.get('max_new_tokens', 50)
+        temperature = input_data.get('temperature', 0.6)
+        top_p = input_data.get('top_p', 0.9)
+        logger.info(f"Generation parameters: max_new_tokens={max_new_tokens}, "
+                   f"temperature={temperature}, "
+                   f"top_p={top_p}")
+        
+        # 生成文本
+        logger.info("Starting text generation...")
+        start_time = time.time()
+        
+        with torch.no_grad(), torch.amp.autocast('cuda'):
+            logger.info("Initializing generation process...")
+            # 添加详细的初始化信息
+            logger.info("- Checking model state...")
+            logger.info(f"- Model device: {self.model.device}")
+            logger.info(f"- Input shape: {input_ids.shape}")
+            logger.info(f"- GPU 0 memory allocated: {torch.cuda.memory_allocated(0)/1024**3:.2f}GB")
+            logger.info(f"- GPU 1 memory allocated: {torch.cuda.memory_allocated(1)/1024**3:.2f}GB")
+            
+            # 临时将需要的模型层移到推理 GPU
+            logger.info("- Moving necessary model parts to inference GPU...")
+            
+            # KV cache 信息
+            num_layers = len(self.model.model.layers)
+            hidden_size = self.model.config.hidden_size
+            logger.info(f"- Model architecture:")
+            logger.info(f"  - Number of layers: {num_layers}")
+            logger.info(f"  - Hidden size: {hidden_size}")
+            
+            # 估算 KV cache 大小
+            seq_len = input_ids.shape[1] + max_new_tokens
+            kv_cache_size = 2 * num_layers * seq_len * hidden_size * input_ids.shape[0] * 2 / (1024**3)  # in GB
+            logger.info(f"- Estimated KV cache size: {kv_cache_size:.2f}GB")
+            
+            # 检查是否启用了 flash attention
+            if hasattr(self.model.config, '_attn_implementation'):
+                logger.info(f"- Attention implementation: {self.model.config._attn_implementation}")
+            
+            # 设置模型的设备映射
+            device_map = {
+                'model.embed_tokens': main_gpu,
+                'model.norm': main_gpu,
+                'lm_head': main_gpu,
+            }
+            # 将部分层移到推理 GPU
+            for i in range(num_layers):
+                if i < num_layers // 2:
+                    device_map[f'model.layers.{i}'] = main_gpu
+                else:
+                    device_map[f'model.layers.{i}'] = infer_gpu
+            
+            self.model.parallelize(device_map)
+            logger.info("- Model parallelized across GPUs")
+            
+            # ... 其余生成配置代码保持不变 ...
+            
+            outputs = self.model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                do_sample=input_
+
 ---
 
 

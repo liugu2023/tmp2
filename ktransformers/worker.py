@@ -79,10 +79,15 @@ class ModelWorker:
             logger.info("Received generation request")
             logger.info(f"Input sequence length: {len(input_data['input_ids'])}")
             
-            # 创建输入张量
-            logger.info("Moving input tensors to GPU...")
-            input_ids = torch.tensor(input_data['input_ids'], device='cuda')
-            attention_mask = torch.tensor(input_data['attention_mask'], device='cuda')
+            # 获取可用的 GPU
+            main_gpu = torch.device("cuda:0")  # 存储模型的 GPU
+            infer_gpu = torch.device("cuda:1")  # 用于推理的 GPU
+            logger.info(f"Using GPU 0 for model storage and GPU 1 for inference")
+            
+            # 创建输入张量到推理 GPU
+            logger.info("Moving input tensors to inference GPU...")
+            input_ids = torch.tensor(input_data['input_ids'], device=infer_gpu)
+            attention_mask = torch.tensor(input_data['attention_mask'], device=infer_gpu)
             
             # 生成参数日志
             max_new_tokens = input_data.get('max_new_tokens', 50)
@@ -95,13 +100,18 @@ class ModelWorker:
             # 生成文本
             logger.info("Starting text generation...")
             start_time = time.time()
+            
             with torch.no_grad(), torch.amp.autocast('cuda'):
                 logger.info("Initializing generation process...")
                 # 添加详细的初始化信息
                 logger.info("- Checking model state...")
                 logger.info(f"- Model device: {self.model.device}")
                 logger.info(f"- Input shape: {input_ids.shape}")
-                logger.info(f"- Current GPU memory allocated: {torch.cuda.memory_allocated()/1024**3:.2f}GB")
+                logger.info(f"- GPU 0 memory allocated: {torch.cuda.memory_allocated(0)/1024**3:.2f}GB")
+                logger.info(f"- GPU 1 memory allocated: {torch.cuda.memory_allocated(1)/1024**3:.2f}GB")
+                
+                # 临时将需要的模型层移到推理 GPU
+                logger.info("- Moving necessary model parts to inference GPU...")
                 
                 # KV cache 信息
                 num_layers = len(self.model.model.layers)
@@ -119,14 +129,21 @@ class ModelWorker:
                 if hasattr(self.model.config, '_attn_implementation'):
                     logger.info(f"- Attention implementation: {self.model.config._attn_implementation}")
                 
-                logger.info("- Starting token generation...")
-                logger.info("  - Preparing generation config:")
-                generation_config = self.model.generation_config
-                logger.info(f"    - Repetition penalty: {generation_config.repetition_penalty}")
-                logger.info(f"    - Length penalty: {generation_config.length_penalty}")
-                logger.info(f"    - Early stopping: {generation_config.early_stopping}")
-                logger.info(f"    - Pad token ID: {generation_config.pad_token_id}")
-                logger.info(f"    - EOS token ID: {generation_config.eos_token_id}")
+                # 设置模型的设备映射
+                device_map = {
+                    'model.embed_tokens': main_gpu,
+                    'model.norm': main_gpu,
+                    'lm_head': main_gpu,
+                }
+                # 将部分层移到推理 GPU
+                for i in range(num_layers):
+                    if i < num_layers // 2:
+                        device_map[f'model.layers.{i}'] = main_gpu
+                    else:
+                        device_map[f'model.layers.{i}'] = infer_gpu
+                
+                self.model.parallelize(device_map)
+                logger.info("- Model parallelized across GPUs")
                 
                 # 记录起始时间戳
                 gen_start_time = time.time()
@@ -169,6 +186,10 @@ class ModelWorker:
                     do_sample=input_data.get('do_sample', True),
                     streamer=streamer
                 )
+                
+                # 生成完成后，将模型恢复到主 GPU
+                logger.info("- Moving model back to main GPU...")
+                self.model.to(main_gpu)
                 
                 # 记录生成完成的信息
                 final_time = time.time()

@@ -833,7 +833,118 @@ class DistributedModel:
     def generate(self, input_ids, attention_mask, **kwargs):
         message = {
             'command': 'generate',
-            'data
+            'data': {
+                'input_ids': input_ids.cpu().numpy().tolist(),
+                'attention_mask': attention_mask.cpu().numpy().tolist(),
+                **kwargs
+            }
+        }
+        self.socket.send_pyobj(message)
+        response = self.socket.recv_pyobj()
+        
+        if response['status'] == 'success':
+            return torch.tensor(response['output_ids'])
+        else:
+            raise Exception(f"Generation failed: {response.get('error')}")
+
+# ... rest of the code ...
+```
+
+主要改动：
+1. 添加了 logging 模块的导入和配置
+2. 添加了更多的日志记录，帮助调试
+3. 在 DistributedModel 类中也添加了日志记录
+
+现在再次运行：
+
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.local_chat \
+    --model_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/ \
+    --gguf_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/ \
+    --worker_address "10.21.22.206:29500"
+```
+
+这样应该就不会报 logger 未定义的错误了。如果还有其他问题，请告诉我。
+
+---
+
+_**User**_
+
+现在貌似不能互通，看一下监听规则
+
+---
+
+_**Assistant**_
+
+
+
+让我们检查一下网络监听和连接的设置。问题可能出在 IP 地址的绑定上。我们需要修改 worker.py 中的绑定地址：
+
+```python:ktransformers/worker.py
+class ModelWorker:
+    def __init__(self, address: str):
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.REP)
+        host, port = address.split(':')
+        # 修改：明确绑定到指定 IP，而不是 *
+        self.socket.bind(f"tcp://{host}:{port}")  # 使用实际的 IP 地址
+        self.socket.setsockopt(zmq.RCVHWM, 0)
+        self.socket.setsockopt(zmq.SNDHWM, 0)
+        
+        self.model = None
+        self.tokenizer = None
+        logger.info(f"Worker started at {address}")
+
+    # ... rest of the code ...
+```
+
+然后在运行时，我们需要确保：
+
+1. 在 GPU 机器 (10.21.22.206) 上运行：
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0 python -m ktransformers.worker --worker_address "10.21.22.206:29500"
+```
+
+2. 在 CPU 机器 (10.21.22.100) 上运行：
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.local_chat \
+    --model_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/ \
+    --gguf_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/ \
+    --worker_address "10.21.22.206:29500"
+```
+
+为了调试网络连接，您可以：
+
+1. 在 GPU 机器上检查端口是否正在监听：
+```bash
+netstat -tunlp | grep 29500
+```
+
+2. 测试两台机器之间的连接：
+```bash
+# 在 CPU 机器上
+telnet 10.21.22.206 29500
+```
+
+如果还是不能连接，可能需要检查：
+1. 防火墙设置
+2. SELinux 状态
+3. 网络路由
+
+请告诉我执行 netstat 的结果，这样我可以更好地帮助诊断问题。
+
+---
+
+_**User**_
+
+(ds) root@login:/archive/liugu/ds/ktransformers# netstat -tunlp | grep 29500
+(ds) root@login:/archive/liugu/ds/ktransformers#
+
+---
+
+_**Assistant**_
+
+
 
 ---
 

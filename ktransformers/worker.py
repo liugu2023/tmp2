@@ -32,13 +32,13 @@ class ModelWorker:
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.REP)
         host, port = address.split(':')
-        self.socket.bind(f"tcp://*:{port}")
+        self.socket.bind(f"tcp://0.0.0.0:{port}")
         self.socket.setsockopt(zmq.RCVHWM, 0)
         self.socket.setsockopt(zmq.SNDHWM, 0)
         
         self.model = None
         self.tokenizer = None
-        logger.info(f"Worker started at {address} with high-performance network")
+        logger.info(f"Worker started at {address}, listening on all interfaces")
 
     def load_model(self, model_path: str, gguf_path: str):
         logger.info("Loading tokenizer...")

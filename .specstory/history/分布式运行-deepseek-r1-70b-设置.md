@@ -2735,7 +2735,57 @@ def load_model_and_tokenizer(model_path: str, gguf_path: str):
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     
     logger.info("Loading model config...")
-    config
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    torch.set_default_dtype(config.torch_dtype)
+    
+    logger.info("Loading model...")
+    if config.architectures[0] in custom_models:
+        logger.info("Using custom modeling_xxx.py")
+        if "Qwen2Moe" in config.architectures[0]:
+            config._attn_implementation = "flash_attention_2"
+        if "Llama" in config.architectures[0]:
+            config._attn_implementation = "eager"
+        if "Mixtral" in config.architectures[0]:
+            config._attn_implementation = "flash_attention_2"
+            
+        model = custom_models[config.architectures[0]](config)
+    else:
+        model = AutoModelForCausalLM.from_config(
+            config, trust_remote_code=True, attn_implementation="flash_attention_2"
+        )
+    
+    # 使用 ktransformers 的优化
+    if config.architectures[0] in default_optimize_rules:
+        logger.info(f"Using default_optimize_rule for {config.architectures[0]}")
+        optimize_config_path = default_optimize_rules[config.architectures[0]]
+    else:
+        optimize_config_path = input("Please input optimize rules path: ")
+    
+    optimize_and_load_gguf(model, optimize_config_path, gguf_path, config)
+    model.eval()
+    
+    return model, tokenizer
+```
+
+我们应该使用 ktransformers 的：
+1. custom_models
+2. optimize_and_load_gguf
+3. 默认优化规则
+4. Flash Attention 实现
+
+您说得对，我之前的实现完全没有利用到 ktransformers 的优势。让我重新设计一下分布式部分，您觉得应该如何利用 ktransformers 的特性来实现跨 GPU 的计算？
+
+---
+
+_**User**_
+
+我让你设计这一整套分布式架构只是为了解决Illegal instruction问题的，现在重新设计吧
+
+---
+
+_**Assistant**_
+
+
 
 ---
 

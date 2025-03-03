@@ -3,9 +3,8 @@ import zmq
 import pickle
 from typing import Dict, Any
 import logging
-from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM, GenerationConfig
+from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM, GenerationConfig, TextStreamer
 import time
-from transformers import TextStreamer
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -90,6 +89,16 @@ class ModelWorker:
             
         logger.info("Model loaded successfully")
 
+    # 添加 CustomStreamer 类定义
+    class CustomStreamer(TextStreamer):
+        def __init__(self, tokenizer, skip_prompt=False, skip_special_tokens=True, on_text_chunk=None):
+            super().__init__(tokenizer, skip_prompt, skip_special_tokens)
+            self.on_text_chunk = on_text_chunk
+
+        def on_finalized_text(self, text: str, stream_end: bool = False):
+            if self.on_text_chunk:
+                self.on_text_chunk(text, stream_end)
+
     def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
         try:
             logger.info("Received generation request")
@@ -167,7 +176,7 @@ class ModelWorker:
                             self.last_send_time = current_time
                 
                 # 创建流式处理器
-                streamer = CustomStreamer(
+                streamer = self.CustomStreamer(
                     self.tokenizer,
                     skip_prompt=True,
                     skip_special_tokens=True,

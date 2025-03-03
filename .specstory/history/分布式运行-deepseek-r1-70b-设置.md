@@ -2798,7 +2798,164 @@ def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
                 
             def __call__(self, text_chunk: str, stream_end: bool = False):
                 current_time = time.time()
-                self
+                self.current_text += text_chunk
+                
+                # 每0.5秒或结束时发送一次
+                if stream_end or (current_time - self.last_send_time) > 0.5:
+                    self.socket.send_pyobj({
+                        'status': 'streaming',
+                        'text': self.current_text,
+                        'finished': stream_end
+                    })
+                    # 等待客户端确认
+                    self.socket.recv_pyobj()
+                    self.last_send_time = current_time
+        
+        # 创建流式处理器
+        streamer = CustomStreamer(
+            self.tokenizer,
+            skip_prompt=True,
+            skip_special_tokens=True,
+            on_text_chunk=StreamingHandler(self.socket, self.tokenizer)
+        )
+        
+        # 生成文本
+        outputs = self.model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            do_sample=input_data.get('do_sample', True),
+            streamer=streamer
+        )
+        
+        # 最终返回完整的 token ids
+        return {
+            'status': 'success',
+            'output_ids': outputs.cpu().numpy().tolist()
+        }
+        
+    except Exception as e:
+        logger.error(f"Generation error: {str(e)}")
+        return {
+            'status': 'error',
+            'error': str(e)
+        }
+```
+
+
+
+然后在 local_chat.py 中处理流式响应：
+
+```python:ktransformers/local_chat.py
+def generate(self, input_ids, attention_mask, **kwargs):
+    try:
+        logger.info("Preparing generation request...")
+        message = {
+            'command': 'generate',
+            'data': {
+                'input_ids': input_ids.cpu().numpy().tolist(),
+                'attention_mask': attention_mask.cpu().numpy().tolist(),
+                **kwargs
+            }
+        }
+        
+        logger.info("Starting generation...")
+        self.socket.send_pyobj(message)
+        
+        # 接收流式响应
+        full_text = ""
+        while True:
+            response = self.socket.recv_pyobj()
+            
+            if response['status'] == 'error':
+                raise Exception(f"Generation failed: {response.get('error')}")
+            
+            if response['status'] == 'streaming':
+                # 打印新生成的文本部分
+                new_text = response['text'][len(full_text):]
+                if new_text:
+                    print(new_text, end='', flush=True)
+                full_text = response['text']
+                
+                # 发送确认
+                self.socket.send_pyobj({'status': 'received'})
+                
+                # 如果生成结束，退出循环
+                if response.get('finished', False):
+                    print()  # 换行
+                    break
+            
+            elif response['status'] == 'success':
+                # 最终的完整响应
+                return torch.tensor(response['output_ids'])
+        
+    except Exception as e:
+        logger.error(f"Error in generate: {str(e)}")
+        raise
+```
+
+
+
+主要改动：
+1. 添加了流式处理器
+2. 每0.5秒发送一次部分生成的文本
+3. 客户端实时显示生成的文本
+4. 保持了原有的 token IDs 返回机制
+
+优点：
+1. 用户可以实时看到生成的内容
+2. 减少了等待感
+3. 可以及早发现生成问题
+4. 充分利用了生成等待时间
+
+运行命令保持不变：
+
+1. GPU 机器:
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0,1 python -m ktransformers.worker --worker_address "10.21.22.206:29500"
+```
+
+
+
+2. CPU 机器:
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.local_chat \
+    --model_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/ \
+    --gguf_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/ \
+    --worker_address "10.21.22.206:29500" \
+    --max_new_tokens 50
+```
+
+
+
+这样用户体验应该会好很多。如果需要调整流式传输的频率或其他参数，请告诉我。
+
+---
+
+_**User**_
+
+ERROR:__main__:Generation error: name 'CustomStreamer' is not defined
+
+---
+
+_**Assistant**_
+
+
+
+
+
+
+
+啊，抱歉，我们需要定义 CustomStreamer 类。让我修改 worker.py：
+
+```python:ktransformers/worker.py
+# 在文件开头添加导入
+from transformers import TextStreamer
+
+# 在 ModelWorker 类中添加 CustomStreamer 类定义
+class ModelWorker:
 
 ---
 

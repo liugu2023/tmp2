@@ -53,7 +53,7 @@ class ModelWorker:
         logger.info("Loading model...")
         # 设置最大显存使用量和内存使用量
         max_memory = {
-            0: "10GiB",  # GPU 0 使用15GB显存
+            0: "12GiB",  # GPU 0 使用15GB显存
             'cpu': "138GiB"  # CPU 使用50GB内存
         }
         

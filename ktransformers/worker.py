@@ -52,7 +52,7 @@ class ModelWorker:
         
         logger.info("Loading model...")
         # 设置最大显存使用量
-        max_memory = {0: "20GiB"}  # 使用95GB显存在GPU 0上
+        max_memory = {0: "15GiB"}  # 使用95GB显存在GPU 0上
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path,
             config=config,

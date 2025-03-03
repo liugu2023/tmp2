@@ -6,8 +6,6 @@ import logging
 from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM, GenerationConfig
 import time
 from transformers import TextStreamer
-import os
-from ktransformers.distributed_config import WORKER_CONFIGS, MODEL_SHARD_STRATEGY, COMMUNICATION_CONFIG
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -32,7 +30,7 @@ def load_model_and_tokenizer(model_path: str, gguf_path: str):
     return model, tokenizer
 
 class ModelWorker:
-    def __init__(self, address: str, worker_id: str):
+    def __init__(self, address: str):
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.REP)
         host, port = address.split(':')
@@ -40,16 +38,9 @@ class ModelWorker:
         self.socket.setsockopt(zmq.RCVHWM, 0)
         self.socket.setsockopt(zmq.SNDHWM, 0)
         
-        # 设置 CPU 核心数
-        torch.set_num_threads(10)
-        logger.info(f"Set PyTorch CPU threads to 10")
-        
-        # 保存 worker_id
-        self.worker_id = worker_id
-        logger.info(f"Worker {worker_id} started at {address}")
-        
         self.model = None
         self.tokenizer = None
+        logger.info(f"Worker started at {address}, listening on all interfaces")
 
     def load_model(self, model_path: str, gguf_path: str):
         logger.info("Loading tokenizer...")
@@ -59,33 +50,30 @@ class ModelWorker:
         config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         torch.set_default_dtype(config.torch_dtype)
         
-        # 获取当前 worker 的分片策略
-        shard_strategy = MODEL_SHARD_STRATEGY[self.worker_id]
-        
-        logger.info(f"Loading model with shard strategy for {self.worker_id}")
-        logger.info(f"Assigned layers: {shard_strategy['layers']}")
-        
-        # 设置设备映射
-        device_map = {layer: f"cuda:{i%2}" for i, layer in enumerate(shard_strategy['layers'])}
-        logger.info(f"Device mapping: {device_map}")
+        logger.info("Loading model...")
+        # 设置双 GPU 的内存分配
+        max_memory = {
+            0: "12GiB",    # 第一张 GPU 使用 12GB
+            1: "12GiB",    # 第二张 GPU 使用 12GB
+            'cpu': "138GiB" # 剩余放在 CPU 内存
+        }
         
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path,
             config=config,
             trust_remote_code=True,
-            device_map=device_map,  # 使用手动设备映射
-            max_memory=shard_strategy['memory'],
+            device_map="auto",  # 自动在两张 GPU 之间分配
+            max_memory=max_memory,
             torch_dtype=torch.float16,
             offload_folder=None,
             offload_state_dict=False
         )
         self.model.eval()
         
-        # 记录模型分布情况
-        if hasattr(self.model, 'hf_device_map'):
-            logger.info("Model layer distribution:")
-            for layer, device in self.model.hf_device_map.items():
-                logger.info(f"  {layer}: {device}")
+        # 输出设备分配信息
+        logger.info("Model layer distribution:")
+        for name, device in self.model.hf_device_map.items():
+            logger.info(f"  {name}: {device}")
         
         # 设置生成配置
         try:
@@ -256,24 +244,9 @@ def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--worker_address', type=str, required=True)
-    parser.add_argument('--worker_id', type=str, required=True,
-                      help='Worker ID (e.g., "worker1" or "worker2")')
     args = parser.parse_args()
     
-    # 加载配置
-    worker_config = WORKER_CONFIGS[args.worker_id]
-    shard_strategy = MODEL_SHARD_STRATEGY[args.worker_id]
-    
-    # 设置可见GPU
-    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(
-        [gpu.split(":")[-1] for gpu in worker_config["gpus"]]
-    )
-    
-    # 设置CPU线程
-    torch.set_num_threads(worker_config["cpu_threads"])
-    
-    # 创建 worker 实例时传入 worker_id
-    worker = ModelWorker(worker_config["address"], args.worker_id)
+    worker = ModelWorker(args.worker_address)
     worker.run()
 
 if __name__ == '__main__':

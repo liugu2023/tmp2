@@ -6,6 +6,7 @@ import logging
 from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM, GenerationConfig
 import time
 from transformers import TextStreamer
+import os
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -260,9 +261,23 @@ def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--worker_address', type=str, required=True)
+    parser.add_argument('--worker_id', type=str, required=True,
+                      help='Worker ID (e.g., "worker1" or "worker2")')
     args = parser.parse_args()
     
-    worker = ModelWorker(args.worker_address)
+    # 加载配置
+    worker_config = WORKER_CONFIGS[args.worker_id]
+    shard_strategy = MODEL_SHARD_STRATEGY[args.worker_id]
+    
+    # 设置可见GPU
+    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(
+        [gpu.split(":")[-1] for gpu in worker_config["gpus"]]
+    )
+    
+    # 设置CPU线程
+    torch.set_num_threads(worker_config["cpu_threads"])
+    
+    worker = ModelWorker(worker_config["address"])
     worker.run()
 
 if __name__ == '__main__':

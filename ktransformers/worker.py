@@ -7,6 +7,7 @@ from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM, Genera
 import time
 from transformers import TextStreamer
 import os
+from ktransformers.distributed_config import WORKER_CONFIGS, MODEL_SHARD_STRATEGY, COMMUNICATION_CONFIG
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

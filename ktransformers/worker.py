@@ -60,10 +60,10 @@ class ModelWorker:
             logger.info("Received generation request")
             logger.info(f"Input sequence length: {len(input_data['input_ids'])}")
             
-            # 创建输入张量在GPU上
-            logger.info("Moving input tensors to GPU...")
-            input_ids = torch.tensor(input_data['input_ids'], device='cuda')
-            attention_mask = torch.tensor(input_data['attention_mask'], device='cuda')
+            # 创建输入张量在CPU上
+            logger.info("Creating input tensors on CPU...")
+            input_ids = torch.tensor(input_data['input_ids'])  # 默认在CPU上
+            attention_mask = torch.tensor(input_data['attention_mask'])
             
             # 生成参数日志
             max_new_tokens = input_data.get('max_new_tokens', 512)
@@ -77,49 +77,49 @@ class ModelWorker:
             logger.info("Starting text generation...")
             start_time = time.time()
             
-            # 设置模型以使用CPU内存但在GPU上计算
+            # 使用 CUDA 内存管理
             with torch.cuda.stream(torch.cuda.Stream()):
                 with torch.no_grad(), torch.amp.autocast('cuda'):
                     logger.info("Generating text...")
                     
-                    # 自定义前向传播，直接从CPU内存读取权重
-                    def custom_forward_hook(module, input_tensor):
-                        # 将权重临时移到GPU进行计算
-                        with torch.cuda.device('cuda'):
-                            # 获取当前模块的权重
-                            weights = {name: param.data for name, param in module.named_parameters()}
-                            # 在GPU上进行计算
-                            output = module._forward_impl(input_tensor[0])
-                            return output
+                    # 设置模型的前向传播钩子
+                    def forward_hook(module, input_tensor):
+                        # 将输入和权重移动到GPU
+                        input_gpu = [x.cuda() if isinstance(x, torch.Tensor) else x for x in input_tensor]
+                        # 执行计算
+                        output = module._forward_impl(*input_gpu)
+                        # 将输出移回CPU
+                        if isinstance(output, torch.Tensor):
+                            output = output.cpu()
+                        elif isinstance(output, tuple):
+                            output = tuple(x.cpu() if isinstance(x, torch.Tensor) else x for x in output)
+                        return output
                     
-                    # 注册前向钩子
+                    # 注册钩子
                     hooks = []
                     for name, module in self.model.named_modules():
                         if hasattr(module, '_forward_impl'):
-                            hook = module.register_forward_pre_hook(custom_forward_hook)
+                            hook = module.register_forward_pre_hook(forward_hook)
                             hooks.append(hook)
                     
-                    # 生成文本
-                    outputs = self.model.generate(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        max_new_tokens=max_new_tokens,
-                        temperature=temperature,
-                        top_p=top_p,
-                        do_sample=input_data.get('do_sample', True),
-                        streamer=TextStreamer(self.tokenizer, skip_prompt=True)
-                    )
-                    
-                    # 移除钩子
-                    for hook in hooks:
-                        hook.remove()
+                    try:
+                        # 生成文本
+                        outputs = self.model.generate(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            max_new_tokens=max_new_tokens,
+                            temperature=temperature,
+                            top_p=top_p,
+                            do_sample=input_data.get('do_sample', True),
+                            streamer=TextStreamer(self.tokenizer, skip_prompt=True)
+                        )
+                    finally:
+                        # 确保钩子被移除
+                        for hook in hooks:
+                            hook.remove()
             
             # 清理GPU内存
             torch.cuda.empty_cache()
-            
-            # 移动输出到CPU
-            logger.info("Moving outputs to CPU...")
-            outputs_cpu = outputs.cpu()
             
             # 记录GPU内存使用情况
             allocated = torch.cuda.memory_allocated() / 1024**3
@@ -128,11 +128,12 @@ class ModelWorker:
             
             logger.info("Preparing response...")
             return {
-                'output_ids': outputs_cpu.numpy().tolist(),
+                'output_ids': outputs.numpy().tolist(),
                 'status': 'success'
             }
         except Exception as e:
             logger.error(f"Generation error: {str(e)}")
+            # 清理GPU内存
             torch.cuda.empty_cache()
             return {
                 'status': 'error',

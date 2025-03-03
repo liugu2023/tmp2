@@ -3396,6 +3396,142 @@ PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.local_chat \
 
 ---
 
+_**User**_
+
+/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/generation/utils.py:1850: UserWarning: You are calling .generate() with the `input_ids` being on a device type different than your model's device. `input_ids` is on cuda, whereas the model is on cpu. You may experience unexpected behaviors or slower generation. Please make sure that you have put `input_ids` to the correct device by calling for example input_ids = input_ids.to('cpu') before running `.generate()`.
+  warnings.warn(
+ERROR:__main__:Generation error: Expected all tensors to be on the same device, but found at least two devices, cpu and cuda:0! (when checking argument for argument index in method wrapper_CUDA__index_select)
+
+---
+
+_**Assistant**_
+
+
+
+
+
+
+
+看来我们需要调整输入张量和模型的设备一致性。让我们修改 worker.py 中的生成部分：
+
+```python:ktransformers/worker.py
+def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        logger.info("Received generation request")
+        logger.info(f"Input sequence length: {len(input_data['input_ids'])}")
+        
+        # 创建输入张量在CPU上
+        logger.info("Creating input tensors on CPU...")
+        input_ids = torch.tensor(input_data['input_ids'])  # 默认在CPU上
+        attention_mask = torch.tensor(input_data['attention_mask'])
+        
+        # 生成参数日志
+        max_new_tokens = input_data.get('max_new_tokens', 512)
+        temperature = input_data.get('temperature', 0.6)
+        top_p = input_data.get('top_p', 0.9)
+        logger.info(f"Generation parameters: max_new_tokens={max_new_tokens}, "
+                   f"temperature={temperature}, "
+                   f"top_p={top_p}")
+        
+        # 生成文本
+        logger.info("Starting text generation...")
+        start_time = time.time()
+        
+        # 使用 CUDA 内存管理
+        with torch.cuda.stream(torch.cuda.Stream()):
+            with torch.no_grad(), torch.amp.autocast('cuda'):
+                logger.info("Generating text...")
+                
+                # 设置模型的前向传播钩子
+                def forward_hook(module, input_tensor):
+                    # 将输入和权重移动到GPU
+                    input_gpu = [x.cuda() if isinstance(x, torch.Tensor) else x for x in input_tensor]
+                    # 执行计算
+                    output = module._forward_impl(*input_gpu)
+                    # 将输出移回CPU
+                    if isinstance(output, torch.Tensor):
+                        output = output.cpu()
+                    elif isinstance(output, tuple):
+                        output = tuple(x.cpu() if isinstance(x, torch.Tensor) else x for x in output)
+                    return output
+                
+                # 注册钩子
+                hooks = []
+                for name, module in self.model.named_modules():
+                    if hasattr(module, '_forward_impl'):
+                        hook = module.register_forward_pre_hook(forward_hook)
+                        hooks.append(hook)
+                
+                try:
+                    # 生成文本
+                    outputs = self.model.generate(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        max_new_tokens=max_new_tokens,
+                        temperature=temperature,
+                        top_p=top_p,
+                        do_sample=input_data.get('do_sample', True),
+                        streamer=TextStreamer(self.tokenizer, skip_prompt=True)
+                    )
+                finally:
+                    # 确保钩子被移除
+                    for hook in hooks:
+                        hook.remove()
+        
+        # 清理GPU内存
+        torch.cuda.empty_cache()
+        
+        # 记录GPU内存使用情况
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        logger.info(f"GPU Memory: Allocated={allocated:.2f}GB, Reserved={reserved:.2f}GB")
+        
+        logger.info("Preparing response...")
+        return {
+            'output_ids': outputs.numpy().tolist(),
+            'status': 'success'
+        }
+    except Exception as e:
+        logger.error(f"Generation error: {str(e)}")
+        # 清理GPU内存
+        torch.cuda.empty_cache()
+        return {
+            'status': 'error',
+            'error': str(e)
+        }
+```
+
+
+
+主要改动：
+1. 输入张量保持在 CPU 上
+2. 修改前向传播钩子，在计算时：
+   - 将输入数据移到 GPU
+   - 执行计算
+   - 将结果移回 CPU
+3. 使用 try-finally 确保钩子被正确移除
+4. 简化了内存管理
+
+运行命令保持不变：
+
+```bash
+# GPU 机器 (10.21.22.206)
+PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0 python -m ktransformers.worker --worker_address "10.21.22.206:29500"
+
+# CPU 机器 (10.21.22.100)
+PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.local_chat \
+    --model_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/ \
+    --gguf_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/ \
+    --worker_address "10.21.22.206:29500" \
+    --max_new_tokens 50
+```
+
+
+
+这样应该能解决设备不一致的问题。如果还有其他错误，请告诉我。
+
+---
+
 
 
 ---

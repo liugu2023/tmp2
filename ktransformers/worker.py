@@ -89,15 +89,15 @@ class ModelWorker:
             
         logger.info("Model loaded successfully")
 
-    # 添加 CustomStreamer 类定义
+    # 修改 CustomStreamer 类定义
     class CustomStreamer(TextStreamer):
-        def __init__(self, tokenizer, skip_prompt=False, skip_special_tokens=True, on_text_chunk=None):
-            super().__init__(tokenizer, skip_prompt, skip_special_tokens)
+        def __init__(self, tokenizer, on_text_chunk=None, **kwargs):
+            super().__init__(tokenizer, **kwargs)
             self.on_text_chunk = on_text_chunk
 
         def on_finalized_text(self, text: str, stream_end: bool = False):
             if self.on_text_chunk:
-                self.on_text_chunk(text, stream_end)
+                self.on_text_text_chunk(text, stream_end)
 
     def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
         try:
@@ -178,9 +178,9 @@ class ModelWorker:
                 # 创建流式处理器
                 streamer = self.CustomStreamer(
                     self.tokenizer,
+                    on_text_chunk=StreamingHandler(self.socket, self.tokenizer),
                     skip_prompt=True,
-                    skip_special_tokens=True,
-                    on_text_chunk=StreamingHandler(self.socket, self.tokenizer)
+                    skip_special_tokens=True
                 )
                 
                 outputs = self.model.generate(

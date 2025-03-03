@@ -2956,6 +2956,97 @@ from transformers import TextStreamer
 
 # 在 ModelWorker 类中添加 CustomStreamer 类定义
 class ModelWorker:
+    def __init__(self, worker_address: str):
+        # ... 现有代码 ...
+
+    # 添加 CustomStreamer 类定义
+    class CustomStreamer(TextStreamer):
+        def __init__(self, tokenizer, skip_prompt=False, skip_special_tokens=True, on_text_chunk=None):
+            super().__init__(tokenizer, skip_prompt, skip_special_tokens)
+            self.on_text_chunk = on_text_chunk
+
+        def on_finalized_text(self, text: str, stream_end: bool = False):
+            if self.on_text_chunk:
+                self.on_text_chunk(text, stream_end)
+
+    def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            # ... 其他代码保持不变 ...
+            
+            # 创建自定义流式处理器
+            class StreamingHandler:
+                def __init__(self, socket, tokenizer):
+                    self.socket = socket
+                    self.tokenizer = tokenizer
+                    self.current_text = ""
+                    self.last_send_time = time.time()
+                    
+                def __call__(self, text_chunk: str, stream_end: bool = False):
+                    current_time = time.time()
+                    self.current_text += text_chunk
+                    
+                    # 每0.5秒或结束时发送一次
+                    if stream_end or (current_time - self.last_send_time) > 0.5:
+                        self.socket.send_pyobj({
+                            'status': 'streaming',
+                            'text': self.current_text,
+                            'finished': stream_end
+                        })
+                        # 等待客户端确认
+                        self.socket.recv_pyobj()
+                        self.last_send_time = current_time
+            
+            # 创建流式处理器
+            streamer = self.CustomStreamer(  # 使用 self.CustomStreamer
+                self.tokenizer,
+                skip_prompt=True,
+                skip_special_tokens=True,
+                on_text_chunk=StreamingHandler(self.socket, self.tokenizer)
+            )
+            
+            # ... 其余代码保持不变 ...
+```
+
+
+
+主要改动：
+1. 添加了 TextStreamer 的导入
+2. 定义了 CustomStreamer 类作为 ModelWorker 的内部类
+3. 修改了 streamer 的创建方式
+
+现在重新运行应该就不会报错了：
+
+1. GPU 机器 (10.21.22.206):
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0,1 python -m ktransformers.worker --worker_address "10.21.22.206:29500"
+```
+
+
+
+2. CPU 机器 (10.21.22.100):
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.local_chat \
+    --model_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/ \
+    --gguf_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/ \
+    --worker_address "10.21.22.206:29500" \
+    --max_new_tokens 50
+```
+
+
+
+这样应该能正常工作了。如果还有其他问题，请告诉我。
+
+---
+
+_**User**_
+
+ERROR:__main__:Generation error: TextStreamer.__init__() takes from 2 to 3 positional arguments but 4 were given
+
+---
+
+_**Assistant**_
+
+
 
 ---
 

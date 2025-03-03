@@ -32,7 +32,7 @@ def load_model_and_tokenizer(model_path: str, gguf_path: str):
     return model, tokenizer
 
 class ModelWorker:
-    def __init__(self, address: str):
+    def __init__(self, address: str, worker_id: str):
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.REP)
         host, port = address.split(':')
@@ -41,12 +41,15 @@ class ModelWorker:
         self.socket.setsockopt(zmq.SNDHWM, 0)
         
         # 设置 CPU 核心数
-        torch.set_num_threads(10)  # 限制为10个核心
+        torch.set_num_threads(10)
         logger.info(f"Set PyTorch CPU threads to 10")
+        
+        # 保存 worker_id
+        self.worker_id = worker_id
+        logger.info(f"Worker {worker_id} started at {address}")
         
         self.model = None
         self.tokenizer = None
-        logger.info(f"Worker started at {address}, listening on all interfaces")
 
     def load_model(self, model_path: str, gguf_path: str):
         logger.info("Loading tokenizer...")
@@ -57,10 +60,9 @@ class ModelWorker:
         torch.set_default_dtype(config.torch_dtype)
         
         # 获取当前 worker 的分片策略
-        worker_id = self.worker_id  # 需要在 __init__ 中添加
-        shard_strategy = MODEL_SHARD_STRATEGY[worker_id]
+        shard_strategy = MODEL_SHARD_STRATEGY[self.worker_id]
         
-        logger.info(f"Loading model with shard strategy for {worker_id}")
+        logger.info(f"Loading model with shard strategy for {self.worker_id}")
         logger.info(f"Assigned layers: {shard_strategy['layers']}")
         
         # 设置设备映射
@@ -270,7 +272,8 @@ def main():
     # 设置CPU线程
     torch.set_num_threads(worker_config["cpu_threads"])
     
-    worker = ModelWorker(worker_config["address"])
+    # 创建 worker 实例时传入 worker_id
+    worker = ModelWorker(worker_config["address"], args.worker_id)
     worker.run()
 
 if __name__ == '__main__':

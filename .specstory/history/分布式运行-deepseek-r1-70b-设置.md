@@ -3412,7 +3412,142 @@ WORKER_CONFIGS = {
 # 模型分片策略 - 手动分配17个数据组
 MODEL_SHARD_STRATEGY = {
     "worker1": {  # 206机器 - 前9个数据组
-        "
+        "layers": [
+            "model.embed_tokens",
+            "model.layers.0",
+            "model.layers.1",
+            "model.layers.2",
+            "model.layers.3",
+            "model.layers.4",
+            "model.layers.5",
+            "model.layers.6",
+            "model.layers.7"
+        ],
+        "memory": {
+            0: "12GiB",  # 第一张P100
+            1: "12GiB",  # 第二张P100
+            'cpu': "138GiB"
+        }
+    },
+    "worker2": {  # 207机器 - 后8个数据组
+        "layers": [
+            "model.layers.8",
+            "model.layers.9",
+            "model.layers.10",
+            "model.layers.11",
+            "model.layers.12",
+            "model.layers.13",
+            "model.layers.14",
+            "model.norm"
+        ],
+        "memory": {
+            0: "12GiB",  # 第一张P100
+            1: "12GiB",  # 第二张P100
+            'cpu': "138GiB"
+        }
+    }
+}
+
+# 通信配置
+COMMUNICATION_CONFIG = {
+    "timeout": 3600,
+    "heartbeat_interval": 30,
+    "retry_attempts": 3
+}
+```
+
+
+
+然后在 worker.py 中使用这个分片策略：
+
+```python:ktransformers/worker.py
+def load_model(self, model_path: str, gguf_path: str):
+    logger.info("Loading tokenizer...")
+    self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    
+    logger.info("Loading model config...")
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    torch.set_default_dtype(config.torch_dtype)
+    
+    # 获取当前 worker 的分片策略
+    worker_id = self.worker_id  # 需要在 __init__ 中添加
+    shard_strategy = MODEL_SHARD_STRATEGY[worker_id]
+    
+    logger.info(f"Loading model with shard strategy for {worker_id}")
+    logger.info(f"Assigned layers: {shard_strategy['layers']}")
+    
+    # 设置设备映射
+    device_map = {layer: f"cuda:{i%2}" for i, layer in enumerate(shard_strategy['layers'])}
+    logger.info(f"Device mapping: {device_map}")
+    
+    self.model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        config=config,
+        trust_remote_code=True,
+        device_map=device_map,  # 使用手动设备映射
+        max_memory=shard_strategy['memory'],
+        torch_dtype=torch.float16,
+        offload_folder=None,
+        offload_state_dict=False
+    )
+    self.model.eval()
+    
+    # 记录模型分布情况
+    if hasattr(self.model, 'hf_device_map'):
+        logger.info("Model layer distribution:")
+        for layer, device in self.model.hf_device_map.items():
+            logger.info(f"  {layer}: {device}")
+```
+
+
+
+运行命令：
+
+1. 206 机器（前9层）:
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.worker \
+    --worker_address "10.21.22.206:29500" \
+    --worker_id "worker1"
+```
+
+
+
+2. 207 机器（后8层）:
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.worker \
+    --worker_address "10.21.22.207:29500" \
+    --worker_id "worker2"
+```
+
+
+
+这样：
+1. 206机器负责：embed_tokens + 前7个transformer层
+2. 207机器负责：后7个transformer层 + 最终norm层
+3. 每台机器的两张P100会交替处理分配到的层
+
+需要我继续优化其他部分吗？
+
+---
+
+_**User**_
+
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/archive/liugu/ds/ktransformers/ktransformers/local_chat.py", line 189, in <module>
+    main()
+  File "/archive/liugu/ds/ktransformers/ktransformers/local_chat.py", line 142, in main
+    model.load_model(args.model_path, args.gguf_path)
+  File "/archive/liugu/ds/ktransformers/ktransformers/local_chat.py", line 61, in load_model
+    raise Exception(f"Failed to load model on {worker['address']}: {response.get('error')}")
+Exception: Failed to load model on 10.21.22.206:29500: 'ModelWorker' object has no attribute 'worker_id'   ERROR:__main__:Error processing message: 'ModelWorker' object has no attribute 'worker_id'
+
+---
+
+_**Assistant**_
+
+
 
 ---
 

@@ -2,12 +2,12 @@ WORKER_CONFIGS = {
     # 第一台机器（有1张P100）
     "worker1": {
         "address": "10.21.22.206:29500",
-        "gpus": ["cuda:0"],  # 本地 P100
+        "gpus": ["cuda:0", "cuda:1"],  # 本地 P100
         "cpu_threads": 10
     },
     # 第二台机器（有2张P100）
     "worker2": {
-        "address": "10.21.22.xxx:29500",  # 替换为实际IP
+        "address": "10.21.22.207:29500",  # 替换为实际IP
         "gpus": ["cuda:0", "cuda:1"],  # 两张 P100
         "cpu_threads": 10
     }

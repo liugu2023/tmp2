@@ -60,10 +60,10 @@ class ModelWorker:
             logger.info("Received generation request")
             logger.info(f"Input sequence length: {len(input_data['input_ids'])}")
             
-            # 创建输入张量在CPU上
-            logger.info("Creating input tensors on CPU...")
-            input_ids = torch.tensor(input_data['input_ids'])
-            attention_mask = torch.tensor(input_data['attention_mask'])
+            # 创建输入张量在GPU上
+            logger.info("Creating input tensors on GPU...")
+            input_ids = torch.tensor(input_data['input_ids'], device='cuda')
+            attention_mask = torch.tensor(input_data['attention_mask'], device='cuda')
             
             # 生成参数日志
             max_new_tokens = input_data.get('max_new_tokens', 512)
@@ -86,9 +86,9 @@ class ModelWorker:
                     original_forward = self.model.forward
                     
                     def gpu_forward(*args, **kwargs):
-                        # 将输入移到GPU
-                        gpu_args = [arg.cuda() if isinstance(arg, torch.Tensor) else arg for arg in args]
-                        gpu_kwargs = {k: v.cuda() if isinstance(v, torch.Tensor) else v for k, v in kwargs.items()}
+                        # 输入已经在GPU上，不需要移动
+                        gpu_args = args
+                        gpu_kwargs = kwargs
                         
                         # 对每个模块的权重进行GPU计算
                         for name, module in self.model.named_modules():
@@ -103,10 +103,10 @@ class ModelWorker:
                                         output = torch.nn.functional.linear(gpu_args[0], weight, bias if module.bias is not None else None)
                                     elif isinstance(module, torch.nn.LayerNorm):
                                         output = torch.nn.functional.layer_norm(gpu_args[0], module.normalized_shape, weight, bias if module.bias is not None else None)
-                                    # 将结果保持在GPU上
+                                    # 结果已经在GPU上
                                     gpu_args = (output,) + gpu_args[1:]
                         
-                        # 返回最终结果
+                        # 返回最终结果（在GPU上）
                         return gpu_args[0]
                     
                     # 替换模型的前向传播方法
@@ -115,8 +115,8 @@ class ModelWorker:
                     try:
                         # 生成文本
                         outputs = self.model.generate(
-                            input_ids=input_ids,
-                            attention_mask=attention_mask,
+                            input_ids=input_ids,  # 已经在GPU上
+                            attention_mask=attention_mask,  # 已经在GPU上
                             max_new_tokens=max_new_tokens,
                             temperature=temperature,
                             top_p=top_p,
@@ -127,19 +127,22 @@ class ModelWorker:
                         # 恢复原始的前向传播方法
                         self.model.forward = original_forward
                 
-                # 清理GPU内存
-                torch.cuda.empty_cache()
-                
-                # 记录GPU内存使用情况
-                allocated = torch.cuda.memory_allocated() / 1024**3
-                reserved = torch.cuda.memory_reserved() / 1024**3
-                logger.info(f"GPU Memory: Allocated={allocated:.2f}GB, Reserved={reserved:.2f}GB")
-                
-                logger.info("Preparing response...")
-                return {
-                    'output_ids': outputs.numpy().tolist(),
-                    'status': 'success'
-                }
+                # 将输出移到CPU进行后处理
+                outputs = outputs.cpu()
+            
+            # 清理GPU内存
+            torch.cuda.empty_cache()
+            
+            # 记录GPU内存使用情况
+            allocated = torch.cuda.memory_allocated() / 1024**3
+            reserved = torch.cuda.memory_reserved() / 1024**3
+            logger.info(f"GPU Memory: Allocated={allocated:.2f}GB, Reserved={reserved:.2f}GB")
+            
+            logger.info("Preparing response...")
+            return {
+                'output_ids': outputs.numpy().tolist(),
+                'status': 'success'
+            }
         except Exception as e:
             logger.error(f"Generation error: {str(e)}")
             # 清理GPU内存

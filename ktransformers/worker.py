@@ -126,6 +126,39 @@ class ModelWorker:
         
         logger.info("Model components cached successfully")
 
+    def compute_attention(self, q, k, v, attention_mask):
+        """计算注意力"""
+        # 获取关键维度
+        batch_size, seq_len, num_heads, head_dim = q.size()
+        
+        # 重塑 q, k, v 为多头注意力格式
+        q = q.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)  # [batch, heads, seq_len, head_dim]
+        k = k.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
+        v = v.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
+        
+        # 计算注意力分数
+        attention_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(head_dim)
+        
+        # 处理注意力掩码
+        # 确保掩码的形状正确
+        if attention_mask is not None:
+            # 扩展掩码维度以匹配注意力分数
+            attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)  # [batch, 1, 1, seq_len]
+            attention_mask = attention_mask.expand(-1, num_heads, -1, -1)  # [batch, heads, 1, seq_len]
+            attention_scores = attention_scores + attention_mask
+        
+        # 应用 softmax
+        attention_probs = torch.nn.functional.softmax(attention_scores, dim=-1)
+        
+        # 计算输出
+        context = torch.matmul(attention_probs, v)  # [batch, heads, seq_len, head_dim]
+        
+        # 重塑回原始维度
+        context = context.transpose(1, 2).contiguous()  # [batch, seq_len, heads, head_dim]
+        context = context.view(batch_size, seq_len, -1)  # [batch, seq_len, hidden_size]
+        
+        return context
+
     def custom_forward_with_cache(self, input_ids, attention_mask):
         """使用缓存的模型组件进行前向传播"""
         # 使用缓存的嵌入层
@@ -133,6 +166,13 @@ class ModelWorker:
             input_ids.cuda(),
             self.embedding_cache['weight'].cuda()
         )
+        
+        # 获取模型配置
+        config = self.model.config
+        head_dim = config.hidden_size // config.num_attention_heads
+        
+        # 处理注意力掩码
+        attention_mask = (attention_mask < 0).float() * -10000.0
         
         # 逐层处理
         for i in range(len(self.layer_cache)):
@@ -147,6 +187,8 @@ class ModelWorker:
                     proj_cache['weight'].cuda(),
                     proj_cache['bias'].cuda() if proj_cache['bias'] is not None else None
                 )
+                # 重塑为多头格式
+                states = states.view(states.size(0), -1, config.num_attention_heads, head_dim)
                 qkv_states.append(states)
             
             # 计算注意力
@@ -177,14 +219,6 @@ class ModelWorker:
         logits = torch.nn.functional.linear(hidden_states, self.lm_head_cache['weight'].cuda())
         
         return logits
-
-    def compute_attention(self, q, k, v, attention_mask):
-        """计算注意力"""
-        attention_scores = torch.matmul(q, k.transpose(-1, -2))
-        attention_scores = attention_scores / math.sqrt(k.size(-1))
-        attention_scores = attention_scores + attention_mask
-        attention_probs = torch.nn.functional.softmax(attention_scores, dim=-1)
-        return torch.matmul(attention_probs, v)
 
     def compute_mlp(self, hidden_states, mlp_cache):
         """计算MLP层"""

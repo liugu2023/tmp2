@@ -1,13 +1,33 @@
 import torch
 import zmq
+import pickle
 from typing import Dict, Any
 import logging
-from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM, GenerationConfig, TextStreamer
+from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM, GenerationConfig
 import time
-import math
+from transformers import TextStreamer
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+def load_model_and_tokenizer(model_path: str, gguf_path: str):
+    logger.info("Loading tokenizer...")
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    
+    logger.info("Loading model config...")
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    torch.set_default_dtype(config.torch_dtype)
+    
+    logger.info("Loading model...")
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        config=config,
+        trust_remote_code=True,
+        device_map="auto"
+    )
+    model.eval()
+    
+    return model, tokenizer
 
 class ModelWorker:
     def __init__(self, address: str):
@@ -30,14 +50,12 @@ class ModelWorker:
         config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         torch.set_default_dtype(config.torch_dtype)
         
-        logger.info("Loading model on CPU...")
+        logger.info("Loading model...")
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path,
             config=config,
             trust_remote_code=True,
-            device_map='cpu',  # 在CPU上加载
-            torch_dtype=torch.float16,  # 使用半精度
-            low_cpu_mem_usage=True,     # 降低CPU内存使用
+            device_map="auto"
         )
         self.model.eval()
         
@@ -53,7 +71,7 @@ class ModelWorker:
             )
         if self.model.generation_config.pad_token_id is None:
             self.model.generation_config.pad_token_id = self.model.generation_config.eos_token_id
-        
+            
         logger.info("Model loaded successfully")
 
     def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -61,10 +79,10 @@ class ModelWorker:
             logger.info("Received generation request")
             logger.info(f"Input sequence length: {len(input_data['input_ids'])}")
             
-            # 创建输入张量在CPU上（与模型保持一致）
-            logger.info("Creating input tensors...")
-            input_ids = torch.tensor(input_data['input_ids'])
-            attention_mask = torch.tensor(input_data['attention_mask'])
+            # 创建输入张量
+            logger.info("Moving input tensors to GPU...")
+            input_ids = torch.tensor(input_data['input_ids'], device='cuda')
+            attention_mask = torch.tensor(input_data['attention_mask'], device='cuda')
             
             # 生成参数日志
             max_new_tokens = input_data.get('max_new_tokens', 512)
@@ -77,125 +95,117 @@ class ModelWorker:
             # 生成文本
             logger.info("Starting text generation...")
             start_time = time.time()
+            with torch.no_grad(), torch.amp.autocast('cuda'):
+                logger.info("Initializing generation process...")
+                # 添加详细的初始化信息
+                logger.info("- Checking model state...")
+                logger.info(f"- Model device: {self.model.device}")
+                logger.info(f"- Input shape: {input_ids.shape}")
+                logger.info(f"- Current GPU memory allocated: {torch.cuda.memory_allocated()/1024**3:.2f}GB")
+                
+                # KV cache 信息
+                num_layers = len(self.model.model.layers)
+                hidden_size = self.model.config.hidden_size
+                logger.info(f"- Model architecture:")
+                logger.info(f"  - Number of layers: {num_layers}")
+                logger.info(f"  - Hidden size: {hidden_size}")
+                
+                # 估算 KV cache 大小
+                seq_len = input_ids.shape[1] + max_new_tokens
+                kv_cache_size = 2 * num_layers * seq_len * hidden_size * input_ids.shape[0] * 2 / (1024**3)  # in GB
+                logger.info(f"- Estimated KV cache size: {kv_cache_size:.2f}GB")
+                
+                # 检查是否启用了 flash attention
+                if hasattr(self.model.config, '_attn_implementation'):
+                    logger.info(f"- Attention implementation: {self.model.config._attn_implementation}")
+                
+                logger.info("- Starting token generation...")
+                logger.info("  - Preparing generation config:")
+                generation_config = self.model.generation_config
+                logger.info(f"    - Repetition penalty: {generation_config.repetition_penalty}")
+                logger.info(f"    - Length penalty: {generation_config.length_penalty}")
+                logger.info(f"    - Early stopping: {generation_config.early_stopping}")
+                logger.info(f"    - Pad token ID: {generation_config.pad_token_id}")
+                logger.info(f"    - EOS token ID: {generation_config.eos_token_id}")
+                
+                # 记录起始时间戳
+                gen_start_time = time.time()
+                last_log_time = gen_start_time
+                
+                def progress_callback(step: int, token: int):
+                    nonlocal last_log_time
+                    current_time = time.time()
+                    # 每2秒记录一次进度
+                    if current_time - last_log_time >= 2:
+                        tokens_so_far = step - len(input_ids[0])
+                        time_elapsed = current_time - gen_start_time
+                        speed = tokens_so_far / time_elapsed if time_elapsed > 0 else 0
+                        logger.info(f"    - Generated {tokens_so_far} tokens, "
+                                  f"speed: {speed:.2f} tokens/sec, "
+                                  f"time elapsed: {time_elapsed:.2f}s")
+                        last_log_time = current_time
+                
+                # 设置 streamer 的回调函数
+                streamer = TextStreamer(
+                    self.tokenizer, 
+                    skip_prompt=True,
+                    skip_special_tokens=True
+                )
+                streamer.on_finalized_text = lambda x: logger.info(f"    - Generated text: {x}")
+                
+                logger.info("  - Generation started with following settings:")
+                logger.info(f"    - Input context length: {len(input_ids[0])} tokens")
+                logger.info(f"    - Maximum new tokens: {max_new_tokens}")
+                logger.info(f"    - Temperature: {temperature}")
+                logger.info(f"    - Top-p sampling: {top_p}")
+                logger.info(f"    - Do sample: {input_data.get('do_sample', True)}")
+                
+                outputs = self.model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    do_sample=input_data.get('do_sample', True),
+                    streamer=streamer
+                )
+                
+                # 记录生成完成的信息
+                final_time = time.time()
+                total_gen_time = final_time - gen_start_time
+                logger.info("  - Generation completed:")
+                logger.info(f"    - Total generation time: {total_gen_time:.2f} seconds")
+                logger.info(f"    - Final sequence length: {len(outputs[0])} tokens")
+                logger.info(f"    - New tokens generated: {len(outputs[0]) - len(input_ids[0])}")
+                logger.info(f"    - Average speed: {(len(outputs[0]) - len(input_ids[0])) / total_gen_time:.2f} tokens/sec")
             
-            # 使用 CUDA 内存管理
-            with torch.cuda.stream(torch.cuda.Stream()):
-                with torch.no_grad(), torch.amp.autocast('cuda'):
-                    logger.info("Generating text...")
-                    
-                    # 修改模型的前向传播方法
-                    original_forward = self.model.forward
-                    
-                    def gpu_forward(*args, **kwargs):
-                        # 获取输入
-                        hidden_states = args[0]
-                        
-                        # 对每个层进行GPU计算
-                        for layer in self.model.model.layers:
-                            # 自注意力层
-                            qkv_weight = torch.cat([
-                                layer.self_attn.q_proj.weight,
-                                layer.self_attn.k_proj.weight,
-                                layer.self_attn.v_proj.weight
-                            ]).cuda()
-                            
-                            # 计算 Q, K, V
-                            hidden_gpu = hidden_states.cuda()
-                            qkv = torch.nn.functional.linear(hidden_gpu, qkv_weight)
-                            q, k, v = qkv.chunk(3, dim=-1)
-                            
-                            # 计算注意力
-                            attn_weights = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(q.size(-1))
-                            attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
-                            attn_output = torch.matmul(attn_weights, v)
-                            
-                            # 输出投影
-                            attn_output = torch.nn.functional.linear(
-                                attn_output,
-                                layer.self_attn.o_proj.weight.cuda(),
-                                layer.self_attn.o_proj.bias.cuda() if layer.self_attn.o_proj.bias is not None else None
-                            )
-                            
-                            # 第一个残差连接
-                            hidden_states = (hidden_gpu + attn_output).cpu()
-                            
-                            # 第一个层标准化
-                            hidden_gpu = hidden_states.cuda()
-                            hidden_states = torch.nn.functional.layer_norm(
-                                hidden_gpu,
-                                layer.input_layernorm.normalized_shape,
-                                layer.input_layernorm.weight.cuda(),
-                                layer.input_layernorm.bias.cuda() if layer.input_layernorm.bias is not None else None
-                            ).cpu()
-                            
-                            # MLP
-                            hidden_gpu = hidden_states.cuda()
-                            mlp_output = torch.nn.functional.linear(hidden_gpu, layer.mlp.gate_proj.weight.cuda())
-                            mlp_output = torch.nn.functional.silu(mlp_output)
-                            mlp_output = torch.nn.functional.linear(mlp_output, layer.mlp.down_proj.weight.cuda())
-                            
-                            # 第二个残差连接
-                            hidden_states = (hidden_gpu + mlp_output).cpu()
-                            
-                            # 第二个层标准化
-                            hidden_gpu = hidden_states.cuda()
-                            hidden_states = torch.nn.functional.layer_norm(
-                                hidden_gpu,
-                                layer.post_attention_layernorm.normalized_shape,
-                                layer.post_attention_layernorm.weight.cuda(),
-                                layer.post_attention_layernorm.bias.cuda() if layer.post_attention_layernorm.bias is not None else None
-                            ).cpu()
-                        
-                        # 最终的层标准化
-                        hidden_gpu = hidden_states.cuda()
-                        hidden_states = torch.nn.functional.layer_norm(
-                            hidden_gpu,
-                            self.model.model.norm.normalized_shape,
-                            self.model.model.norm.weight.cuda(),
-                            self.model.model.norm.bias.cuda() if self.model.model.norm.bias is not None else None
-                        ).cpu()
-                        
-                        # 语言模型头
-                        hidden_gpu = hidden_states.cuda()
-                        logits = torch.nn.functional.linear(hidden_gpu, self.model.lm_head.weight.cuda())
-                        
-                        return logits.cpu()
-                    
-                    # 替换模型的前向传播方法
-                    self.model.forward = gpu_forward
-                    
-                    try:
-                        # 生成文本
-                        outputs = self.model.generate(
-                            input_ids=input_ids,
-                            attention_mask=attention_mask,
-                            max_new_tokens=max_new_tokens,
-                            temperature=temperature,
-                            top_p=top_p,
-                            do_sample=input_data.get('do_sample', True),
-                            streamer=TextStreamer(self.tokenizer, skip_prompt=True)
-                        )
-                    finally:
-                        # 恢复原始的前向传播方法
-                        self.model.forward = original_forward
-                
-                # 清理GPU内存
-                torch.cuda.empty_cache()
-                
-                # 记录GPU内存使用情况
-                allocated = torch.cuda.memory_allocated() / 1024**3
-                reserved = torch.cuda.memory_reserved() / 1024**3
-                logger.info(f"GPU Memory: Allocated={allocated:.2f}GB, Reserved={reserved:.2f}GB")
-                
-                logger.info("Preparing response...")
-                return {
-                    'output_ids': outputs.numpy().tolist(),
-                    'status': 'success'
-                }
+            end_time = time.time()
+            generation_time = end_time - start_time
+            tokens_generated = len(outputs[0]) - len(input_ids[0])
+            tokens_per_second = tokens_generated / generation_time
+            
+            logger.info(f"Generation completed in {generation_time:.2f} seconds")
+            logger.info(f"Tokens generated: {tokens_generated}")
+            logger.info(f"Generation speed: {tokens_per_second:.2f} tokens/second")
+            logger.info(f"Final sequence length: {len(outputs[0])}")
+            
+            # 移动到CPU
+            logger.info("Moving outputs to CPU...")
+            outputs_cpu = outputs.to('cpu', non_blocking=True)
+            torch.cuda.synchronize()
+            
+            # 记录GPU内存使用情况
+            allocated = torch.cuda.memory_allocated() / 1024**3
+            reserved = torch.cuda.memory_reserved() / 1024**3
+            logger.info(f"GPU Memory: Allocated={allocated:.2f}GB, Reserved={reserved:.2f}GB")
+            
+            logger.info("Preparing response...")
+            return {
+                'output_ids': outputs_cpu.numpy().tolist(),
+                'status': 'success'
+            }
         except Exception as e:
             logger.error(f"Generation error: {str(e)}")
-            # 清理GPU内存
-            torch.cuda.empty_cache()
             return {
                 'status': 'error',
                 'error': str(e)

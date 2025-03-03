@@ -171,19 +171,30 @@ class ModelWorker:
             logger.info(f"Generation speed: {tokens_per_second:.2f} tokens/second")
             logger.info(f"Final sequence length: {len(outputs[0])}")
             
-            # 移动到CPU
-            logger.info("Moving outputs to CPU...")
-            outputs_cpu = outputs.to('cpu', non_blocking=True)
-            torch.cuda.synchronize()
+            # 移动到CPU并转换格式
+            logger.info("Moving outputs to CPU and preparing response...")
+            start_transfer = time.time()
             
-            # 记录GPU内存使用情况
+            # 使用异步传输
+            outputs_cpu = outputs.to('cpu', non_blocking=True)
+            
+            # 在等待GPU->CPU传输的同时，记录GPU内存使用情况
             allocated = torch.cuda.memory_allocated() / 1024**3
             reserved = torch.cuda.memory_reserved() / 1024**3
             logger.info(f"GPU Memory: Allocated={allocated:.2f}GB, Reserved={reserved:.2f}GB")
             
-            logger.info("Preparing response...")
+            # 确保传输完成
+            torch.cuda.synchronize()
+            
+            # 使用 numpy() 的异步版本
+            with torch.no_grad():
+                output_ids = outputs_cpu.numpy(force=True)  # force=True 可能会更快
+            
+            transfer_time = time.time() - start_transfer
+            logger.info(f"Data transfer and conversion completed in {transfer_time:.2f} seconds")
+            
             return {
-                'output_ids': outputs_cpu.numpy().tolist(),
+                'output_ids': output_ids.tolist(),
                 'status': 'success'
             }
         except Exception as e:

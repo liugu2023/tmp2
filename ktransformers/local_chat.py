@@ -14,6 +14,7 @@ import logging
 import locale
 import torch
 from transformers import AutoTokenizer
+import time
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -56,24 +57,35 @@ class DistributedModel:
     def generate(self, input_ids, attention_mask, **kwargs):
         try:
             logger.info("Preparing generation request...")
+            # 预先分配好 numpy 数组
+            input_ids_np = input_ids.cpu().numpy()
+            attention_mask_np = attention_mask.cpu().numpy()
+            
             message = {
                 'command': 'generate',
                 'data': {
-                    'input_ids': input_ids.cpu().numpy().tolist(),
-                    'attention_mask': attention_mask.cpu().numpy().tolist(),
+                    'input_ids': input_ids_np.tolist(),
+                    'attention_mask': attention_mask_np.tolist(),
                     **kwargs
                 }
             }
             
             logger.info("Sending request to worker...")
+            send_start = time.time()
             self.socket.send_pyobj(message)
             
             logger.info("Waiting for response...")
             response = self.socket.recv_pyobj()
+            recv_time = time.time() - send_start
+            logger.info(f"Network round trip took {recv_time:.2f} seconds")
             
             if response['status'] == 'success':
-                logger.info("Response received successfully")
-                return torch.tensor(response['output_ids'])
+                logger.info("Converting response to tensor...")
+                conv_start = time.time()
+                output_tensor = torch.tensor(response['output_ids'])
+                conv_time = time.time() - conv_start
+                logger.info(f"Tensor conversion took {conv_time:.2f} seconds")
+                return output_tensor
             else:
                 logger.error(f"Generation failed: {response.get('error')}")
                 raise Exception(f"Generation failed: {response.get('error')}")

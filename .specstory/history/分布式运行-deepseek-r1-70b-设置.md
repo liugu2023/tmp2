@@ -2287,7 +2287,138 @@ def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
         
         # 生成参数日志
         max_new_tokens = input_data.get('max_new_tokens', 512)
-        temperature = input_data
+        temperature = input_data.get('temperature', 0.6)
+        top_p = input_data.get('top_p', 0.9)
+        logger.info(f"Generation parameters: max_new_tokens={max_new_tokens}, "
+                   f"temperature={temperature}, "
+                   f"top_p={top_p}")
+        
+        # 生成文本
+        logger.info("Starting text generation...")
+        start_time = time.time()
+        with torch.no_grad(), torch.amp.autocast('cuda'):
+            logger.info("Initializing generation process...")
+            # ... 其他初始化代码保持不变 ...
+            
+            logger.info("- Starting token generation...")
+            logger.info("  - Generation started with following settings:")
+            logger.info(f"    - Input context length: {len(input_ids[0])} tokens")
+            logger.info(f"    - Maximum new tokens: {max_new_tokens}")
+            logger.info(f"    - Temperature: {temperature}")
+            logger.info(f"    - Top-p sampling: {top_p}")
+            logger.info(f"    - Do sample: {input_data.get('do_sample', True)}")
+            
+            # 修改 streamer 配置
+            class CustomStreamer(TextStreamer):
+                def on_finalized_text(self, text: str, stream_end: bool = False):
+                    logger.info(f"    - Generated text: {text}")
+            
+            streamer = CustomStreamer(
+                self.tokenizer, 
+                skip_prompt=True,
+                skip_special_tokens=True
+            )
+            
+            outputs = self.model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                do_sample=input_data.get('do_sample', True),
+                streamer=streamer
+            )
+            
+            # ... 其他代码保持不变 ...
+```
+
+
+主要改动：
+1. 创建了一个 CustomStreamer 类来正确处理回调参数
+2. 移除了之前的 lambda 函数设置
+
+运行命令保持不变：
+
+1. GPU 机器 (10.21.22.206):
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0 python -m ktransformers.worker --worker_address "10.21.22.206:29500"
+```
+
+
+2. CPU 机器 (10.21.22.100):
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.local_chat \
+    --model_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/ \
+    --gguf_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/ \
+    --worker_address "10.21.22.206:29500" \
+    --max_new_tokens 50
+```
+
+
+这样应该能解决 stream_end 参数的错误。如果还有其他问题，请告诉我。
+
+---
+
+_**User**_
+
+Preparing response...这步在干什么
+
+---
+
+_**Assistant**_
+
+
+
+"Preparing response..." 这一步是在准备要发送回客户端的响应数据。让我详细解释这个过程：
+
+```python
+# 在 worker.py 中的 generate 方法最后
+logger.info("Preparing response...")
+return {
+    'output_ids': outputs_cpu.numpy().tolist(),  # 将模型输出的 token IDs 转换为 Python 列表
+    'status': 'success'  # 表示生成成功的状态标志
+}
+```
+
+这个步骤包含以下操作：
+1. 将 PyTorch tensor (outputs_cpu) 转换为 NumPy 数组 (.numpy())
+2. 将 NumPy 数组转换为 Python 列表 (.tolist())
+3. 打包成一个字典，包含：
+   - output_ids: 生成的文本的 token IDs
+   - status: 生成状态
+
+这个响应会通过 ZMQ 发送回客户端（CPU 机器），然后客户端会：
+1. 接收这个响应
+2. 检查状态
+3. 将 token IDs 转回 PyTorch tensor
+4. 使用 tokenizer 解码成最终的文本
+
+我们可以添加更多日志来显示这个过程：
+
+```python:ktransformers/worker.py
+logger.info("Preparing response...")
+output_ids = outputs_cpu.numpy().tolist()
+logger.info(f"- Response size: {len(output_ids[0])} tokens")
+logger.info(f"- First few tokens: {output_ids[0][:10]}...")
+return {
+    'output_ids': output_ids,
+    'status': 'success'
+}
+```
+
+这样您就能看到响应数据的具体内容了。需要我修改代码吗？
+
+---
+
+_**User**_
+
+这步耗时好长啊
+
+---
+
+_**Assistant**_
+
+
 
 ---
 

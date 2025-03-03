@@ -77,25 +77,43 @@ class DistributedModel:
                 }
             }
             
-            logger.info("Sending request to worker...")
+            # 并行发送请求到所有 worker
+            logger.info("Sending requests to all workers...")
             send_start = time.time()
-            self.socket.send_pyobj(message)
             
-            logger.info("Waiting for response...")
-            response = self.socket.recv_pyobj()
+            # 发送请求
+            for worker in self.workers:
+                logger.info(f"Sending to worker at {worker['address']}...")
+                worker['socket'].send_pyobj(message)
+            
+            # 接收响应
+            responses = []
+            for worker in self.workers:
+                logger.info(f"Waiting for response from {worker['address']}...")
+                response = worker['socket'].recv_pyobj()
+                if response['status'] == 'success':
+                    responses.append(response)
+                else:
+                    logger.error(f"Generation failed on {worker['address']}: {response.get('error')}")
+            
             recv_time = time.time() - send_start
             logger.info(f"Network round trip took {recv_time:.2f} seconds")
             
-            if response['status'] == 'success':
-                logger.info("Converting response to tensor...")
+            if responses:
+                # 合并所有 worker 的输出
+                logger.info("Combining responses from all workers...")
                 conv_start = time.time()
-                output_tensor = torch.tensor(response['output_ids'])
+                
+                # 这里需要根据实际情况选择合适的合并策略
+                # 目前简单使用第一个响应
+                output_tensor = torch.tensor(responses[0]['output_ids'])
+                
                 conv_time = time.time() - conv_start
-                logger.info(f"Tensor conversion took {conv_time:.2f} seconds")
+                logger.info(f"Response combination took {conv_time:.2f} seconds")
                 return output_tensor
             else:
-                logger.error(f"Generation failed: {response.get('error')}")
-                raise Exception(f"Generation failed: {response.get('error')}")
+                raise Exception("No successful responses from any worker")
+            
         except Exception as e:
             logger.error(f"Error in generate: {str(e)}")
             raise

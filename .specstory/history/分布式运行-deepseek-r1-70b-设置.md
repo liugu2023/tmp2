@@ -3149,6 +3149,120 @@ _**Assistant**_
 
 
 
+
+
+
+
+我们需要在 worker.py 中导入配置，并修改 local_chat.py 以支持多个 worker。让我们修改这些文件：
+
+1. 在 worker.py 中添加配置导入：
+
+```python:ktransformers/worker.py
+import torch
+import zmq
+import pickle
+from typing import Dict, Any
+import logging
+from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM, GenerationConfig
+import time
+from transformers import TextStreamer
+import os
+from ktransformers.distributed_config import WORKER_CONFIGS, MODEL_SHARD_STRATEGY, COMMUNICATION_CONFIG
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+```
+
+
+2. 修改 local_chat.py 以支持多个 worker：
+
+```python:ktransformers/local_chat.py
+class DistributedModel:
+    def __init__(self, worker_addresses: str):
+        self.workers = []
+        for address in worker_addresses.split(','):
+            context = zmq.Context()
+            socket = context.socket(zmq.REQ)
+            socket.connect(f"tcp://{address}")
+            self.workers.append({
+                'address': address,
+                'socket': socket
+            })
+        logger.info(f"Connected to workers at {worker_addresses}")
+    
+    def load_model(self, model_path: str, gguf_path: str):
+        for worker in self.workers:
+            message = {
+                'command': 'load_model',
+                'model_path': model_path,
+                'gguf_path': gguf_path
+            }
+            logger.info(f"Requesting model load from worker at {worker['address']}...")
+            worker['socket'].send_pyobj(message)
+            response = worker['socket'].recv_pyobj()
+            if response['status'] != 'success':
+                raise Exception(f"Failed to load model on {worker['address']}: {response.get('error')}")
+        logger.info("Model loaded successfully on all workers")
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--model_path', type=str, required=True)
+    parser.add_argument('--gguf_path', type=str, required=True)
+    parser.add_argument('--worker_addresses', type=str, required=True,
+                      help='Comma-separated list of worker addresses (e.g., "10.21.22.206:29500,10.21.22.207:29500")')
+    parser.add_argument('--max_new_tokens', type=int, default=300)
+    args = parser.parse_args()
+    
+    # 分布式模式
+    logger.info("Running in distributed mode")
+    model = DistributedModel(args.worker_addresses)
+    model.load_model(args.model_path, args.gguf_path)
+    # ... 其余代码保持不变 ...
+```
+
+
+现在运行命令应该是：
+
+1. 在 206 机器上：
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.worker \
+    --worker_address "10.21.22.206:29500" \
+    --worker_id "worker1"
+```
+
+
+2. 在 207 机器上：
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.worker \
+    --worker_address "10.21.22.207:29500" \
+    --worker_id "worker2"
+```
+
+
+3. 在客户端机器上：
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.local_chat \
+    --model_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/ \
+    --gguf_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/ \
+    --worker_addresses "10.21.22.206:29500,10.21.22.207:29500" \
+    --max_new_tokens 50
+```
+
+
+这样应该能正确启动分布式系统了。需要我继续完善其他部分吗？
+
+---
+
+_**User**_
+
+207上的机器为什么不干活，换句话说，为什么客户端机器上为什么先从206上启动模型加载
+
+---
+
+_**Assistant**_
+
+
+
 ---
 
 

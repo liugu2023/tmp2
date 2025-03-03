@@ -35,31 +35,26 @@ def import_local_modules():
             prefill_and_generate, get_compute_capability, Config, flashinfer_enabled)
 
 class DistributedModel:
-    def __init__(self, worker_addresses: str):
-        self.workers = []
-        for address in worker_addresses.split(','):
-            context = zmq.Context()
-            socket = context.socket(zmq.REQ)
-            socket.connect(f"tcp://{address}")
-            self.workers.append({
-                'address': address,
-                'socket': socket
-            })
-        logger.info(f"Connected to workers at {worker_addresses}")
+    def __init__(self, worker_address: str):
+        self.worker_address = worker_address
+        context = zmq.Context()
+        socket = context.socket(zmq.REQ)
+        socket.connect(f"tcp://{worker_address}")
+        self.socket = socket
+        logger.info(f"Connected to worker at {worker_address}")
     
     def load_model(self, model_path: str, gguf_path: str):
-        for worker in self.workers:
-            message = {
-                'command': 'load_model',
-                'model_path': model_path,
-                'gguf_path': gguf_path
-            }
-            logger.info(f"Requesting model load from worker at {worker['address']}...")
-            worker['socket'].send_pyobj(message)
-            response = worker['socket'].recv_pyobj()
-            if response['status'] != 'success':
-                raise Exception(f"Failed to load model on {worker['address']}: {response.get('error')}")
-        logger.info("Model loaded successfully on all workers")
+        message = {
+            'command': 'load_model',
+            'model_path': model_path,
+            'gguf_path': gguf_path
+        }
+        logger.info(f"Requesting model load from worker at {self.worker_address}...")
+        self.socket.send_pyobj(message)
+        response = self.socket.recv_pyobj()
+        if response['status'] != 'success':
+            raise Exception(f"Failed to load model on {self.worker_address}: {response.get('error')}")
+        logger.info("Model loaded successfully on worker")
 
     def generate(self, input_ids, attention_mask, **kwargs):
         try:
@@ -77,42 +72,30 @@ class DistributedModel:
                 }
             }
             
-            # 并行发送请求到所有 worker
-            logger.info("Sending requests to all workers...")
-            send_start = time.time()
-            
             # 发送请求
-            for worker in self.workers:
-                logger.info(f"Sending to worker at {worker['address']}...")
-                worker['socket'].send_pyobj(message)
+            logger.info("Sending request to worker...")
+            send_start = time.time()
+            self.socket.send_pyobj(message)
             
             # 接收响应
-            responses = []
-            for worker in self.workers:
-                logger.info(f"Waiting for response from {worker['address']}...")
-                response = worker['socket'].recv_pyobj()
-                if response['status'] == 'success':
-                    responses.append(response)
-                else:
-                    logger.error(f"Generation failed on {worker['address']}: {response.get('error')}")
+            logger.info("Waiting for response from worker...")
+            response = self.socket.recv_pyobj()
             
             recv_time = time.time() - send_start
             logger.info(f"Network round trip took {recv_time:.2f} seconds")
             
-            if responses:
+            if response['status'] == 'success':
                 # 合并所有 worker 的输出
-                logger.info("Combining responses from all workers...")
+                logger.info("Combining response from worker...")
                 conv_start = time.time()
                 
-                # 这里需要根据实际情况选择合适的合并策略
-                # 目前简单使用第一个响应
-                output_tensor = torch.tensor(responses[0]['output_ids'])
+                output_tensor = torch.tensor(response['output_ids'])
                 
                 conv_time = time.time() - conv_start
                 logger.info(f"Response combination took {conv_time:.2f} seconds")
                 return output_tensor
             else:
-                raise Exception("No successful responses from any worker")
+                raise Exception(f"Generation failed on {self.worker_address}: {response.get('error')}")
             
         except Exception as e:
             logger.error(f"Error in generate: {str(e)}")
@@ -131,14 +114,14 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_path', type=str, required=True)
     parser.add_argument('--gguf_path', type=str, required=True)
-    parser.add_argument('--worker_addresses', type=str, required=True,
-                      help='Comma-separated list of worker addresses (e.g., "10.21.22.206:29500,10.21.22.207:29500")')
+    parser.add_argument('--worker_address', type=str, required=True,
+                      help='Worker address (e.g., "10.21.22.206:29500")')
     parser.add_argument('--max_new_tokens', type=int, default=300)
     args = parser.parse_args()
 
     # 分布式模式
     logger.info("Running in distributed mode")
-    model = DistributedModel(args.worker_addresses)
+    model = DistributedModel(args.worker_address)
     model.load_model(args.model_path, args.gguf_path)
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
     

@@ -3549,6 +3549,105 @@ _**Assistant**_
 
 
 
+
+
+
+
+啊，我们忘记在 ModelWorker 类中添加 worker_id 属性。让我们修改 worker.py：
+
+```python:ktransformers/worker.py
+class ModelWorker:
+    def __init__(self, address: str, worker_id: str):  # 添加 worker_id 参数
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.REP)
+        host, port = address.split(':')
+        self.socket.bind(f"tcp://0.0.0.0:{port}")
+        self.socket.setsockopt(zmq.RCVHWM, 0)
+        self.socket.setsockopt(zmq.SNDHWM, 0)
+        
+        # 设置 CPU 核心数
+        torch.set_num_threads(10)
+        logger.info(f"Set PyTorch CPU threads to 10")
+        
+        # 保存 worker_id
+        self.worker_id = worker_id
+        logger.info(f"Worker {worker_id} started at {address}")
+        
+        self.model = None
+        self.tokenizer = None
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--worker_address', type=str, required=True)
+    parser.add_argument('--worker_id', type=str, required=True,
+                      help='Worker ID (e.g., "worker1" or "worker2")')
+    args = parser.parse_args()
+    
+    # 加载配置
+    worker_config = WORKER_CONFIGS[args.worker_id]
+    shard_strategy = MODEL_SHARD_STRATEGY[args.worker_id]
+    
+    # 设置可见GPU
+    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(
+        [gpu.split(":")[-1] for gpu in worker_config["gpus"]]
+    )
+    
+    # 设置CPU线程
+    torch.set_num_threads(worker_config["cpu_threads"])
+    
+    # 创建 worker 实例时传入 worker_id
+    worker = ModelWorker(worker_config["address"], args.worker_id)
+    worker.run()
+```
+
+
+
+现在重新运行命令：
+
+1. 206 机器:
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.worker \
+    --worker_address "10.21.22.206:29500" \
+    --worker_id "worker1"
+```
+
+
+
+2. 207 机器:
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.worker \
+    --worker_address "10.21.22.207:29500" \
+    --worker_id "worker2"
+```
+
+
+
+3. 客户端:
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.local_chat \
+    --model_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/ \
+    --gguf_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/ \
+    --worker_addresses "10.21.22.206:29500,10.21.22.207:29500" \
+    --max_new_tokens 50
+```
+
+
+
+这样应该能正确加载模型了。每个 worker 都会知道自己的 ID，并根据分片策略加载相应的模型层。
+
+---
+
+_**User**_
+
+先把207放放，先把206上的东西搞明白，改代码
+
+---
+
+_**Assistant**_
+
+
+
 ---
 
 

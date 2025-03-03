@@ -4,6 +4,7 @@ from typing import Dict, Any
 import logging
 from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM, GenerationConfig, TextStreamer
 import time
+import math
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -60,10 +61,10 @@ class ModelWorker:
             logger.info("Received generation request")
             logger.info(f"Input sequence length: {len(input_data['input_ids'])}")
             
-            # 创建输入张量在GPU上
-            logger.info("Creating input tensors on GPU...")
-            input_ids = torch.tensor(input_data['input_ids'], device='cuda')
-            attention_mask = torch.tensor(input_data['attention_mask'], device='cuda')
+            # 创建输入张量在CPU上（与模型保持一致）
+            logger.info("Creating input tensors...")
+            input_ids = torch.tensor(input_data['input_ids'])
+            attention_mask = torch.tensor(input_data['attention_mask'])
             
             # 生成参数日志
             max_new_tokens = input_data.get('max_new_tokens', 512)
@@ -86,28 +87,79 @@ class ModelWorker:
                     original_forward = self.model.forward
                     
                     def gpu_forward(*args, **kwargs):
-                        # 输入已经在GPU上，不需要移动
-                        gpu_args = args
-                        gpu_kwargs = kwargs
+                        # 获取输入
+                        hidden_states = args[0]
                         
-                        # 对每个模块的权重进行GPU计算
-                        for name, module in self.model.named_modules():
-                            if hasattr(module, 'weight') and module.weight is not None:
-                                # 临时将权重移到GPU
-                                with torch.cuda.device('cuda'):
-                                    weight = module.weight.cuda()
-                                    if hasattr(module, 'bias') and module.bias is not None:
-                                        bias = module.bias.cuda()
-                                    # 执行计算
-                                    if isinstance(module, torch.nn.Linear):
-                                        output = torch.nn.functional.linear(gpu_args[0], weight, bias if module.bias is not None else None)
-                                    elif isinstance(module, torch.nn.LayerNorm):
-                                        output = torch.nn.functional.layer_norm(gpu_args[0], module.normalized_shape, weight, bias if module.bias is not None else None)
-                                    # 结果已经在GPU上
-                                    gpu_args = (output,) + gpu_args[1:]
+                        # 对每个层进行GPU计算
+                        for layer in self.model.model.layers:
+                            # 自注意力层
+                            qkv_weight = torch.cat([
+                                layer.self_attn.q_proj.weight,
+                                layer.self_attn.k_proj.weight,
+                                layer.self_attn.v_proj.weight
+                            ]).cuda()
+                            
+                            # 计算 Q, K, V
+                            hidden_gpu = hidden_states.cuda()
+                            qkv = torch.nn.functional.linear(hidden_gpu, qkv_weight)
+                            q, k, v = qkv.chunk(3, dim=-1)
+                            
+                            # 计算注意力
+                            attn_weights = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(q.size(-1))
+                            attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
+                            attn_output = torch.matmul(attn_weights, v)
+                            
+                            # 输出投影
+                            attn_output = torch.nn.functional.linear(
+                                attn_output,
+                                layer.self_attn.o_proj.weight.cuda(),
+                                layer.self_attn.o_proj.bias.cuda() if layer.self_attn.o_proj.bias is not None else None
+                            )
+                            
+                            # 第一个残差连接
+                            hidden_states = (hidden_gpu + attn_output).cpu()
+                            
+                            # 第一个层标准化
+                            hidden_gpu = hidden_states.cuda()
+                            hidden_states = torch.nn.functional.layer_norm(
+                                hidden_gpu,
+                                layer.input_layernorm.normalized_shape,
+                                layer.input_layernorm.weight.cuda(),
+                                layer.input_layernorm.bias.cuda() if layer.input_layernorm.bias is not None else None
+                            ).cpu()
+                            
+                            # MLP
+                            hidden_gpu = hidden_states.cuda()
+                            mlp_output = torch.nn.functional.linear(hidden_gpu, layer.mlp.gate_proj.weight.cuda())
+                            mlp_output = torch.nn.functional.silu(mlp_output)
+                            mlp_output = torch.nn.functional.linear(mlp_output, layer.mlp.down_proj.weight.cuda())
+                            
+                            # 第二个残差连接
+                            hidden_states = (hidden_gpu + mlp_output).cpu()
+                            
+                            # 第二个层标准化
+                            hidden_gpu = hidden_states.cuda()
+                            hidden_states = torch.nn.functional.layer_norm(
+                                hidden_gpu,
+                                layer.post_attention_layernorm.normalized_shape,
+                                layer.post_attention_layernorm.weight.cuda(),
+                                layer.post_attention_layernorm.bias.cuda() if layer.post_attention_layernorm.bias is not None else None
+                            ).cpu()
                         
-                        # 返回最终结果（在GPU上）
-                        return gpu_args[0]
+                        # 最终的层标准化
+                        hidden_gpu = hidden_states.cuda()
+                        hidden_states = torch.nn.functional.layer_norm(
+                            hidden_gpu,
+                            self.model.model.norm.normalized_shape,
+                            self.model.model.norm.weight.cuda(),
+                            self.model.model.norm.bias.cuda() if self.model.model.norm.bias is not None else None
+                        ).cpu()
+                        
+                        # 语言模型头
+                        hidden_gpu = hidden_states.cuda()
+                        logits = torch.nn.functional.linear(hidden_gpu, self.model.lm_head.weight.cuda())
+                        
+                        return logits.cpu()
                     
                     # 替换模型的前向传播方法
                     self.model.forward = gpu_forward
@@ -115,8 +167,8 @@ class ModelWorker:
                     try:
                         # 生成文本
                         outputs = self.model.generate(
-                            input_ids=input_ids,  # 已经在GPU上
-                            attention_mask=attention_mask,  # 已经在GPU上
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
                             max_new_tokens=max_new_tokens,
                             temperature=temperature,
                             top_p=top_p,
@@ -127,22 +179,19 @@ class ModelWorker:
                         # 恢复原始的前向传播方法
                         self.model.forward = original_forward
                 
-                # 将输出移到CPU进行后处理
-                outputs = outputs.cpu()
-            
-            # 清理GPU内存
-            torch.cuda.empty_cache()
-            
-            # 记录GPU内存使用情况
-            allocated = torch.cuda.memory_allocated() / 1024**3
-            reserved = torch.cuda.memory_reserved() / 1024**3
-            logger.info(f"GPU Memory: Allocated={allocated:.2f}GB, Reserved={reserved:.2f}GB")
-            
-            logger.info("Preparing response...")
-            return {
-                'output_ids': outputs.numpy().tolist(),
-                'status': 'success'
-            }
+                # 清理GPU内存
+                torch.cuda.empty_cache()
+                
+                # 记录GPU内存使用情况
+                allocated = torch.cuda.memory_allocated() / 1024**3
+                reserved = torch.cuda.memory_reserved() / 1024**3
+                logger.info(f"GPU Memory: Allocated={allocated:.2f}GB, Reserved={reserved:.2f}GB")
+                
+                logger.info("Preparing response...")
+                return {
+                    'output_ids': outputs.numpy().tolist(),
+                    'status': 'success'
+                }
         except Exception as e:
             logger.error(f"Generation error: {str(e)}")
             # 清理GPU内存

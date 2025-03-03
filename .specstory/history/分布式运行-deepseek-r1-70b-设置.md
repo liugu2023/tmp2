@@ -3820,6 +3820,68 @@ PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.local_chat \
 
 ---
 
+_**User**_
+
+/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/generation/utils.py:1850: UserWarning: You are calling .generate() with the `input_ids` being on a device type different than your model's device. `input_ids` is on cuda, whereas the model is on cpu. You may experience unexpected behaviors or slower generation. Please make sure that you have put `input_ids` to the correct device by calling for example input_ids = input_ids.to('cpu') before running `.generate()`.
+  warnings.warn(
+ERROR:__main__:Generation error: cannot access local variable 'output' where it is not associated with a value
+
+---
+
+_**Assistant**_
+
+
+
+
+
+
+
+
+
+看来我们需要修改前向传播的实现方式。让我们更新 worker.py：
+
+```python:ktransformers/worker.py
+def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        logger.info("Received generation request")
+        logger.info(f"Input sequence length: {len(input_data['input_ids'])}")
+        
+        # 创建输入张量在CPU上（与模型保持一致）
+        logger.info("Creating input tensors...")
+        input_ids = torch.tensor(input_data['input_ids'])
+        attention_mask = torch.tensor(input_data['attention_mask'])
+        
+        # 生成参数日志
+        max_new_tokens = input_data.get('max_new_tokens', 512)
+        temperature = input_data.get('temperature', 0.6)
+        top_p = input_data.get('top_p', 0.9)
+        logger.info(f"Generation parameters: max_new_tokens={max_new_tokens}, "
+                   f"temperature={temperature}, "
+                   f"top_p={top_p}")
+        
+        # 生成文本
+        logger.info("Starting text generation...")
+        start_time = time.time()
+        
+        # 使用 CUDA 内存管理
+        with torch.cuda.stream(torch.cuda.Stream()):
+            with torch.no_grad(), torch.amp.autocast('cuda'):
+                logger.info("Generating text...")
+                
+                # 修改模型的前向传播方法
+                original_forward = self.model.forward
+                
+                def gpu_forward(*args, **kwargs):
+                    # 获取输入
+                    hidden_states = args[0]
+                    
+                    # 对每个层进行GPU计算
+                    for layer in self.model.model.layers:
+                        # 自注意力层
+                        qkv_weight = torch.cat
+
+---
+
 
 
 ---

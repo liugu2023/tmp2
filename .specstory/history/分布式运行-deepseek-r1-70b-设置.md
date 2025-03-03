@@ -3263,6 +3263,157 @@ _**Assistant**_
 
 
 
+
+
+
+
+问题出在 DistributedModel 的 generate 方法中，它只使用了第一个 worker。让我们修改 generate 方法来使用所有 worker：
+
+```python:ktransformers/local_chat.py
+def generate(self, input_ids, attention_mask, **kwargs):
+    try:
+        logger.info("Preparing generation request...")
+        # 预先分配好 numpy 数组
+        input_ids_np = input_ids.cpu().numpy()
+        attention_mask_np = attention_mask.cpu().numpy()
+        
+        message = {
+            'command': 'generate',
+            'data': {
+                'input_ids': input_ids_np.tolist(),
+                'attention_mask': attention_mask_np.tolist(),
+                **kwargs
+            }
+        }
+        
+        # 并行发送请求到所有 worker
+        logger.info("Sending requests to all workers...")
+        send_start = time.time()
+        
+        # 发送请求
+        for worker in self.workers:
+            logger.info(f"Sending to worker at {worker['address']}...")
+            worker['socket'].send_pyobj(message)
+        
+        # 接收响应
+        responses = []
+        for worker in self.workers:
+            logger.info(f"Waiting for response from {worker['address']}...")
+            response = worker['socket'].recv_pyobj()
+            if response['status'] == 'success':
+                responses.append(response)
+            else:
+                logger.error(f"Generation failed on {worker['address']}: {response.get('error')}")
+        
+        recv_time = time.time() - send_start
+        logger.info(f"Network round trip took {recv_time:.2f} seconds")
+        
+        if responses:
+            # 合并所有 worker 的输出
+            logger.info("Combining responses from all workers...")
+            conv_start = time.time()
+            
+            # 这里需要根据实际情况选择合适的合并策略
+            # 目前简单使用第一个响应
+            output_tensor = torch.tensor(responses[0]['output_ids'])
+            
+            conv_time = time.time() - conv_start
+            logger.info(f"Response combination took {conv_time:.2f} seconds")
+            return output_tensor
+        else:
+            raise Exception("No successful responses from any worker")
+            
+    except Exception as e:
+        logger.error(f"Error in generate: {str(e)}")
+        raise
+```
+
+
+
+这样修改后：
+1. 请求会同时发送到所有 worker
+2. 每个 worker 都会处理请求
+3. 我们可以看到所有 worker 的工作状态
+
+运行命令保持不变：
+
+1. 206 机器:
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.worker \
+    --worker_address "10.21.22.206:29500" \
+    --worker_id "worker1"
+```
+
+
+
+2. 207 机器:
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.worker \
+    --worker_address "10.21.22.207:29500" \
+    --worker_id "worker2"
+```
+
+
+
+3. 客户端:
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.local_chat \
+    --model_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/ \
+    --gguf_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/ \
+    --worker_addresses "10.21.22.206:29500,10.21.22.207:29500" \
+    --max_new_tokens 50
+```
+
+
+
+这样两台机器都会参与工作。后续我们可以添加：
+1. 更复杂的输出合并策略
+2. 负载均衡
+3. 失败重试机制
+
+需要我继续优化吗？
+
+---
+
+_**User**_
+
+一共17个数据组需要加载，手动对半砍，前9个分给206，后8个分给207
+
+---
+
+_**Assistant**_
+
+
+
+
+
+
+
+
+
+好的，让我们修改分片策略来手动分配模型层。修改 distributed_config.py：
+
+```python:ktransformers/distributed_config.py
+WORKER_CONFIGS = {
+    # 第一台机器（206，有2张P100）
+    "worker1": {
+        "address": "10.21.22.206:29500",
+        "gpus": ["cuda:0", "cuda:1"],
+        "cpu_threads": 10
+    },
+    # 第二台机器（207，有2张P100）
+    "worker2": {
+        "address": "10.21.22.207:29500",
+        "gpus": ["cuda:0", "cuda:1"],
+        "cpu_threads": 10
+    }
+}
+
+# 模型分片策略 - 手动分配17个数据组
+MODEL_SHARD_STRATEGY = {
+    "worker1": {  # 206机器 - 前9个数据组
+        "
+
 ---
 
 

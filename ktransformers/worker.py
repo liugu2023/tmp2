@@ -56,31 +56,23 @@ class ModelWorker:
         config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         torch.set_default_dtype(config.torch_dtype)
         
-        # 获取可用的 GPU
-        gpu_memory = {}
-        for i in range(torch.cuda.device_count()):
-            total_mem = torch.cuda.get_device_properties(i).total_memory / (1024**3)
-            # P100 有 16GB 显存，我们保留一些用于中间计算
-            if torch.cuda.get_device_name(i).find("P100") != -1:
-                gpu_memory[i] = f"{int(total_mem * 0.8)}GiB"  # 使用 80% 的显存
+        # 获取当前 worker 的分片策略
+        worker_id = self.worker_id  # 需要在 __init__ 中添加
+        shard_strategy = MODEL_SHARD_STRATEGY[worker_id]
         
-        logger.info(f"Available GPUs: {gpu_memory}")
+        logger.info(f"Loading model with shard strategy for {worker_id}")
+        logger.info(f"Assigned layers: {shard_strategy['layers']}")
         
-        # 添加 CPU 内存配置
-        max_memory = {
-            **gpu_memory,  # GPU 显存配置
-            'cpu': "138GiB"  # CPU 内存配置
-        }
+        # 设置设备映射
+        device_map = {layer: f"cuda:{i%2}" for i, layer in enumerate(shard_strategy['layers'])}
+        logger.info(f"Device mapping: {device_map}")
         
-        logger.info(f"Memory configuration: {max_memory}")
-        
-        # 加载模型时自动分配到多个 GPU
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path,
             config=config,
             trust_remote_code=True,
-            device_map="auto",  # 自动决定最优的设备分配
-            max_memory=max_memory,
+            device_map=device_map,  # 使用手动设备映射
+            max_memory=shard_strategy['memory'],
             torch_dtype=torch.float16,
             offload_folder=None,
             offload_state_dict=False

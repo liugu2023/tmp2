@@ -13,18 +13,37 @@ WORKER_CONFIGS = {
     }
 }
 
-# 模型分片策略 - 在4张P100上分配
+# 模型分片策略 - 手动分配17个数据组
 MODEL_SHARD_STRATEGY = {
-    "worker1": {  # 206机器
-        "layers": "0:35",  # 分配前36层
+    "worker1": {  # 206机器 - 前9个数据组
+        "layers": [
+            "model.embed_tokens",
+            "model.layers.0",
+            "model.layers.1",
+            "model.layers.2",
+            "model.layers.3",
+            "model.layers.4",
+            "model.layers.5",
+            "model.layers.6",
+            "model.layers.7"
+        ],
         "memory": {
             0: "12GiB",  # 第一张P100
             1: "12GiB",  # 第二张P100
             'cpu': "138GiB"
         }
     },
-    "worker2": {  # 207机器
-        "layers": "36:71",  # 分配后36层
+    "worker2": {  # 207机器 - 后8个数据组
+        "layers": [
+            "model.layers.8",
+            "model.layers.9",
+            "model.layers.10",
+            "model.layers.11",
+            "model.layers.12",
+            "model.layers.13",
+            "model.layers.14",
+            "model.norm"
+        ],
         "memory": {
             0: "12GiB",  # 第一张P100
             1: "12GiB",  # 第二张P100

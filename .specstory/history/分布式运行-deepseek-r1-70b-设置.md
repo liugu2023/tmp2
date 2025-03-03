@@ -3048,6 +3048,62 @@ _**Assistant**_
 
 
 
+
+
+
+
+
+
+看起来是 TextStreamer 的参数不匹配。让我们修改 CustomStreamer 的实现：
+
+```python:ktransformers/worker.py
+    # 修改 CustomStreamer 类定义
+    class CustomStreamer(TextStreamer):
+        def __init__(self, tokenizer, on_text_chunk=None, **kwargs):
+            super().__init__(tokenizer, **kwargs)
+            self.on_text_chunk = on_text_chunk
+
+        def on_finalized_text(self, text: str, stream_end: bool = False):
+            if self.on_text_chunk:
+                self.on_text_chunk(text, stream_end)
+
+    def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            # ... 其他代码保持不变 ...
+            
+            # 创建流式处理器
+            streamer = self.CustomStreamer(
+                self.tokenizer,
+                on_text_chunk=StreamingHandler(self.socket, self.tokenizer),
+                skip_prompt=True,
+                skip_special_tokens=True
+            )
+            
+            # ... 其他代码保持不变 ...
+```
+
+
+
+主要改动：
+1. 修改了 CustomStreamer 的初始化方法，使用 **kwargs 来处理额外参数
+2. 将 on_text_chunk 作为单独的参数
+3. 调整了 streamer 的创建方式
+
+这样应该能解决参数不匹配的问题。如果还有其他错误，请告诉我。
+
+---
+
+_**User**_
+
+ERROR:__main__:Error in generate: Generation failed: 'CustomStreamer' object has no attribute 'on_text_text_chunk'
+ERROR:__main__:Error: Generation failed: 'CustomStreamer' object has no attribute 'on_text_text_chunk'  ERROR:__main__:Generation error: 'CustomStreamer' object has no attribute 'on_text_text_chunk'
+
+---
+
+_**Assistant**_
+
+
+
 ---
 
 

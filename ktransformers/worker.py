@@ -97,7 +97,7 @@ class ModelWorker:
 
         def on_finalized_text(self, text: str, stream_end: bool = False):
             if self.on_text_chunk:
-                self.on_text_text_chunk(text, stream_end)
+                self.on_text_chunk(text, stream_end)
 
     def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
         try:

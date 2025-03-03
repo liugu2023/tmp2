@@ -51,15 +51,21 @@ class ModelWorker:
         torch.set_default_dtype(config.torch_dtype)
         
         logger.info("Loading model...")
-        # 设置最大显存使用量
-        max_memory = {0: "15GiB"}  # 使用95GB显存在GPU 0上
+        # 设置最大显存使用量和内存使用量
+        max_memory = {
+            0: "15GiB",  # GPU 0 使用15GB显存
+            'cpu': "138GiB"  # CPU 使用50GB内存
+        }
+        
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path,
             config=config,
             trust_remote_code=True,
             device_map="auto",
-            max_memory=max_memory,  # 添加显存配置
-            torch_dtype=torch.float16  # 使用 FP16 来节省显存
+            max_memory=max_memory,  # 添加显存和内存配置
+            torch_dtype=torch.float16,  # 使用 FP16 来节省显存
+            offload_folder=None,  # 禁用磁盘卸载
+            offload_state_dict=False  # 禁用状态字典卸载
         )
         self.model.eval()
         

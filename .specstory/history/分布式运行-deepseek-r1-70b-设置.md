@@ -2420,6 +2420,145 @@ _**Assistant**_
 
 
 
+
+
+是的，这一步可能会比较耗时，因为涉及到数据的多次转换和网络传输。让我们优化一下这个过程：
+
+```python:ktransformers/worker.py
+def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        # ... 前面的代码保持不变 ...
+        
+        # 移动到CPU并转换格式
+        logger.info("Moving outputs to CPU and preparing response...")
+        start_transfer = time.time()
+        
+        # 使用异步传输
+        outputs_cpu = outputs.to('cpu', non_blocking=True)
+        
+        # 在等待GPU->CPU传输的同时，记录GPU内存使用情况
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        logger.info(f"GPU Memory: Allocated={allocated:.2f}GB, Reserved={reserved:.2f}GB")
+        
+        # 确保传输完成
+        torch.cuda.synchronize()
+        
+        # 使用 numpy() 的异步版本
+        with torch.no_grad():
+            output_ids = outputs_cpu.numpy(force=True)  # force=True 可能会更快
+        
+        transfer_time = time.time() - start_transfer
+        logger.info(f"Data transfer and conversion completed in {transfer_time:.2f} seconds")
+        
+        return {
+            'output_ids': output_ids.tolist(),
+            'status': 'success'
+        }
+        
+    except Exception as e:
+        logger.error(f"Generation error: {str(e)}")
+        return {
+            'status': 'error',
+            'error': str(e)
+        }
+```
+
+
+同时，在 local_chat.py 中也优化接收处理：
+
+```python:ktransformers/local_chat.py
+def generate(self, input_ids, attention_mask, **kwargs):
+    try:
+        logger.info("Preparing generation request...")
+        # 预先分配好 numpy 数组
+        input_ids_np = input_ids.cpu().numpy()
+        attention_mask_np = attention_mask.cpu().numpy()
+        
+        message = {
+            'command': 'generate',
+            'data': {
+                'input_ids': input_ids_np.tolist(),
+                'attention_mask': attention_mask_np.tolist(),
+                **kwargs
+            }
+        }
+        
+        logger.info("Sending request to worker...")
+        send_start = time.time()
+        self.socket.send_pyobj(message)
+        
+        logger.info("Waiting for response...")
+        response = self.socket.recv_pyobj()
+        recv_time = time.time() - send_start
+        logger.info(f"Network round trip took {recv_time:.2f} seconds")
+        
+        if response['status'] == 'success':
+            logger.info("Converting response to tensor...")
+            conv_start = time.time()
+            output_tensor = torch.tensor(response['output_ids'])
+            conv_time = time.time() - conv_start
+            logger.info(f"Tensor conversion took {conv_time:.2f} seconds")
+            return output_tensor
+        else:
+            logger.error(f"Generation failed: {response.get('error')}")
+            raise Exception(f"Generation failed: {response.get('error')}")
+    except Exception as e:
+        logger.error(f"Error in generate: {str(e)}")
+        raise
+```
+
+
+主要优化点：
+1. 使用异步数据传输（non_blocking=True）
+2. 在等待传输时执行其他操作
+3. 使用 force=True 来加速 numpy 转换
+4. 添加了详细的时间统计
+5. 预先分配数组减少内存拷贝
+
+运行命令保持不变：
+
+1. GPU 机器 (10.21.22.206):
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0 python -m ktransformers.worker --worker_address "10.21.22.206:29500"
+```
+
+
+2. CPU 机器 (10.21.22.100):
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.local_chat \
+    --model_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/ \
+    --gguf_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/ \
+    --worker_address "10.21.22.206:29500" \
+    --max_new_tokens 50
+```
+
+
+这些优化应该能显著减少数据传输和转换的时间。如果还是觉得慢，我们可以考虑：
+1. 使用更快的序列化方法（如 msgpack）
+2. 实现流式传输
+3. 使用压缩来减少网络传输量
+
+请告诉我优化后的效果如何。
+
+---
+
+_**User**_
+
+WARNING:accelerate.big_modeling:Some parameters are on the meta device because they were offloaded to the disk.这个是？我不想卸载到磁盘上，我想卸载到内存上
+
+---
+
+_**Assistant**_
+
+
+
+
+
+这是因为模型太大，Accelerate 自动把一些参数卸载到了磁盘上。让我们修改配置，使其保持在内存中：
+
+```python:ktransformers/worker
+
 ---
 
 

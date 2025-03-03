@@ -90,7 +90,7 @@ class DistributedModel:
                     # 如果生成结束，退出循环
                     if response.get('finished', False):
                         print()  # 换行
-                        break
+                        # 不要在这里 break，等待最终的 token IDs
                 
                 elif response['status'] == 'success':
                     # 最终的完整响应
@@ -157,9 +157,12 @@ def main():
                     do_sample=True
                 )
                 
-                logger.info("Decoding response...")
-                response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-                print("\nAssistant:", response)
+                # 不需要再次解码和打印，因为已经在流式输出中完成了
+                if outputs is not None:  # 添加检查
+                    logger.info("Generation completed successfully")
+                else:
+                    logger.warning("No output tokens received")
+                
             except UnicodeDecodeError as e:
                 logger.error(f"Encoding error: {str(e)}")
                 print("请使用UTF-8编码输入文本")

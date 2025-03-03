@@ -3104,6 +3104,187 @@ _**Assistant**_
 
 
 
+
+
+
+
+
+
+啊，抱歉，是我的笔误。在 CustomStreamer 类中把方法名写错了，让我修复一下：
+
+```python:ktransformers/worker.py
+    # 修改 CustomStreamer 类定义
+    class CustomStreamer(TextStreamer):
+        def __init__(self, tokenizer, on_text_chunk=None, **kwargs):
+            super().__init__(tokenizer, **kwargs)
+            self.on_text_chunk = on_text_chunk
+
+        def on_finalized_text(self, text: str, stream_end: bool = False):
+            if self.on_text_chunk:
+                # 修正这里：把 on_text_text_chunk 改为 on_text_chunk
+                self.on_text_chunk(text, stream_end)
+```
+
+
+
+主要改动：
+- 把 `self.on_text_text_chunk` 改为 `self.on_text_chunk`
+
+这是一个简单的拼写错误，现在应该能正常工作了。运行命令保持不变：
+
+1. GPU 机器 (10.21.22.206):
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0,1 python -m ktransformers.worker --worker_address "10.21.22.206:29500"
+```
+
+
+
+2. CPU 机器 (10.21.22.100):
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.local_chat \
+    --model_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/ \
+    --gguf_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/ \
+    --worker_address "10.21.22.206:29500" \
+    --max_new_tokens 50
+```
+
+
+
+现在您应该能看到实时的生成输出了。如果还有其他问题，请告诉我。
+
+---
+
+_**User**_
+
+INFO:__main__:Decoding response...
+ERROR:__main__:Error: 'NoneType' object is not subscriptable
+
+---
+
+_**Assistant**_
+
+
+
+
+
+
+
+
+
+这个错误是因为我们在流式输出后没有正确处理最终的 token IDs。让我们修改代码：
+
+```python:ktransformers/local_chat.py
+def generate(self, input_ids, attention_mask, **kwargs):
+    try:
+        logger.info("Preparing generation request...")
+        message = {
+            'command': 'generate',
+            'data': {
+                'input_ids': input_ids.cpu().numpy().tolist(),
+                'attention_mask': attention_mask.cpu().numpy().tolist(),
+                **kwargs
+            }
+        }
+        
+        logger.info("Starting generation...")
+        self.socket.send_pyobj(message)
+        
+        # 接收流式响应
+        full_text = ""
+        while True:
+            response = self.socket.recv_pyobj()
+            
+            if response['status'] == 'error':
+                raise Exception(f"Generation failed: {response.get('error')}")
+            
+            if response['status'] == 'streaming':
+                # 打印新生成的文本部分
+                new_text = response['text'][len(full_text):]
+                if new_text:
+                    print(new_text, end='', flush=True)
+                full_text = response['text']
+                
+                # 发送确认
+                self.socket.send_pyobj({'status': 'received'})
+                
+                # 如果生成结束，退出循环
+                if response.get('finished', False):
+                    print()  # 换行
+                    # 不要在这里 break，等待最终的 token IDs
+            
+            elif response['status'] == 'success':
+                # 最终的完整响应
+                return torch.tensor(response['output_ids'])
+        
+    except Exception as e:
+        logger.error(f"Error in generate: {str(e)}")
+        raise
+
+def main():
+    # ... 其他代码保持不变 ...
+    
+    if args.worker_address:
+        # 分布式模式
+        logger.info("Running in distributed mode")
+        model = DistributedModel(args.worker_address)
+        model.load_model(args.model_path, args.gguf_path)
+        tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+        
+        while True:
+            try:
+                content = input("Chat: ")
+                if content.lower() in ['quit', 'exit']:
+                    break
+                    
+                # ... 其他代码保持不变 ...
+                
+                logger.info("Starting generation...")
+                outputs = model.generate(
+                    input_tensor,
+                    torch.ones_like(input_tensor),
+                    max_new_tokens=args.max_new_tokens,
+                    temperature=0.7,
+                    top_p=0.9,
+                    do_sample=True
+                )
+                
+                # 不需要再次解码和打印，因为已经在流式输出中完成了
+                if outputs is not None:  # 添加检查
+                    logger.info("Generation completed successfully")
+                else:
+                    logger.warning("No output tokens received")
+                
+            except UnicodeDecodeError as e:
+                logger.error(f"Encoding error: {str(e)}")
+                print("请使用UTF-8编码输入文本")
+                continue
+            except Exception as e:
+                logger.error(f"Error: {str(e)}")
+                continue
+```
+
+
+
+主要改动：
+1. 移除了流式输出完成后的 break
+2. 等待最终的 token IDs 响应
+3. 添加了输出检查
+4. 移除了重复的文本解码和打印
+
+这样应该能解决 NoneType 错误。如果还有其他问题，请告诉我。
+
+---
+
+_**User**_
+
+记得添加上性能统计
+
+---
+
+_**Assistant**_
+
+
+
 ---
 
 

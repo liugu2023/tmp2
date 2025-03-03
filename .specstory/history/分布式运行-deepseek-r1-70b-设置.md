@@ -2259,6 +2259,38 @@ PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.local_chat \
 
 ---
 
+_**User**_
+
+ERROR:__main__:Generation error: ModelWorker.generate.<locals>.<lambda>() got an unexpected keyword argument 'stream_end'
+
+
+---
+
+_**Assistant**_
+
+
+
+
+
+这个错误是因为 TextStreamer 的回调函数参数不匹配。让我们修改 worker.py 中的 streamer 配置：
+
+```python:ktransformers/worker.py
+def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        logger.info("Received generation request")
+        logger.info(f"Input sequence length: {len(input_data['input_ids'])}")
+        
+        # 创建输入张量
+        logger.info("Moving input tensors to GPU...")
+        input_ids = torch.tensor(input_data['input_ids'], device='cuda')
+        attention_mask = torch.tensor(input_data['attention_mask'], device='cuda')
+        
+        # 生成参数日志
+        max_new_tokens = input_data.get('max_new_tokens', 512)
+        temperature = input_data
+
+---
+
 
 
 ---

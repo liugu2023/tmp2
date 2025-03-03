@@ -124,45 +124,23 @@ class ModelWorker:
                     logger.info(f"- Attention implementation: {self.model.config._attn_implementation}")
                 
                 logger.info("- Starting token generation...")
-                logger.info("  - Preparing generation config:")
-                generation_config = self.model.generation_config
-                logger.info(f"    - Repetition penalty: {generation_config.repetition_penalty}")
-                logger.info(f"    - Length penalty: {generation_config.length_penalty}")
-                logger.info(f"    - Early stopping: {generation_config.early_stopping}")
-                logger.info(f"    - Pad token ID: {generation_config.pad_token_id}")
-                logger.info(f"    - EOS token ID: {generation_config.eos_token_id}")
-                
-                # 记录起始时间戳
-                gen_start_time = time.time()
-                last_log_time = gen_start_time
-                
-                def progress_callback(step: int, token: int):
-                    nonlocal last_log_time
-                    current_time = time.time()
-                    # 每2秒记录一次进度
-                    if current_time - last_log_time >= 2:
-                        tokens_so_far = step - len(input_ids[0])
-                        time_elapsed = current_time - gen_start_time
-                        speed = tokens_so_far / time_elapsed if time_elapsed > 0 else 0
-                        logger.info(f"    - Generated {tokens_so_far} tokens, "
-                                  f"speed: {speed:.2f} tokens/sec, "
-                                  f"time elapsed: {time_elapsed:.2f}s")
-                        last_log_time = current_time
-                
-                # 设置 streamer 的回调函数
-                streamer = TextStreamer(
-                    self.tokenizer, 
-                    skip_prompt=True,
-                    skip_special_tokens=True
-                )
-                streamer.on_finalized_text = lambda x: logger.info(f"    - Generated text: {x}")
-                
                 logger.info("  - Generation started with following settings:")
                 logger.info(f"    - Input context length: {len(input_ids[0])} tokens")
                 logger.info(f"    - Maximum new tokens: {max_new_tokens}")
                 logger.info(f"    - Temperature: {temperature}")
                 logger.info(f"    - Top-p sampling: {top_p}")
                 logger.info(f"    - Do sample: {input_data.get('do_sample', True)}")
+                
+                # 修改 streamer 配置
+                class CustomStreamer(TextStreamer):
+                    def on_finalized_text(self, text: str, stream_end: bool = False):
+                        logger.info(f"    - Generated text: {text}")
+                
+                streamer = CustomStreamer(
+                    self.tokenizer, 
+                    skip_prompt=True,
+                    skip_special_tokens=True
+                )
                 
                 outputs = self.model.generate(
                     input_ids=input_ids,
@@ -176,7 +154,7 @@ class ModelWorker:
                 
                 # 记录生成完成的信息
                 final_time = time.time()
-                total_gen_time = final_time - gen_start_time
+                total_gen_time = final_time - start_time
                 logger.info("  - Generation completed:")
                 logger.info(f"    - Total generation time: {total_gen_time:.2f} seconds")
                 logger.info(f"    - Final sequence length: {len(outputs[0])} tokens")

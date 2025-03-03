@@ -143,15 +143,35 @@ class ModelWorker:
                 logger.info(f"    - Top-p sampling: {top_p}")
                 logger.info(f"    - Do sample: {input_data.get('do_sample', True)}")
                 
-                # 修改 streamer 配置
-                class CustomStreamer(TextStreamer):
-                    def on_finalized_text(self, text: str, stream_end: bool = False):
-                        logger.info(f"    - Generated text: {text}")
+                # 创建自定义流式处理器
+                class StreamingHandler:
+                    def __init__(self, socket, tokenizer):
+                        self.socket = socket
+                        self.tokenizer = tokenizer
+                        self.current_text = ""
+                        self.last_send_time = time.time()
+                        
+                    def __call__(self, text_chunk: str, stream_end: bool = False):
+                        current_time = time.time()
+                        self.current_text += text_chunk
+                        
+                        # 每0.5秒或结束时发送一次
+                        if stream_end or (current_time - self.last_send_time) > 0.5:
+                            self.socket.send_pyobj({
+                                'status': 'streaming',
+                                'text': self.current_text,
+                                'finished': stream_end
+                            })
+                            # 等待客户端确认
+                            self.socket.recv_pyobj()
+                            self.last_send_time = current_time
                 
+                # 创建流式处理器
                 streamer = CustomStreamer(
-                    self.tokenizer, 
+                    self.tokenizer,
                     skip_prompt=True,
-                    skip_special_tokens=True
+                    skip_special_tokens=True,
+                    on_text_chunk=StreamingHandler(self.socket, self.tokenizer)
                 )
                 
                 outputs = self.model.generate(
@@ -183,31 +203,10 @@ class ModelWorker:
             logger.info(f"Generation speed: {tokens_per_second:.2f} tokens/second")
             logger.info(f"Final sequence length: {len(outputs[0])}")
             
-            # 移动到CPU并转换格式
-            logger.info("Moving outputs to CPU and preparing response...")
-            start_transfer = time.time()
-            
-            # 使用异步传输
-            outputs_cpu = outputs.to('cpu', non_blocking=True)
-            
-            # 在等待GPU->CPU传输的同时，记录GPU内存使用情况
-            allocated = torch.cuda.memory_allocated() / 1024**3
-            reserved = torch.cuda.memory_reserved() / 1024**3
-            logger.info(f"GPU Memory: Allocated={allocated:.2f}GB, Reserved={reserved:.2f}GB")
-            
-            # 确保传输完成
-            torch.cuda.synchronize()
-            
-            # 使用 numpy() 的异步版本
-            with torch.no_grad():
-                output_ids = outputs_cpu.numpy(force=True)  # force=True 可能会更快
-            
-            transfer_time = time.time() - start_transfer
-            logger.info(f"Data transfer and conversion completed in {transfer_time:.2f} seconds")
-            
+            # 最终返回完整的 token ids
             return {
-                'output_ids': output_ids.tolist(),
-                'status': 'success'
+                'status': 'success',
+                'output_ids': outputs.cpu().numpy().tolist()
             }
         except Exception as e:
             logger.error(f"Generation error: {str(e)}")

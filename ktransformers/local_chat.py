@@ -57,38 +57,45 @@ class DistributedModel:
     def generate(self, input_ids, attention_mask, **kwargs):
         try:
             logger.info("Preparing generation request...")
-            # 预先分配好 numpy 数组
-            input_ids_np = input_ids.cpu().numpy()
-            attention_mask_np = attention_mask.cpu().numpy()
-            
             message = {
                 'command': 'generate',
                 'data': {
-                    'input_ids': input_ids_np.tolist(),
-                    'attention_mask': attention_mask_np.tolist(),
+                    'input_ids': input_ids.cpu().numpy().tolist(),
+                    'attention_mask': attention_mask.cpu().numpy().tolist(),
                     **kwargs
                 }
             }
             
-            logger.info("Sending request to worker...")
-            send_start = time.time()
+            logger.info("Starting generation...")
             self.socket.send_pyobj(message)
             
-            logger.info("Waiting for response...")
-            response = self.socket.recv_pyobj()
-            recv_time = time.time() - send_start
-            logger.info(f"Network round trip took {recv_time:.2f} seconds")
-            
-            if response['status'] == 'success':
-                logger.info("Converting response to tensor...")
-                conv_start = time.time()
-                output_tensor = torch.tensor(response['output_ids'])
-                conv_time = time.time() - conv_start
-                logger.info(f"Tensor conversion took {conv_time:.2f} seconds")
-                return output_tensor
-            else:
-                logger.error(f"Generation failed: {response.get('error')}")
-                raise Exception(f"Generation failed: {response.get('error')}")
+            # 接收流式响应
+            full_text = ""
+            while True:
+                response = self.socket.recv_pyobj()
+                
+                if response['status'] == 'error':
+                    raise Exception(f"Generation failed: {response.get('error')}")
+                
+                if response['status'] == 'streaming':
+                    # 打印新生成的文本部分
+                    new_text = response['text'][len(full_text):]
+                    if new_text:
+                        print(new_text, end='', flush=True)
+                    full_text = response['text']
+                    
+                    # 发送确认
+                    self.socket.send_pyobj({'status': 'received'})
+                    
+                    # 如果生成结束，退出循环
+                    if response.get('finished', False):
+                        print()  # 换行
+                        break
+                
+                elif response['status'] == 'success':
+                    # 最终的完整响应
+                    return torch.tensor(response['output_ids'])
+        
         except Exception as e:
             logger.error(f"Error in generate: {str(e)}")
             raise

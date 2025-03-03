@@ -2700,6 +2700,106 @@ _**Assistant**_
 
 
 
+
+
+
+
+好的，让我们修改配置来使用两张 GPU：
+
+```python:ktransformers/worker.py
+def load_model(self, model_path: str, gguf_path: str):
+    logger.info("Loading tokenizer...")
+    self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    
+    logger.info("Loading model config...")
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    torch.set_default_dtype(config.torch_dtype)
+    
+    logger.info("Loading model...")
+    # 设置双 GPU 的内存分配
+    max_memory = {
+        0: "12GiB",    # 第一张 GPU 使用 12GB
+        1: "12GiB",    # 第二张 GPU 使用 12GB
+        'cpu': "114GiB" # 剩余放在 CPU 内存
+    }
+    
+    self.model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        config=config,
+        trust_remote_code=True,
+        device_map="auto",  # 自动在两张 GPU 之间分配
+        max_memory=max_memory,
+        torch_dtype=torch.float16,
+        offload_folder=None,
+        offload_state_dict=False
+    )
+    self.model.eval()
+    
+    # 输出设备分配信息
+    logger.info("Model layer distribution:")
+    for name, device in self.model.hf_device_map.items():
+        logger.info(f"  {name}: {device}")
+    
+    # ... 其余代码保持不变 ...
+```
+
+
+现在运行命令需要修改：
+
+1. GPU 机器 (10.21.22.206):
+```bash
+# 设置可见的 GPU 为 0 和 1
+PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0,1 python -m ktransformers.worker --worker_address "10.21.22.206:29500"
+```
+
+
+主要改动：
+1. 配置了两张 GPU 的显存限制
+2. 减少了 CPU 内存占用（因为更多层可以放在 GPU 上）
+3. 添加了设备分配信息的日志
+
+这样应该能：
+1. 提高模型的运行效率
+2. 减少 CPU-GPU 之间的数据传输
+3. 更好地利用可用的硬件资源
+
+如果需要调整显存分配或看到更详细的分配信息，请告诉我。
+
+---
+
+_**User**_
+
+反正推理时间闲着也是闲着，我们这样，它每推理出来一条，我们就进行打包，传送回客户端，怎么样
+
+---
+
+_**Assistant**_
+
+
+
+
+
+
+
+好主意！我们可以实现流式传输，让用户能实时看到生成的内容。让我们修改代码：
+
+```python:ktransformers/worker.py
+def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        # ... 前面的初始化代码保持不变 ...
+        
+        # 创建自定义流式处理器
+        class StreamingHandler:
+            def __init__(self, socket, tokenizer):
+                self.socket = socket
+                self.tokenizer = tokenizer
+                self.current_text = ""
+                self.last_send_time = time.time()
+                
+            def __call__(self, text_chunk: str, stream_end: bool = False):
+                current_time = time.time()
+                self
+
 ---
 
 

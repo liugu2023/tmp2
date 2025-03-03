@@ -3532,6 +3532,150 @@ PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.local_chat \
 
 ---
 
+_**User**_
+
+gpu他不干活
+
+---
+
+_**Assistant**_
+
+
+
+
+
+
+
+看来我们需要修改前向传播钩子，确保 GPU 真正参与计算。让我们修改 worker.py：
+
+```python:ktransformers/worker.py
+def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        logger.info("Received generation request")
+        logger.info(f"Input sequence length: {len(input_data['input_ids'])}")
+        
+        # 创建输入张量在CPU上
+        logger.info("Creating input tensors on CPU...")
+        input_ids = torch.tensor(input_data['input_ids'])
+        attention_mask = torch.tensor(input_data['attention_mask'])
+        
+        # 生成参数日志
+        max_new_tokens = input_data.get('max_new_tokens', 512)
+        temperature = input_data.get('temperature', 0.6)
+        top_p = input_data.get('top_p', 0.9)
+        logger.info(f"Generation parameters: max_new_tokens={max_new_tokens}, "
+                   f"temperature={temperature}, "
+                   f"top_p={top_p}")
+        
+        # 生成文本
+        logger.info("Starting text generation...")
+        start_time = time.time()
+        
+        # 使用 CUDA 内存管理
+        with torch.cuda.stream(torch.cuda.Stream()):
+            with torch.no_grad(), torch.amp.autocast('cuda'):
+                logger.info("Generating text...")
+                
+                # 修改模型的前向传播方法
+                original_forward = self.model.forward
+                
+                def gpu_forward(*args, **kwargs):
+                    # 将输入移到GPU
+                    gpu_args = [arg.cuda() if isinstance(arg, torch.Tensor) else arg for arg in args]
+                    gpu_kwargs = {k: v.cuda() if isinstance(v, torch.Tensor) else v for k, v in kwargs.items()}
+                    
+                    # 对每个模块的权重进行GPU计算
+                    for name, module in self.model.named_modules():
+                        if hasattr(module, 'weight') and module.weight is not None:
+                            # 临时将权重移到GPU
+                            with torch.cuda.device('cuda'):
+                                weight = module.weight.cuda()
+                                if hasattr(module, 'bias') and module.bias is not None:
+                                    bias = module.bias.cuda()
+                                # 执行计算
+                                if isinstance(module, torch.nn.Linear):
+                                    output = torch.nn.functional.linear(gpu_args[0], weight, bias if module.bias is not None else None)
+                                elif isinstance(module, torch.nn.LayerNorm):
+                                    output = torch.nn.functional.layer_norm(gpu_args[0], module.normalized_shape, weight, bias if module.bias is not None else None)
+                                # 将结果保持在GPU上
+                                gpu_args = (output,) + gpu_args[1:]
+                    
+                    # 返回最终结果
+                    return gpu_args[0]
+                
+                # 替换模型的前向传播方法
+                self.model.forward = gpu_forward
+                
+                try:
+                    # 生成文本
+                    outputs = self.model.generate(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        max_new_tokens=max_new_tokens,
+                        temperature=temperature,
+                        top_p=top_p,
+                        do_sample=input_data.get('do_sample', True),
+                        streamer=TextStreamer(self.tokenizer, skip_prompt=True)
+                    )
+                finally:
+                    # 恢复原始的前向传播方法
+                    self.model.forward = original_forward
+            
+            # 清理GPU内存
+            torch.cuda.empty_cache()
+            
+            # 记录GPU内存使用情况
+            allocated = torch.cuda.memory_allocated() / 1024**3
+            reserved = torch.cuda.memory_reserved() / 1024**3
+            logger.info(f"GPU Memory: Allocated={allocated:.2f}GB, Reserved={reserved:.2f}GB")
+            
+            logger.info("Preparing response...")
+            return {
+                'output_ids': outputs.numpy().tolist(),
+                'status': 'success'
+            }
+    except Exception as e:
+        logger.error(f"Generation error: {str(e)}")
+        # 清理GPU内存
+        torch.cuda.empty_cache()
+        return {
+            'status': 'error',
+            'error': str(e)
+        }
+```
+
+
+
+
+主要改动：
+1. 移除了钩子机制
+2. 直接修改模型的前向传播方法
+3. 在前向传播中：
+   - 将输入数据移到 GPU
+   - 对每个模块的权重进行 GPU 计算
+   - 保持中间结果在 GPU 上
+4. 使用 try-finally 确保恢复原始前向传播方法
+
+这样应该能确保 GPU 真正参与计算。运行命令保持不变：
+
+```bash
+# GPU 机器 (10.21.22.206)
+PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0 python -m ktransformers.worker --worker_address "10.21.22.206:29500"
+
+# CPU 机器 (10.21.22.100)
+PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.local_chat \
+    --model_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/ \
+    --gguf_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/ \
+    --worker_address "10.21.22.206:29500" \
+    --max_new_tokens 50
+```
+
+
+
+如果还有问题，请告诉我。
+
+---
+
 
 
 ---

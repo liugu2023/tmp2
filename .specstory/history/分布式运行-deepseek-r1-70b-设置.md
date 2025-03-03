@@ -2700,6 +2700,303 @@ _**Assistant**_
 
 
 
+
+
+让我们添加 CPU 核心数的限制。我们可以使用 `torch.set_num_threads()` 来控制 PyTorch 使用的 CPU 线程数：
+
+```python:ktransformers/worker.py
+def __init__(self, address: str):
+    self.context = zmq.Context()
+    self.socket = self.context.socket(zmq.REP)
+    host, port = address.split(':')
+    self.socket.bind(f"tcp://0.0.0.0:{port}")
+    self.socket.setsockopt(zmq.RCVHWM, 0)
+    self.socket.setsockopt(zmq.SNDHWM, 0)
+    
+    # 设置 CPU 核心数
+    torch.set_num_threads(10)  # 限制为10个核心
+    logger.info(f"Set PyTorch CPU threads to 10")
+    
+    self.model = None
+    self.tokenizer = None
+    logger.info(f"Worker started at {address}, listening on all interfaces")
+
+def load_model(self, model_path: str, gguf_path: str):
+    logger.info("Loading tokenizer...")
+    self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    
+    logger.info("Loading model config...")
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    torch.set_default_dtype(config.torch_dtype)
+    
+    # 再次确认 CPU 线程数
+    logger.info(f"Current PyTorch CPU threads: {torch.get_num_threads()}")
+    
+    logger.info("Loading model...")
+    # 设置最大显存使用量和内存使用量
+    max_memory = {
+        0: "12GiB",  # GPU 显存
+        'cpu': "138GiB"  # CPU 内存
+    }
+    
+    self.model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        config=config,
+        trust_remote_code=True,
+        device_map="auto",
+        max_memory=max_memory,
+        torch_dtype=torch.float16,
+        offload_folder=None,
+        offload_state_dict=False
+    )
+    self.model.eval()
+    # ... 其余代码保持不变 ...
+```
+
+
+运行命令保持不变：
+
+1. GPU 机器 (10.21.22.206):
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0 python -m ktransformers.worker --worker_address "10.21.22.206:29500"
+```
+
+
+这样可以：
+1. 限制 PyTorch 使用的 CPU 线程数为 10
+2. 避免过多的 CPU 资源占用
+3. 在日志中显示实际使用的线程数
+
+如果需要更精确的 CPU 核心控制，我们还可以使用 `os.sched_setaffinity()` 来绑定特定的 CPU 核心。需要我添加这个功能吗？
+
+---
+
+_**User**_
+
+为啥你设置完多核运行后，模型加载速度大幅降低
+
+---
+
+_**Assistant**_
+
+
+
+
+
+这是因为我们限制了 CPU 线程数，但模型加载过程是 IO 密集型和计算密集型的混合操作。让我们优化一下加载过程：
+
+```python:ktransformers/worker.py
+def __init__(self, address: str):
+    self.context = zmq.Context()
+    self.socket = self.context.socket(zmq.REP)
+    host, port = address.split(':')
+    self.socket.bind(f"tcp://0.0.0.0:{port}")
+    self.socket.setsockopt(zmq.RCVHWM, 0)
+    self.socket.setsockopt(zmq.SNDHWM, 0)
+    
+    # 初始时不限制线程数
+    self.model = None
+    self.tokenizer = None
+    logger.info(f"Worker started at {address}, listening on all interfaces")
+
+def load_model(self, model_path: str, gguf_path: str):
+    logger.info("Loading tokenizer...")
+    self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    
+    logger.info("Loading model config...")
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    torch.set_default_dtype(config.torch_dtype)
+    
+    logger.info("Loading model with maximum threads...")
+    # 设置最大显存使用量和内存使用量
+    max_memory = {
+        0: "12GiB",  # GPU 显存
+        'cpu': "138GiB"  # CPU 内存
+    }
+    
+    self.model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        config=config,
+        trust_remote_code=True,
+        device_map="auto",
+        max_memory=max_memory,
+        torch_dtype=torch.float16,
+        offload_folder=None,
+        offload_state_dict=False
+    )
+    self.model.eval()
+    
+    # 模型加载完成后再限制线程数
+    logger.info("Model loaded, setting CPU threads to 10...")
+    torch.set_num_threads(10)
+    logger.info(f"Current PyTorch CPU threads: {torch.get_num_threads()}")
+    
+    # ... 其余代码保持不变 ...
+```
+
+
+
+主要改动：
+1. 在初始化时不限制线程数
+2. 让模型加载使用最大的 CPU 资源
+3. 只在模型加载完成后再限制线程数为 10
+
+这样可以：
+1. 加快模型加载速度
+2. 在推理阶段仍然控制 CPU 使用率
+3. 平衡加载速度和运行效率
+
+运行命令保持不变：
+
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0 python -m ktransformers.worker --worker_address "10.21.22.206:29500"
+```
+
+
+这样应该能显著提高模型加载速度。如果还有其他问题，请告诉我。
+
+---
+
+_**User**_
+
+我要是说，我这台机器上还有一张P100，另一台机器上还有两张P100，你能优化到什么程度
+
+---
+
+_**Assistant**_
+
+
+
+
+
+
+
+我们可以利用多 GPU 进行分布式推理。让我们修改代码以支持多 GPU 和多机器部署：
+
+1. 首先修改 worker.py 以支持多 GPU：
+
+```python:ktransformers/worker.py
+def load_model(self, model_path: str, gguf_path: str):
+    logger.info("Loading tokenizer...")
+    self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    
+    logger.info("Loading model config...")
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    torch.set_default_dtype(config.torch_dtype)
+    
+    # 获取可用的 GPU
+    gpu_memory = {}
+    for i in range(torch.cuda.device_count()):
+        total_mem = torch.cuda.get_device_properties(i).total_memory / (1024**3)
+        # P100 有 16GB 显存，我们保留一些用于中间计算
+        if torch.cuda.get_device_name(i).find("P100") != -1:
+            gpu_memory[i] = f"{int(total_mem * 0.8)}GiB"  # 使用 80% 的显存
+    
+    logger.info(f"Available GPUs: {gpu_memory}")
+    
+    # 添加 CPU 内存配置
+    max_memory = {
+        **gpu_memory,  # GPU 显存配置
+        'cpu': "138GiB"  # CPU 内存配置
+    }
+    
+    logger.info(f"Memory configuration: {max_memory}")
+    
+    # 加载模型时自动分配到多个 GPU
+    self.model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        config=config,
+        trust_remote_code=True,
+        device_map="auto",  # 自动决定最优的设备分配
+        max_memory=max_memory,
+        torch_dtype=torch.float16,
+        offload_folder=None,
+        offload_state_dict=False
+    )
+    self.model.eval()
+    
+    # 记录模型分布情况
+    if hasattr(self.model, 'hf_device_map'):
+        logger.info("Model layer distribution:")
+        for layer, device in self.model.hf_device_map.items():
+            logger.info(f"  {layer}: {device}")
+```
+
+2. 然后创建一个新的分布式配置文件 distributed_config.py：
+
+```python:ktransformers/distributed_config.py
+WORKER_CONFIGS = {
+    # 第一台机器（有1张P100）
+    "worker1": {
+        "address": "10.21.22.206:29500",
+        "gpus": ["cuda:0"],  # 本地 P100
+        "cpu_threads": 10
+    },
+    # 第二台机器（有2张P100）
+    "worker2": {
+        "address": "10.21.22.xxx:29500",  # 替换为实际IP
+        "gpus": ["cuda:0", "cuda:1"],  # 两张 P100
+        "cpu_threads": 10
+    }
+}
+
+# 模型分片策略
+MODEL_SHARD_STRATEGY = {
+    "worker1": {
+        "layers": "0:23",  # 分配前24层
+        "memory": {
+            0: "12GiB",
+            'cpu': "138GiB"
+        }
+    },
+    "worker2": {
+        "layers": "24:47",  # 分配后24层
+        "memory": {
+            0: "12GiB",
+            1: "12GiB",
+            'cpu': "138GiB"
+        }
+    }
+}
+```
+
+3. 修改启动命令：
+
+第一台机器 (10.21.22.206):
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0 python -m ktransformers.worker \
+    --worker_address "10.21.22.206:29500" \
+    --worker_id "worker1"
+```
+
+第二台机器:
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0,1 python -m ktransformers.worker \
+    --worker_address "10.21.22.xxx:29500" \
+    --worker_id "worker2"
+```
+
+这样的优化可以带来：
+1. 显存利用率提升：
+   - 3张 P100 总共 48GB 显存
+   - 每张卡可用约 12GB
+   - 总可用显存达到 36GB
+
+2. 性能提升：
+   - 模型层分布在多个 GPU 上
+   - 减少 CPU-GPU 数据传输
+   - 并行处理能力提升
+
+3. 吞吐量提升：
+   - 可以同时处理多个请求
+   - 不同 GPU 负责不同的模型层
+   - 减少单卡负载
+
+需要我继续完善分布式部署的其他细节吗？比如：
+1. 负载均衡策略
+2. 故障转移机制
+3. 动态资源分配
+
 ---
 
 

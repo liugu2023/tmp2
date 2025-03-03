@@ -54,27 +54,42 @@ class ModelWorker:
         config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         torch.set_default_dtype(config.torch_dtype)
         
-        # 再次确认 CPU 线程数
-        logger.info(f"Current PyTorch CPU threads: {torch.get_num_threads()}")
+        # 获取可用的 GPU
+        gpu_memory = {}
+        for i in range(torch.cuda.device_count()):
+            total_mem = torch.cuda.get_device_properties(i).total_memory / (1024**3)
+            # P100 有 16GB 显存，我们保留一些用于中间计算
+            if torch.cuda.get_device_name(i).find("P100") != -1:
+                gpu_memory[i] = f"{int(total_mem * 0.8)}GiB"  # 使用 80% 的显存
         
-        logger.info("Loading model...")
-        # 设置最大显存使用量和内存使用量
+        logger.info(f"Available GPUs: {gpu_memory}")
+        
+        # 添加 CPU 内存配置
         max_memory = {
-            0: "12GiB",  # GPU 0 使用15GB显存
-            'cpu': "138GiB"  # CPU 使用50GB内存
+            **gpu_memory,  # GPU 显存配置
+            'cpu': "138GiB"  # CPU 内存配置
         }
         
+        logger.info(f"Memory configuration: {max_memory}")
+        
+        # 加载模型时自动分配到多个 GPU
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path,
             config=config,
             trust_remote_code=True,
-            device_map="auto",
-            max_memory=max_memory,  # 添加显存和内存配置
-            torch_dtype=torch.float16,  # 使用 FP16 来节省显存
-            offload_folder=None,  # 禁用磁盘卸载
-            offload_state_dict=False  # 禁用状态字典卸载
+            device_map="auto",  # 自动决定最优的设备分配
+            max_memory=max_memory,
+            torch_dtype=torch.float16,
+            offload_folder=None,
+            offload_state_dict=False
         )
         self.model.eval()
+        
+        # 记录模型分布情况
+        if hasattr(self.model, 'hf_device_map'):
+            logger.info("Model layer distribution:")
+            for layer, device in self.model.hf_device_map.items():
+                logger.info(f"  {layer}: {device}")
         
         # 设置生成配置
         try:

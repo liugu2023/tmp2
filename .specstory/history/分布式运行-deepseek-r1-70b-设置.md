@@ -2557,7 +2557,148 @@ _**Assistant**_
 
 这是因为模型太大，Accelerate 自动把一些参数卸载到了磁盘上。让我们修改配置，使其保持在内存中：
 
-```python:ktransformers/worker
+```python:ktransformers/worker.py
+def load_model(self, model_path: str, gguf_path: str):
+    logger.info("Loading tokenizer...")
+    self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    
+    logger.info("Loading model config...")
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    torch.set_default_dtype(config.torch_dtype)
+    
+    logger.info("Loading model...")
+    # 设置最大显存使用量和内存使用量
+    max_memory = {
+        0: "15GiB",  # GPU 0 使用15GB显存
+        'cpu': "50GiB"  # CPU 使用50GB内存
+    }
+    
+    self.model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        config=config,
+        trust_remote_code=True,
+        device_map="auto",
+        max_memory=max_memory,  # 添加显存和内存配置
+        torch_dtype=torch.float16,  # 使用 FP16 来节省显存
+        offload_folder=None,  # 禁用磁盘卸载
+        offload_state_dict=False  # 禁用状态字典卸载
+    )
+    self.model.eval()
+    
+    # ... 其余代码保持不变 ...
+```
+
+
+主要改动：
+1. 添加了 CPU 内存限制配置
+2. 禁用了磁盘卸载功能
+3. 设置了合理的内存分配比例
+
+现在重新运行：
+
+1. GPU 机器 (10.21.22.206):
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0 python -m ktransformers.worker --worker_address "10.21.22.206:29500"
+```
+
+
+这样模型参数会在 GPU 显存和 CPU 内存之间分配，而不会卸载到磁盘。您可以根据实际的硬件配置调整内存分配：
+- GPU 显存: "15GiB"
+- CPU 内存: "50GiB"
+
+如果您的服务器内存更大，可以相应增加这些值。
+
+---
+
+_**User**_
+
+为什么GPU占用很低40%都打不到，是因为内存读取速度的问题吗
+
+---
+
+_**Assistant**_
+
+
+
+
+
+是的，这个问题主要有几个原因：
+
+1. CPU-GPU 数据传输瓶颈：
+- 模型参数需要从 CPU 内存传输到 GPU
+- 当前配置中大部分参数在 CPU 内存中（138GB CPU vs 12GB GPU）
+- PCIe 带宽限制了传输速度
+
+2. 内存访问模式：
+- 模型参数分散在 CPU 和 GPU 中
+- 需要频繁在 CPU 和 GPU 之间交换数据
+- 这种交换会导致 GPU 等待数据到达
+
+让我们尝试优化这个问题：
+
+```python:ktransformers/worker.py
+def load_model(self, model_path: str, gguf_path: str):
+    logger.info("Loading tokenizer...")
+    self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    
+    logger.info("Loading model config...")
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    torch.set_default_dtype(config.torch_dtype)
+    
+    logger.info("Loading model...")
+    # 优化内存分配策略
+    max_memory = {
+        0: "12GiB",  # GPU 显存
+        'cpu': "138GiB",  # CPU 内存
+    }
+    
+    # 计算每层的参数大小
+    num_layers = config.num_hidden_layers
+    hidden_size = config.hidden_size
+    layer_size = hidden_size * hidden_size * 4 * 2 / (1024**3)  # 每层大约的 GB 大小
+    logger.info(f"Estimated layer size: {layer_size:.2f}GB")
+    
+    # 设置更激进的优化选项
+    self.model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        config=config,
+        trust_remote_code=True,
+        device_map="auto",
+        max_memory=max_memory,
+        torch_dtype=torch.float16,
+        offload_folder=None,
+        offload_state_dict=False,
+        low_cpu_mem_usage=True,  # 减少 CPU 内存使用
+        preload_modules=['self_attn'],  # 预加载注意力模块
+        use_cache=True  # 启用 KV 缓存
+    )
+    
+    # 尝试预热一些关键层
+    logger.info("Warming up key layers...")
+    with torch.no_grad():
+        dummy_input = torch.zeros((1, 32), dtype=torch.long, device='cuda')
+        self.model(dummy_input)
+    
+    self.model.eval()
+    # ... 其余代码保持不变 ...
+```
+
+
+同时在 generate 方法中添加批处理优化：
+
+```python:ktrans
+
+---
+
+_**User**_
+
+把CPU核心数设置为10个核心
+
+---
+
+_**Assistant**_
+
+
 
 ---
 

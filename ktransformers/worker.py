@@ -38,6 +38,10 @@ class ModelWorker:
         self.socket.setsockopt(zmq.RCVHWM, 0)
         self.socket.setsockopt(zmq.SNDHWM, 0)
         
+        # 设置 CPU 核心数
+        torch.set_num_threads(10)  # 限制为10个核心
+        logger.info(f"Set PyTorch CPU threads to 10")
+        
         self.model = None
         self.tokenizer = None
         logger.info(f"Worker started at {address}, listening on all interfaces")
@@ -49,6 +53,9 @@ class ModelWorker:
         logger.info("Loading model config...")
         config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         torch.set_default_dtype(config.torch_dtype)
+        
+        # 再次确认 CPU 线程数
+        logger.info(f"Current PyTorch CPU threads: {torch.get_num_threads()}")
         
         logger.info("Loading model...")
         # 设置最大显存使用量和内存使用量

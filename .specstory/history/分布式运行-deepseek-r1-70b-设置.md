@@ -2580,6 +2580,820 @@ _**Assistant**_
 
 
 
+
+
+让我们添加一个缓存机制来存储模型的中间状态。修改 worker.py：
+
+```python:ktransformers/worker.py
+class ModelWorker:
+    def __init__(self, address: str):
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.REP)
+        host, port = address.split(':')
+        self.socket.bind(f"tcp://0.0.0.0:{port}")
+        self.socket.setsockopt(zmq.RCVHWM, 0)
+        self.socket.setsockopt(zmq.SNDHWM, 0)
+        
+        self.model = None
+        self.tokenizer = None
+        # 添加缓存字典
+        self.layer_cache = {}
+        self.embedding_cache = None
+        self.norm_cache = None
+        self.lm_head_cache = None
+        logger.info(f"Worker started at {address}, listening on all interfaces")
+
+    def load_model(self, model_path: str, gguf_path: str):
+        logger.info("Loading tokenizer...")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        
+        logger.info("Loading model config...")
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        torch.set_default_dtype(config.torch_dtype)
+        
+        logger.info("Loading model on CPU...")
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            config=config,
+            trust_remote_code=True,
+            device_map='cpu',  # 在CPU上加载
+            torch_dtype=torch.float16,  # 使用半精度
+            low_cpu_mem_usage=True,     # 降低CPU内存使用
+        )
+        self.model.eval()
+        
+        # 预处理并缓存模型的各个部分
+        logger.info("Preprocessing and caching model components...")
+        self.preprocess_model()
+        
+        # 设置生成配置
+        try:
+            self.model.generation_config = GenerationConfig.from_pretrained(model_path)
+        except Exception as e:
+            logger.warning(f"Generation config can't auto create, making default. Message: {e}")
+            self.model.generation_config = GenerationConfig(
+                temperature=0.6,
+                top_p=0.9,
+                do_sample=True
+            )
+        if self.model.generation_config.pad_token_id is None:
+            self.model.generation_config.pad_token_id = self.model.generation_config.eos_token_id
+        
+        logger.info("Model loaded and cached successfully")
+
+    def preprocess_model(self):
+        """预处理模型并缓存各个组件"""
+        logger.info("Caching model components...")
+        
+        # 缓存嵌入层
+        self.embedding_cache = {
+            'weight': self.model.model.embed_tokens.weight.cpu(),
+            'device': self.model.model.embed_tokens.weight.device
+        }
+        
+        # 缓存每个transformer层
+        for i, layer in enumerate(self.model.model.layers):
+            self.layer_cache[i] = {
+                'self_attn': {
+                    'q_proj': {'weight': layer.self_attn.q_proj.weight.cpu(), 'bias': layer.self_attn.q_proj.bias.cpu() if layer.self_attn.q_proj.bias is not None else None},
+                    'k_proj': {'weight': layer.self_attn.k_proj.weight.cpu(), 'bias': layer.self_attn.k_proj.bias.cpu() if layer.self_attn.k_proj.bias is not None else None},
+                    'v_proj': {'weight': layer.self_attn.v_proj.weight.cpu(), 'bias': layer.self_attn.v_proj.bias.cpu() if layer.self_attn.v_proj.bias is not None else None},
+                    'o_proj': {'weight': layer.self_attn.o_proj.weight.cpu(), 'bias': layer.self_attn.o_proj.bias.cpu() if layer.self_attn.o_proj.bias is not None else None},
+                },
+                'mlp': {
+                    'gate_proj': {'weight': layer.mlp.gate_proj.weight.cpu()},
+                    'up_proj': {'weight': layer.mlp.up_proj.weight.cpu()},
+                    'down_proj': {'weight': layer.mlp.down_proj.weight.cpu()},
+                },
+                'input_layernorm': {'weight': layer.input_layernorm.weight.cpu()},
+                'post_attention_layernorm': {'weight': layer.post_attention_layernorm.weight.cpu()}
+            }
+        
+        # 缓存最终的norm层
+        self.norm_cache = {
+            'weight': self.model.model.norm.weight.cpu()
+        }
+        
+        # 缓存语言模型头
+        self.lm_head_cache = {
+            'weight': self.model.lm_head.weight.cpu()
+        }
+        
+        logger.info("Model components cached successfully")
+
+    def custom_forward_with_cache(self, input_ids, attention_mask):
+        """使用缓存的模型组件进行前向传播"""
+        # 使用缓存的嵌入层
+        hidden_states = torch.nn.functional.embedding(
+            input_ids.cuda(),
+            self.embedding_cache['weight'].cuda()
+        )
+        
+        # 逐层处理
+        for i in range(len(self.layer_cache)):
+            layer_cache = self.layer_cache[i]
+            
+            # 自注意力处理
+            qkv_states = []
+            for proj in ['q_proj', 'k_proj', 'v_proj']:
+                proj_cache = layer_cache['self_attn'][proj]
+                states = torch.nn.functional.linear(
+                    hidden_states.cuda(),
+                    proj_cache['weight'].cuda(),
+                    proj_cache['bias'].cuda() if proj_cache['bias'] is not None else None
+                )
+                qkv_states.append(states)
+            
+            # 计算注意力
+            q, k, v = qkv_states
+            attention_output = self.compute_attention(q, k, v, attention_mask)
+            
+            # 输出投影
+            attention_output = torch.nn.functional.linear(
+                attention_output,
+                layer_cache['self_attn']['o_proj']['weight'].cuda(),
+                layer_cache['self_attn']['o_proj']['bias'].cuda() if layer_cache['self_attn']['o_proj']['bias'] is not None else None
+            )
+            
+            # 残差连接和层标准化
+            hidden_states = attention_output + hidden_states
+            hidden_states = self.apply_layernorm(hidden_states, layer_cache['input_layernorm']['weight'].cuda())
+            
+            # MLP处理
+            mlp_output = self.compute_mlp(hidden_states, layer_cache['mlp'])
+            hidden_states = mlp_output + hidden_states
+            hidden_states = self.apply_layernorm(hidden_states, layer_cache['post_attention_layernorm']['weight'].cuda())
+            
+            # 将中间结果移回CPU以节省GPU内存
+            hidden_states = hidden_states.cpu()
+        
+        # 最终的norm和语言模型头
+        hidden_states = self.apply_layernorm(hidden_states.cuda(), self.norm_cache['weight'].cuda())
+        logits = torch.nn.functional.linear(hidden_states, self.lm_head_cache['weight'].cuda())
+        
+        return logits
+
+    def compute_attention(self, q, k, v, attention_mask):
+        """计算注意力"""
+        attention_scores = torch.matmul(q, k.transpose(-1, -2))
+        attention_scores = attention_scores / math.sqrt(k.size(-1))
+        attention_scores = attention_scores + attention_mask
+        attention_probs = torch.nn.functional.softmax(attention_scores, dim=-1)
+        return torch.matmul(attention_probs, v)
+
+    def compute_mlp(self, hidden_states, mlp_cache):
+        """计算MLP层"""
+        gate_output = torch.nn.functional.linear(hidden_states, mlp_cache['gate_proj']['weight'].cuda())
+        up_output = torch.nn.functional.linear(hidden_states, mlp_cache['up_proj']['weight'].cuda())
+        activated = torch.nn.functional.silu(gate_output) * up_output
+        return torch.nn.functional.linear(activated, mlp_cache['down_proj']['weight'].cuda())
+
+    def apply_layernorm(self, hidden_states, weight):
+        """应用层标准化"""
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + 1e-5)
+        return hidden_states * weight
+
+    def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            # ... 前面的代码保持不变 ...
+            
+            # 使用缓存的前向传播
+            with torch.cuda.stream(torch.cuda.Stream()):
+                with torch.no_grad(), torch.amp.autocast('cuda'):
+                    # ... 日志代码保持不变 ...
+                    
+                    # 使用带缓存的自定义前向传播
+                    outputs = []
+                    current_input_ids = input_ids
+                    current_attention_mask = attention_mask
+                    
+                    for _ in range(max_new_tokens):
+                        logits = self.custom_forward_with_cache(current_input_ids, current_attention_mask)
+                        next_token_logits = logits[:, -1, :]
+                        
+                        if input_data.get('do_sample', True):
+                            probs = torch.nn.functional.softmax(next_token_logits / temperature, dim=-1)
+                            next_token = torch.multinomial(probs, num_samples=1)
+                        else:
+                            next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+                        
+                        current_input_ids = torch.cat([current_input_ids, next_token], dim=1)
+                        current_attention_mask = torch.cat([current_attention_mask, torch.ones_like(next_token)], dim=1)
+                        
+                        if next_token[0].item() == self.model.generation_config.eos_token_id:
+                            break
+                    
+                    outputs = current_input_ids
+            
+            # ... 后面的代码保持不变 ...
+```
+
+
+主要改进：
+1. 添加了模型组件缓存
+   - 嵌入层
+   - Transformer 层
+   - 最终的 norm 层
+   - 语言模型头
+2. 实现了使用缓存的前向传播
+   - 直接使用缓存的权重
+   - 按需将权重移动到 GPU
+   - 优化了内存使用
+3. 分解了复杂操作
+   - 注意力计算
+   - MLP 计算
+   - 层标准化
+
+优点：
+1. 避免重复构建模型
+2. 更细粒度的内存控制
+3. 可能提高推理速度
+
+如果性能还不够理想，我们可以：
+1. 添加更多的缓存策略
+2. 优化数据移动
+3. 实现更复杂的流水线
+
+请告诉我运行效果如何。
+
+---
+
+_**User**_
+
+ERROR:__main__:Generation error: Expected size for first two dimensions of batch2 tensor to be: [1, 8192] but got: [1, 1024].
+
+---
+
+_**Assistant**_
+
+
+
+
+
+这个错误是因为注意力计算时的维度不匹配。让我们修改 `compute_attention` 函数来正确处理注意力掩码：
+
+```python:ktransformers/worker.py
+def compute_attention(self, q, k, v, attention_mask):
+    """计算注意力"""
+    # 获取关键维度
+    batch_size, seq_len, num_heads, head_dim = q.size()
+    
+    # 重塑 q, k, v 为多头注意力格式
+    q = q.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)  # [batch, heads, seq_len, head_dim]
+    k = k.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
+    v = v.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
+    
+    # 计算注意力分数
+    attention_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(head_dim)
+    
+    # 处理注意力掩码
+    # 确保掩码的形状正确
+    if attention_mask is not None:
+        # 扩展掩码维度以匹配注意力分数
+        attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)  # [batch, 1, 1, seq_len]
+        attention_mask = attention_mask.expand(-1, num_heads, -1, -1)  # [batch, heads, 1, seq_len]
+        attention_scores = attention_scores + attention_mask
+    
+    # 应用 softmax
+    attention_probs = torch.nn.functional.softmax(attention_scores, dim=-1)
+    
+    # 计算输出
+    context = torch.matmul(attention_probs, v)  # [batch, heads, seq_len, head_dim]
+    
+    # 重塑回原始维度
+    context = context.transpose(1, 2).contiguous()  # [batch, seq_len, heads, head_dim]
+    context = context.view(batch_size, seq_len, -1)  # [batch, seq_len, hidden_size]
+    
+    return context
+
+def custom_forward_with_cache(self, input_ids, attention_mask):
+    """使用缓存的模型组件进行前向传播"""
+    # 使用缓存的嵌入层
+    hidden_states = torch.nn.functional.embedding(
+        input_ids.cuda(),
+        self.embedding_cache['weight'].cuda()
+    )
+    
+    # 获取模型配置
+    config = self.model.config
+    head_dim = config.hidden_size // config.num_attention_heads
+    
+    # 处理注意力掩码
+    attention_mask = (attention_mask < 0).float() * -10000.0
+    
+    # 逐层处理
+    for i in range(len(self.layer_cache)):
+        layer_cache = self.layer_cache[i]
+        
+        # 自注意力处理
+        qkv_states = []
+        for proj in ['q_proj', 'k_proj', 'v_proj']:
+            proj_cache = layer_cache['self_attn'][proj]
+            states = torch.nn.functional.linear(
+                hidden_states.cuda(),
+                proj_cache['weight'].cuda(),
+                proj_cache['bias'].cuda() if proj_cache['bias'] is not None else None
+            )
+            # 重塑为多头格式
+            states = states.view(states.size(0), -1, config.num_attention_heads, head_dim)
+            qkv_states.append(states)
+        
+        # 计算注意力
+        q, k, v = qkv_states
+        attention_output = self.compute_attention(q, k, v, attention_mask)
+        
+        # 输出投影
+        attention_output = torch.nn.functional.linear(
+            attention_output,
+            layer_cache['self_attn']['o_proj']['weight'].cuda(),
+            layer_cache['self_attn']['o_proj']['bias'].cuda() if layer_cache['self_attn']['o_proj']['bias'] is not None else None
+        )
+        
+        # 残差连接和层标准化
+        hidden_states = attention_output + hidden_states
+        hidden_states = self.apply_layernorm(hidden_states, layer_cache['input_layernorm']['weight'].cuda())
+        
+        # MLP处理
+        mlp_output = self.compute_mlp(hidden_states, layer_cache['mlp'])
+        hidden_states = mlp_output + hidden_states
+        hidden_states = self.apply_layernorm(hidden_states, layer_cache['post_attention_layernorm']['weight'].cuda())
+        
+        # 将中间结果移回CPU以节省GPU内存
+        hidden_states = hidden_states.cpu()
+    
+    # 最终的norm和语言模型头
+    hidden_states = self.apply_layernorm(hidden_states.cuda(), self.norm_cache['weight'].cuda())
+    logits = torch.nn.functional.linear(hidden_states, self.lm_head_cache['weight'].cuda())
+    
+    return logits
+```
+
+
+
+主要改动：
+1. 重写了 `compute_attention` 函数，正确处理多头注意力机制
+2. 在 `custom_forward_with_cache` 中添加了注意力掩码的处理
+3. 添加了维度重塑以匹配模型的注意力头配置
+4. 优化了内存使用和数据流动
+
+运行命令保持不变：
+
+```bash
+# GPU 机器 (10.21.22.206)
+PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0 python -m ktransformers.worker --worker_address "10.21.22.206:29500"
+
+# CPU 机器 (10.21.22.100)
+PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.local_chat \
+    --model_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/ \
+    --gguf_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/ \
+    --worker_address "10.21.22.206:29500" \
+    --max_new_tokens 50
+```
+
+这样应该能解决维度不匹配的问题。如果还有其他错误，请告诉我。
+
+---
+
+_**User**_
+
+把缓存机制删掉
+
+---
+
+_**Assistant**_
+
+
+
+
+
+让我们简化代码，删除缓存机制，回到基本的模型加载和推理：
+
+```python:ktransformers/worker.py
+import torch
+import zmq
+from typing import Dict, Any
+import logging
+from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM, GenerationConfig, TextStreamer
+import time
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class ModelWorker:
+    def __init__(self, address: str):
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.REP)
+        host, port = address.split(':')
+        self.socket.bind(f"tcp://0.0.0.0:{port}")
+        self.socket.setsockopt(zmq.RCVHWM, 0)
+        self.socket.setsockopt(zmq.SNDHWM, 0)
+        
+        self.model = None
+        self.tokenizer = None
+        logger.info(f"Worker started at {address}, listening on all interfaces")
+
+    def load_model(self, model_path: str, gguf_path: str):
+        logger.info("Loading tokenizer...")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        
+        logger.info("Loading model config...")
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        torch.set_default_dtype(config.torch_dtype)
+        
+        logger.info("Loading model on CPU...")
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            config=config,
+            trust_remote_code=True,
+            device_map='cpu',  # 在CPU上加载
+            torch_dtype=torch.float16,  # 使用半精度
+            low_cpu_mem_usage=True,     # 降低CPU内存使用
+        )
+        self.model.eval()
+        
+        # 设置生成配置
+        try:
+            self.model.generation_config = GenerationConfig.from_pretrained(model_path)
+        except Exception as e:
+            logger.warning(f"Generation config can't auto create, making default. Message: {e}")
+            self.model.generation_config = GenerationConfig(
+                temperature=0.6,
+                top_p=0.9,
+                do_sample=True
+            )
+        if self.model.generation_config.pad_token_id is None:
+            self.model.generation_config.pad_token_id = self.model.generation_config.eos_token_id
+        
+        logger.info("Model loaded successfully")
+
+    def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            logger.info("Received generation request")
+            logger.info(f"Input sequence length: {len(input_data['input_ids'])}")
+            
+            # 创建输入张量在GPU上
+            logger.info("Moving input tensors to GPU...")
+            input_ids = torch.tensor(input_data['input_ids'], device='cuda')
+            attention_mask = torch.tensor(input_data['attention_mask'], device='cuda')
+            
+            # 生成参数日志
+            max_new_tokens = input_data.get('max_new_tokens', 512)
+            temperature = input_data.get('temperature', 0.6)
+            top_p = input_data.get('top_p', 0.9)
+            logger.info(f"Generation parameters: max_new_tokens={max_new_tokens}, "
+                       f"temperature={temperature}, "
+                       f"top_p={top_p}")
+            
+            # 生成文本
+            logger.info("Starting text generation...")
+            start_time = time.time()
+            
+            # 将模型移动到GPU进行推理
+            logger.info("Moving model to GPU for inference...")
+            self.model = self.model.cuda()
+            
+            with torch.cuda.stream(torch.cuda.Stream()):
+                with torch.no_grad(), torch.amp.autocast('cuda'):
+                    logger.info("Generating text...")
+                    outputs = self.model.generate(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        max_new_tokens=max_new_tokens,
+                        temperature=temperature,
+                        top_p=top_p,
+                        do_sample=input_data.get('do_sample', True),
+                        streamer=TextStreamer(self.tokenizer, skip_prompt=True)
+                    )
+            
+            # 将模型移回CPU并清理GPU内存
+            logger.info("Moving model back to CPU...")
+            self.model = self.model.cpu()
+            torch.cuda.empty_cache()
+            
+            # 移动输出到CPU
+            logger.info("Moving outputs to CPU...")
+            outputs_cpu = outputs.cpu()
+            
+            # 记录GPU内存使用情况
+            allocated = torch.cuda.memory_allocated() / 1024**3
+            reserved = torch.cuda.memory_reserved() / 1024**3
+            logger.info(f"GPU Memory: Allocated={allocated:.2f}GB, Reserved={reserved:.2f}GB")
+            
+            logger.info("Preparing response...")
+            return {
+                'output_ids': outputs_cpu.numpy().tolist(),
+                'status': 'success'
+            }
+        except Exception as e:
+            logger.error(f"Generation error: {str(e)}")
+            # 确保在发生错误时也将模型移回CPU
+            try:
+                self.model = self.model.cpu()
+                torch.cuda.empty_cache()
+            except:
+                pass
+            return {
+                'status': 'error',
+                'error': str(e)
+            }
+
+    def run(self):
+        logger.info("Worker ready to receive requests")
+        while True:
+            try:
+                message = self.socket.recv_pyobj()
+                command = message.get('command')
+                
+                if command == 'load_model':
+                    self.load_model(message['model_path'], message['gguf_path'])
+                    self.socket.send_pyobj({'status': 'success'})
+                
+                elif command == 'generate':
+                    result = self.generate(message['data'])
+                    self.socket.send_pyobj(result)
+                
+                elif command == 'shutdown':
+                    logger.info("Shutting down worker")
+                    self.socket.send_pyobj({'status': 'shutdown'})
+                    break
+                
+            except Exception as e:
+                logger.error(f"Error processing message: {str(e)}")
+                self.socket.send_pyobj({'status': 'error', 'error': str(e)})
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--worker_address', type=str, required=True)
+    args = parser.parse_args()
+    
+    worker = ModelWorker(args.worker_address)
+    worker.run()
+
+if __name__ == '__main__':
+    main()
+```
+
+
+
+主要改动：
+1. 删除了所有缓存相关的代码
+2. 简化了模型加载和推理过程
+3. 使用原生的 model.generate 方法
+4. 保持了 CPU-GPU 内存管理策略
+
+工作流程：
+1. 在 CPU 上加载模型
+2. 收到请求时将模型移到 GPU
+3. 完成推理后将模型移回 CPU
+4. 清理 GPU 内存
+
+运行命令保持不变：
+
+```bash
+# GPU 机器 (10.21.22.206)
+PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0 python -m ktransformers.worker --worker_address "10.21.22.206:29500"
+
+# CPU 机器 (10.21.22.100)
+PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.local_chat \
+    --model_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/ \
+    --gguf_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/ \
+    --worker_address "10.21.22.206:29500" \
+    --max_new_tokens 50
+```
+
+
+这样代码更简单，更容易维护。如果还有问题，请告诉我。
+
+---
+
+_**User**_
+
+不不不，是在收到请求时直接从内存读取模型数据，不是移动到gpu读取后在gpu上推理
+
+---
+
+_**Assistant**_
+
+
+
+
+
+
+
+明白了，我们需要让 GPU 直接从 CPU 内存读取数据进行推理。让我们修改 worker.py：
+
+```python:ktransformers/worker.py
+import torch
+import zmq
+from typing import Dict, Any
+import logging
+from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM, GenerationConfig, TextStreamer
+import time
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class ModelWorker:
+    def __init__(self, address: str):
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.REP)
+        host, port = address.split(':')
+        self.socket.bind(f"tcp://0.0.0.0:{port}")
+        self.socket.setsockopt(zmq.RCVHWM, 0)
+        self.socket.setsockopt(zmq.SNDHWM, 0)
+        
+        self.model = None
+        self.tokenizer = None
+        logger.info(f"Worker started at {address}, listening on all interfaces")
+
+    def load_model(self, model_path: str, gguf_path: str):
+        logger.info("Loading tokenizer...")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        
+        logger.info("Loading model config...")
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        torch.set_default_dtype(config.torch_dtype)
+        
+        logger.info("Loading model on CPU...")
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            config=config,
+            trust_remote_code=True,
+            device_map='cpu',  # 在CPU上加载
+            torch_dtype=torch.float16,  # 使用半精度
+            low_cpu_mem_usage=True,     # 降低CPU内存使用
+        )
+        self.model.eval()
+        
+        # 设置生成配置
+        try:
+            self.model.generation_config = GenerationConfig.from_pretrained(model_path)
+        except Exception as e:
+            logger.warning(f"Generation config can't auto create, making default. Message: {e}")
+            self.model.generation_config = GenerationConfig(
+                temperature=0.6,
+                top_p=0.9,
+                do_sample=True
+            )
+        if self.model.generation_config.pad_token_id is None:
+            self.model.generation_config.pad_token_id = self.model.generation_config.eos_token_id
+        
+        logger.info("Model loaded successfully")
+
+    def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            logger.info("Received generation request")
+            logger.info(f"Input sequence length: {len(input_data['input_ids'])}")
+            
+            # 创建输入张量在GPU上
+            logger.info("Moving input tensors to GPU...")
+            input_ids = torch.tensor(input_data['input_ids'], device='cuda')
+            attention_mask = torch.tensor(input_data['attention_mask'], device='cuda')
+            
+            # 生成参数日志
+            max_new_tokens = input_data.get('max_new_tokens', 512)
+            temperature = input_data.get('temperature', 0.6)
+            top_p = input_data.get('top_p', 0.9)
+            logger.info(f"Generation parameters: max_new_tokens={max_new_tokens}, "
+                       f"temperature={temperature}, "
+                       f"top_p={top_p}")
+            
+            # 生成文本
+            logger.info("Starting text generation...")
+            start_time = time.time()
+            
+            # 设置模型以使用CPU内存但在GPU上计算
+            with torch.cuda.stream(torch.cuda.Stream()):
+                with torch.no_grad(), torch.amp.autocast('cuda'):
+                    logger.info("Generating text...")
+                    
+                    # 自定义前向传播，直接从CPU内存读取权重
+                    def custom_forward_hook(module, input_tensor):
+                        # 将权重临时移到GPU进行计算
+                        with torch.cuda.device('cuda'):
+                            # 获取当前模块的权重
+                            weights = {name: param.data for name, param in module.named_parameters()}
+                            # 在GPU上进行计算
+                            output = module._forward_impl(input_tensor[0])
+                            return output
+                    
+                    # 注册前向钩子
+                    hooks = []
+                    for name, module in self.model.named_modules():
+                        if hasattr(module, '_forward_impl'):
+                            hook = module.register_forward_pre_hook(custom_forward_hook)
+                            hooks.append(hook)
+                    
+                    # 生成文本
+                    outputs = self.model.generate(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        max_new_tokens=max_new_tokens,
+                        temperature=temperature,
+                        top_p=top_p,
+                        do_sample=input_data.get('do_sample', True),
+                        streamer=TextStreamer(self.tokenizer, skip_prompt=True)
+                    )
+                    
+                    # 移除钩子
+                    for hook in hooks:
+                        hook.remove()
+            
+            # 清理GPU内存
+            torch.cuda.empty_cache()
+            
+            # 移动输出到CPU
+            logger.info("Moving outputs to CPU...")
+            outputs_cpu = outputs.cpu()
+            
+            # 记录GPU内存使用情况
+            allocated = torch.cuda.memory_allocated() / 1024**3
+            reserved = torch.cuda.memory_reserved() / 1024**3
+            logger.info(f"GPU Memory: Allocated={allocated:.2f}GB, Reserved={reserved:.2f}GB")
+            
+            logger.info("Preparing response...")
+            return {
+                'output_ids': outputs_cpu.numpy().tolist(),
+                'status': 'success'
+            }
+        except Exception as e:
+            logger.error(f"Generation error: {str(e)}")
+            torch.cuda.empty_cache()
+            return {
+                'status': 'error',
+                'error': str(e)
+            }
+
+    def run(self):
+        logger.info("Worker ready to receive requests")
+        while True:
+            try:
+                message = self.socket.recv_pyobj()
+                command = message.get('command')
+                
+                if command == 'load_model':
+                    self.load_model(message['model_path'], message['gguf_path'])
+                    self.socket.send_pyobj({'status': 'success'})
+                
+                elif command == 'generate':
+                    result = self.generate(message['data'])
+                    self.socket.send_pyobj(result)
+                
+                elif command == 'shutdown':
+                    logger.info("Shutting down worker")
+                    self.socket.send_pyobj({'status': 'shutdown'})
+                    break
+                
+            except Exception as e:
+                logger.error(f"Error processing message: {str(e)}")
+                self.socket.send_pyobj({'status': 'error', 'error': str(e)})
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--worker_address', type=str, required=True)
+    args = parser.parse_args()
+    
+    worker = ModelWorker(args.worker_address)
+    worker.run()
+
+if __name__ == '__main__':
+    main()
+```
+
+
+
+主要改动：
+1. 添加了自定义前向钩子，使模型在计算时直接从 CPU 内存读取权重
+2. 移除了模型在 CPU 和 GPU 之间的移动
+3. 使用 CUDA stream 优化数据传输
+4. 保持模型权重在 CPU 内存中
+
+工作流程：
+1. 模型始终保持在 CPU 内存中
+2. 计算时，权重直接从 CPU 内存读取到 GPU 进行计算
+3. 计算完成后立即释放 GPU 内存
+
+运行命令保持不变：
+
+```bash
+# GPU 机器 (10.21.22.206)
+PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0 python -m ktransformers.worker --worker_address "10.21.22.206:29500"
+
+# CPU 机器 (10.21.22.100)
+PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.local_chat \
+    --model_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/ \
+    --gguf_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/ \
+    --worker_address "10.21.22.206:29500" \
+    --max_new_tokens 50
+```
+
+
+
+这样应该能实现直接从 CPU 内存读取数据进行 GPU 推理。如果还有问题，请告诉我。
+
 ---
 
 

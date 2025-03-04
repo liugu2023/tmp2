@@ -4629,13 +4629,250 @@ def load_model(self, model_path: str, gguf_path: str):
 
 _**User**_
 
-允许将模型卸载到磁盘上
+ERROR:__main__:Error in generate: Generation failed: The following `model_kwargs` are not used by the model: ['use_attention_mask'] (note: typos in the generate arguments will also show up in this list)
+ERROR:__main__:Error: Generation failed: The following `model_kwargs` are not used by the model: ['use_attention_mask'] (note: typos in the generate arguments will also show up in this list)
+INFO:__main__:Sending shutdown command to worker...
 
 ---
 
 _**Assistant**_
 
 
+
+
+
+
+
+
+
+
+
+
+
+让我们移除不支持的 `use_attention_mask` 参数。修改 worker.py 中的 generate 方法：
+
+```python:ktransformers/worker.py
+def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        # ... 其他代码保持不变 ...
+        
+        with torch.no_grad(), torch.amp.autocast('cuda'):
+            outputs = self.model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                do_sample=input_data.get('do_sample', True),
+                streamer=streamer,
+                use_cache=True,
+                num_beams=1,
+                synced_gpus=False,
+                # 添加其他可用的优化参数
+                repetition_penalty=1.0,
+                length_penalty=1.0,
+                early_stopping=True,
+                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=self.tokenizer.eos_token_id
+            )
+```
+
+
+
+
+
+主要改动：
+1. 移除了不支持的 `use_attention_mask` 参数
+2. 保留其他有效的生成参数
+
+这样应该能正常工作了。如果还有其他错误，请告诉我。
+
+---
+
+_**User**_
+
+/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/generation/configuration_utils.py:615: UserWarning: `num_beams` is set to 1. However, `early_stopping` is set to `True` -- this flag is only used in beam-based generation modes. You should set `num_beams>1` or unset `early_stopping`.
+  warnings.warn(
+
+---
+
+_**Assistant**_
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+让我们修正生成参数，移除不适用的 early_stopping 参数：
+
+```python:ktransformers/worker.py
+def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        # ... 其他代码保持不变 ...
+        
+        with torch.no_grad(), torch.amp.autocast('cuda'):
+            outputs = self.model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                do_sample=input_data.get('do_sample', True),
+                streamer=streamer,
+                use_cache=True,
+                num_beams=1,
+                synced_gpus=False,
+                # 优化参数
+                repetition_penalty=1.0,
+                length_penalty=1.0,
+                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=self.tokenizer.eos_token_id
+            )
+```
+
+
+
+
+
+
+主要改动：
+1. 移除了 `early_stopping` 参数，因为它只在 beam search（num_beams > 1）时有效
+2. 保留其他有效的生成参数
+
+这样应该不会再有警告了。如果还有其他问题，请告诉我。
+
+---
+
+_**User**_
+
+你说我们能不能在每个核心上都进行推理，并行12个进程推理呢
+
+---
+
+_**Assistant**_
+
+
+
+
+
+
+
+
+
+
+
+
+
+我们可以使用多进程来并行推理。让我们修改代码来支持这个功能：
+
+```python:ktransformers/worker.py
+import multiprocessing
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+class ModelWorker:
+    def __init__(self, address: str):
+        # ... 其他初始化代码保持不变 ...
+        self.num_processes = 12  # 使用12个进程
+        self.process_pool = None
+        self.generation_queue = multiprocessing.Queue()
+        self.result_queue = multiprocessing.Queue()
+
+    def generate_single(self, input_data: Dict[str, Any], process_id: int) -> Dict[str, Any]:
+        try:
+            logger.info(f"Process {process_id}: Starting generation...")
+            
+            # 设置当前进程使用的 GPU
+            gpu_id = process_id % 2  # 在两个 GPU 之间分配
+            torch.cuda.set_device(f'cuda:{gpu_id}')
+            
+            input_ids = torch.tensor(input_data['input_ids'], device=f'cuda:{gpu_id}')
+            attention_mask = torch.tensor(input_data['attention_mask'], device=f'cuda:{gpu_id}')
+            
+            with torch.no_grad(), torch.amp.autocast('cuda'):
+                outputs = self.model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    max_new_tokens=input_data.get('max_new_tokens', 512),
+                    temperature=input_data.get('temperature', 0.6),
+                    top_p=input_data.get('top_p', 0.9),
+                    do_sample=input_data.get('do_sample', True),
+                    streamer=None,  # 并行模式下暂时不使用 streamer
+                    use_cache=True,
+                    num_beams=1,
+                    synced_gpus=False,
+                    repetition_penalty=1.0,
+                    length_penalty=1.0,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id
+                )
+            
+            return {
+                'process_id': process_id,
+                'status': 'success',
+                'output_ids': outputs.cpu().numpy().tolist()
+            }
+        except Exception as e:
+            logger.error(f"Process {process_id} error: {str(e)}")
+            return {
+                'process_id': process_id,
+                'status': 'error',
+                'error': str(e)
+            }
+
+    def generate_parallel(self, input_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """并行生成多个结果"""
+        start_time = time.time()
+        results = []
+        
+        # 创建线程池
+        with ThreadPoolExecutor(max_workers=self.num_processes) as executor:
+            # 提交所有任务
+            future_to_id = {
+                executor.submit(self.generate_single, input_data, i): i 
+                for i in range(self.num_processes)
+            }
+            
+            # 收集结果
+            for future in as_completed(future_to_id):
+                process_id = future_to_id[future]
+                try:
+                    result = future.result()
+                    results.append(result)
+                    logger.info(f"Process {process_id} completed")
+                except Exception as e:
+                    logger.error(f"Process {process_id} failed: {str(e)}")
+        
+        end_time = time.time()
+        total_time = end_time - start_time
+        logger.info(f"All processes completed in {total_time:.2f} seconds")
+        
+        return results
+
+    def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            logger.info("Starting parallel generation...")
+            results = self.generate_parallel(input_data)
+            
+            # 统计成功的生成结果
+            successful_results = [r for r in results if r['status'] == 'success']
+            if not successful_results:
+                raise Exception("No successful generations")
+            
+            # 计算统计信息
+            total_tokens = sum(len(r['output_ids'][0]) for r in successful_results)
+            avg_tokens = total_tokens / len(successful_results)
+            
+            logger.info(f"Parallel generation completed:")
+            logger.info(f"
 
 ---
 

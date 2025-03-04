@@ -1,11 +1,13 @@
 import torch
 import zmq
 import pickle
-from typing import Dict, Any
+from typing import Dict, Any, List
 import logging
 from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM, GenerationConfig, TextStreamer
 import time
 import os
+import multiprocessing
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -40,6 +42,10 @@ class ModelWorker:
         
         self.model = None
         self.tokenizer = None
+        self.num_processes = 12  # 使用12个进程
+        self.process_pool = None
+        self.generation_queue = multiprocessing.Queue()
+        self.result_queue = multiprocessing.Queue()
         logger.info(f"Worker started at {address}, listening on all interfaces")
 
     def load_model(self, model_path: str, gguf_path: str):
@@ -160,98 +166,101 @@ class ModelWorker:
             if self.on_text_chunk:
                 self.on_text_chunk(text, stream_end)
 
-    def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+    def generate_single(self, input_data: Dict[str, Any], process_id: int) -> Dict[str, Any]:
         try:
-            logger.info("Received generation request")
-            logger.info(f"Input sequence length: {len(input_data['input_ids'])}")
+            logger.info(f"Process {process_id}: Starting generation...")
             
-            # 创建输入张量
-            logger.info("Moving input tensors to GPU...")
-            input_ids = torch.tensor(input_data['input_ids'], device='cuda')
-            attention_mask = torch.tensor(input_data['attention_mask'], device='cuda')
+            # 设置当前进程使用的 GPU
+            gpu_id = process_id % 2  # 在两个 GPU 之间分配
+            torch.cuda.set_device(f'cuda:{gpu_id}')
             
-            # 生成参数日志
-            max_new_tokens = input_data.get('max_new_tokens', 512)
-            temperature = input_data.get('temperature', 0.6)
-            top_p = input_data.get('top_p', 0.9)
-            logger.info(f"Generation parameters: max_new_tokens={max_new_tokens}, "
-                       f"temperature={temperature}, "
-                       f"top_p={top_p}")
-            
-            # 创建自定义流式处理器
-            class StreamingHandler:
-                def __init__(self, socket, tokenizer):
-                    self.socket = socket
-                    self.tokenizer = tokenizer
-                    self.current_text = ""
-                    self.last_send_time = time.time()
-                    
-                def __call__(self, text_chunk: str, stream_end: bool = False):
-                    current_time = time.time()
-                    self.current_text += text_chunk
-                    
-                    # 每0.5秒或结束时发送一次
-                    if stream_end or (current_time - self.last_send_time) > 0.5:
-                        self.socket.send_pyobj({
-                            'status': 'streaming',
-                            'text': self.current_text,
-                            'finished': stream_end
-                        })
-                        # 等待客户端确认
-                        self.socket.recv_pyobj()
-                        self.last_send_time = current_time
-            
-            # 创建流式处理器
-            streamer = self.CustomStreamer(
-                self.tokenizer,
-                on_text_chunk=StreamingHandler(self.socket, self.tokenizer),
-                skip_prompt=True,
-                skip_special_tokens=True
-            )
-            
-            # 生成文本
-            logger.info("Starting text generation...")
-            start_time = time.time()
-            
-            # 设置生成时的线程配置
-            torch.set_grad_enabled(False)
-            torch.set_num_threads(12)  # 使用所有逻辑核心
+            input_ids = torch.tensor(input_data['input_ids'], device=f'cuda:{gpu_id}')
+            attention_mask = torch.tensor(input_data['attention_mask'], device=f'cuda:{gpu_id}')
             
             with torch.no_grad(), torch.amp.autocast('cuda'):
                 outputs = self.model.generate(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
-                    max_new_tokens=max_new_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
+                    max_new_tokens=input_data.get('max_new_tokens', 512),
+                    temperature=input_data.get('temperature', 0.6),
+                    top_p=input_data.get('top_p', 0.9),
                     do_sample=input_data.get('do_sample', True),
-                    streamer=streamer,
+                    streamer=None,  # 并行模式下暂时不使用 streamer
                     use_cache=True,
                     num_beams=1,
                     synced_gpus=False,
-                    # 添加其他可用的优化参数
                     repetition_penalty=1.0,
                     length_penalty=1.0,
-                    early_stopping=True,
                     pad_token_id=self.tokenizer.pad_token_id,
                     eos_token_id=self.tokenizer.eos_token_id
                 )
             
-            end_time = time.time()
-            generation_time = end_time - start_time
-            tokens_generated = len(outputs[0]) - len(input_ids[0])
-            tokens_per_second = tokens_generated / generation_time
-            
-            logger.info(f"Generation completed in {generation_time:.2f} seconds")
-            logger.info(f"Tokens generated: {tokens_generated}")
-            logger.info(f"Generation speed: {tokens_per_second:.2f} tokens/second")
-            logger.info(f"Final sequence length: {len(outputs[0])}")
-            
-            # 最终返回完整的 token ids
             return {
+                'process_id': process_id,
                 'status': 'success',
                 'output_ids': outputs.cpu().numpy().tolist()
             }
+        except Exception as e:
+            logger.error(f"Process {process_id} error: {str(e)}")
+            return {
+                'process_id': process_id,
+                'status': 'error',
+                'error': str(e)
+            }
+
+    def generate_parallel(self, input_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """并行生成多个结果"""
+        start_time = time.time()
+        results = []
+        
+        # 创建线程池
+        with ThreadPoolExecutor(max_workers=self.num_processes) as executor:
+            # 提交所有任务
+            future_to_id = {
+                executor.submit(self.generate_single, input_data, i): i 
+                for i in range(self.num_processes)
+            }
+            
+            # 收集结果
+            for future in as_completed(future_to_id):
+                process_id = future_to_id[future]
+                try:
+                    result = future.result()
+                    results.append(result)
+                    logger.info(f"Process {process_id} completed")
+                except Exception as e:
+                    logger.error(f"Process {process_id} failed: {str(e)}")
+        
+        end_time = time.time()
+        total_time = end_time - start_time
+        logger.info(f"All processes completed in {total_time:.2f} seconds")
+        
+        return results
+
+    def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            logger.info("Starting parallel generation...")
+            results = self.generate_parallel(input_data)
+            
+            # 统计成功的生成结果
+            successful_results = [r for r in results if r['status'] == 'success']
+            if not successful_results:
+                raise Exception("No successful generations")
+            
+            # 计算统计信息
+            total_tokens = sum(len(r['output_ids'][0]) for r in successful_results)
+            avg_tokens = total_tokens / len(successful_results)
+            
+            logger.info(f"Parallel generation completed:")
+            logger.info(f"- Successful generations: {len(successful_results)}/{self.num_processes}")
+            logger.info(f"- Average tokens per generation: {avg_tokens:.2f}")
+            
+            # 返回所有结果
+            return {
+                'status': 'success',
+                'results': results
+            }
+            
         except Exception as e:
             logger.error(f"Generation error: {str(e)}")
             return {

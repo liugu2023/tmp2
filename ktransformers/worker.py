@@ -71,11 +71,6 @@ class ModelWorker:
             'cpu': "138GiB" # 剩余放在 CPU 内存
         }
         
-        # 创建磁盘缓存目录
-        offload_dir = os.path.join(os.path.dirname(model_path), "offload_cache")
-        os.makedirs(offload_dir, exist_ok=True)
-        logger.info(f"Created offload directory: {offload_dir}")
-        
         # 设置 CPU 线程数为物理核心数
         num_physical_cores = 6
         num_threads = 12  # 总线程数
@@ -99,12 +94,6 @@ class ModelWorker:
             "device_map": "auto",
             "max_memory": max_memory,
             "low_cpu_mem_usage": True,
-            # 启用磁盘卸载
-            "offload_folder": offload_dir,
-            "offload_state_dict": True,  # 允许状态字典卸载到磁盘
-            # 设置卸载策略
-            "offload_buffers": True,  # 允许缓冲区卸载
-            "torch_dtype": torch.float16,  # 使用 FP16 来减少内存使用
         }
         
         # 设置并行环境
@@ -116,11 +105,11 @@ class ModelWorker:
             torch.backends.cudnn.allow_tf32 = True
         
         logger.info("Applying optimization configurations...")
-        logger.info("Loading model with disk offloading enabled...")
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path,
             config=config,
             trust_remote_code=True,
+            torch_dtype=torch.float16,
             **model_kwargs
         )
         
@@ -134,14 +123,12 @@ class ModelWorker:
         logger.info("Model optimization settings:")
         logger.info("- Using FP16 precision")
         logger.info("- Flash Attention 2 enabled")
-        logger.info("- Disk offloading enabled:")
-        logger.info(f"  - Offload directory: {offload_dir}")
         logger.info("- CPU threads:")
-        logger.info(f"  - Physical cores: {num_physical_cores}")
-        logger.info(f"  - Total threads: {num_threads}")
-        logger.info(f"  - PyTorch threads: {torch.get_num_threads()}")
-        logger.info(f"  - OpenMP threads: {os.environ.get('OMP_NUM_THREADS')}")
-        logger.info(f"  - MKL threads: {os.environ.get('MKL_NUM_THREADS')}")
+        logger.info(f"- Physical cores: {num_physical_cores}")
+        logger.info(f"- Total threads: {num_threads}")
+        logger.info(f"- PyTorch threads: {torch.get_num_threads()}")
+        logger.info(f"- OpenMP threads: {os.environ.get('OMP_NUM_THREADS')}")
+        logger.info(f"- MKL threads: {os.environ.get('MKL_NUM_THREADS')}")
         logger.info("- Device mapping:")
         for name, device in self.model.hf_device_map.items():
             logger.info(f"  {name}: {device}")
@@ -294,12 +281,6 @@ class ModelWorker:
                         self.socket.send_pyobj({'status': 'shutdown'})
                         # 清理资源
                         if hasattr(self, 'model'):
-                            # 清理磁盘缓存
-                            offload_dir = getattr(self.model, 'offload_folder', None)
-                            if offload_dir and os.path.exists(offload_dir):
-                                logger.info(f"Cleaning up offload directory: {offload_dir}")
-                                import shutil
-                                shutil.rmtree(offload_dir)
                             del self.model
                         if hasattr(self, 'tokenizer'):
                             del self.tokenizer

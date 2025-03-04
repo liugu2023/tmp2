@@ -6498,6 +6498,176 @@ def load_model(self, model_path: str, gguf_path: str):
 
 ---
 
+_**User**_
+
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 150, in <module>
+    main()
+    ^^^^^^
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 147, in main
+    worker.run()
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 119, in run
+    self.kv_server.load_model(
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 71, in load_model
+    device_map[f'model.layers.{i}']
+    ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^
+KeyError: 'model.layers.0'
+
+---
+
+_**Assistant**_
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+抱歉，我们需要完成 KVCacheServer 中的 load_model 方法。这里是完整的修改：
+
+```python:ktransformers/worker.py
+def load_model(self, model_path: str, gguf_path: str):
+    logger.info("Loading tokenizer...")
+    self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    
+    logger.info("Loading model config...")
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    config.attn_implementation = "flash_attention_2"
+    torch.set_default_dtype(config.torch_dtype)
+    
+    logger.info("Loading model...")
+    
+    # 计算模型层数
+    num_layers = config.num_hidden_layers  # 应该是 80 层
+    logger.info(f"Total layers: {num_layers}")
+    
+    # 调整层分配
+    cpu_front_layers = 34  # 前34层放在CPU
+    gpu_middle_layers = 12  # GPU总共处理12层(每个GPU 6层)
+    cpu_end_layers = num_layers - cpu_front_layers - gpu_middle_layers  # 剩余层放在CPU
+    
+    # 创建详细的设备映射
+    device_map = {
+        'model.embed_tokens': 'cpu',  # embedding 层放在 CPU
+        'model.norm': 'cpu',  # 最终的 norm 层放在 CPU
+        'lm_head': 'cpu',  # 输出层放在 CPU
+    }
+    
+    # 前34层放在 CPU
+    for i in range(cpu_front_layers):
+        device_map[f'model.layers.{i}'] = 'cpu'
+    
+    # 中间12层在两个 GPU 之间平衡分配（每个GPU 6层）
+    gpu_layers_per_device = gpu_middle_layers // 2  # 每个GPU 6层
+    for i in range(cpu_front_layers, cpu_front_layers + gpu_middle_layers):
+        gpu_id = (i - cpu_front_layers) // gpu_layers_per_device
+        device_map[f'model.layers.{i}'] = f'cuda:{gpu_id}'
+    
+    # 剩余层放在 CPU
+    for i in range(cpu_front_layers + gpu_middle_layers, num_layers):
+        device_map[f'model.layers.{i}'] = 'cpu'
+    
+    # 设置内存限制
+    max_memory = {
+        0: "12GiB",  # 第一个GPU分配12GB
+        1: "12GiB",  # 第二个GPU分配12GB
+        'cpu': "138GiB"  # CPU内存
+    }
+    
+    logger.info("Device mapping summary:")
+    logger.info(f"CPU front layers: 0-{cpu_front_layers-1}")
+    logger.info(f"GPU layers: {cpu_front_layers}-{cpu_front_layers+gpu_middle_layers-1}")
+    logger.info(f"CPU end layers: {cpu_front_layers+gpu_middle_layers}-{num_layers-1}")
+    
+    # 详细的设备映射日志
+    device_counts = {'cpu': 0, 'cuda:0': 0, 'cuda:1': 0}
+    for layer, device in device_map.items():
+        logger.info(f"{layer}: {device}")
+        device_counts[device] += 1
+    
+    logger.info("\nLayer distribution:")
+    for device, count in device_counts.items():
+        logger.info(f"{device}: {count} layers")
+    
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.enabled = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    
+    self.model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        config=config,
+        trust_remote_code=True,
+        torch_dtype=torch.float16,
+        device_map=device_map,
+        max_memory=max_memory,
+        low_cpu_mem_usage=True,
+    )
+    
+    # 优化 CPU 上的层
+    for name, module in self.model.named_modules():
+        if any(device == 'cpu' for layer, device in device_map.items() if layer in name):
+            # 对于 CPU 上的层，使用 float32 以提高数值稳定性
+            module.to(torch.float32)
+    
+    self.model.eval()
+    logger.info("Model loaded successfully with custom device mapping")
+```
+
+主要修复：
+1. 完成了 device_map 的赋值操作
+2. 保持了其他所有优化逻辑不变
+
+这样应该能正常工作了。如果还有其他错误，请告诉我。
+
+---
+
+_**User**_
+
+WARNING:accelerate.big_modeling:Some parameters are on the meta device because they were offloaded to the cpu.
+INFO:__main__:Worker shutdown complete
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 207, in <module>
+    main()
+    ^^^^^^
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 204, in main
+    worker.run()
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 176, in run
+    self.kv_server.load_model(
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 125, in load_model
+    module.to(torch.float32)
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1340, in to
+    return self._apply(convert)
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/torch/nn/modules/module.py", line 900, in _apply
+    module._apply(fn)
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/torch/nn/modules/module.py", line 900, in _apply
+    module._apply(fn)
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/torch/nn/modules/module.py", line 927, in _apply
+    param_applied = fn(param)
+                    ^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1326, in convert
+    return t.to(
+           ^^^^^
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 896.00 MiB. GPU 0 has a total capacity of 15.89 GiB of which 763.88 MiB is free. Including non-PyTorch memory, this process has 15.15 GiB memory in use. Of the allocated memory 13.91 GiB is allocated by PyTorch, and 641.71 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)为什么瞬间消耗将近5G显存
+
+---
+
 
 
 ---

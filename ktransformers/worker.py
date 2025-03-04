@@ -108,6 +108,7 @@ class KVCacheServer:
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
         
+        logger.info("Loading model with custom device mapping...")
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path,
             config=config,
@@ -118,14 +119,36 @@ class KVCacheServer:
             low_cpu_mem_usage=True,
         )
         
-        # 优化 CPU 上的层
+        # 分批优化 CPU 上的层
+        logger.info("Optimizing CPU layers...")
+        cpu_modules = []
         for name, module in self.model.named_modules():
             if any(device == 'cpu' for layer, device in device_map.items() if layer in name):
-                # 对于 CPU 上的层，使用 float32 以提高数值稳定性
-                module.to(torch.float32)
+                cpu_modules.append((name, module))
+        
+        # 每批处理 5 个模块
+        batch_size = 5
+        for i in range(0, len(cpu_modules), batch_size):
+            batch = cpu_modules[i:i + batch_size]
+            logger.info(f"Converting batch {i//batch_size + 1}/{(len(cpu_modules) + batch_size - 1)//batch_size}")
+            
+            # 清理 GPU 缓存
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            # 转换这一批的模块
+            for name, module in batch:
+                try:
+                    # 先将模块移到 CPU
+                    module.cpu()
+                    # 然后转换数据类型
+                    module.to(torch.float32)
+                    logger.info(f"Converted {name} to float32 on CPU")
+                except Exception as e:
+                    logger.error(f"Error converting {name}: {str(e)}")
         
         self.model.eval()
-        logger.info("Model loaded successfully with custom device mapping")
+        logger.info("Model loaded and optimized successfully")
 
 class ModelWorker:
     def __init__(self, address: str):

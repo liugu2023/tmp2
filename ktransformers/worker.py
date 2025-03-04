@@ -57,14 +57,10 @@ class ModelWorker:
             'cpu': "138GiB" # 剩余放在 CPU 内存
         }
         
-        # 添加基本优化配置
+        # 简化设备映射，让 transformers 自动处理
         model_kwargs = {
-            # 设备配置
-            "device_map": {
-                "embed_tokens": "cpu",
-                "lm_head": "cuda:0",
-                "layers": "balanced"  # 自动在两张 GPU 之间平衡
-            }
+            "device_map": "auto",  # 让 transformers 自动处理设备分配
+            "max_memory": max_memory
         }
         
         logger.info("Applying optimization configurations...")
@@ -72,7 +68,6 @@ class ModelWorker:
             model_path,
             config=config,
             trust_remote_code=True,
-            max_memory=max_memory,
             torch_dtype=torch.float16,
             **model_kwargs
         )

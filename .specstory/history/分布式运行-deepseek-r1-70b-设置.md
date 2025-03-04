@@ -3803,6 +3803,99 @@ _**Assistant**_
 
 ---
 
+_**User**_
+
+ERROR:__main__:Error processing message: LlamaForCausalLM.__init__() got an unexpected keyword argument 'use_cache'
+
+---
+
+_**Assistant**_
+
+
+
+
+
+
+
+
+
+
+
+让我们修改 worker.py 中的模型加载配置，移除不支持的参数：
+
+```python:ktransformers/worker.py
+def load_model(self, model_path: str, gguf_path: str):
+    logger.info("Loading tokenizer...")
+    self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    
+    logger.info("Loading model config...")
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    torch.set_default_dtype(config.torch_dtype)
+    
+    logger.info("Loading model...")
+    # 设置双 GPU 的内存分配
+    max_memory = {
+        0: "12GiB",    # 第一张 GPU 使用 12GB
+        1: "12GiB",    # 第二张 GPU 使用 12GB
+        'cpu': "138GiB" # 剩余放在 CPU 内存
+    }
+    
+    # 添加基本优化配置
+    model_kwargs = {
+        # 设备配置
+        "device_map": {
+            "embed_tokens": "cpu",
+            "lm_head": "cuda:0",
+            "layers": "balanced"  # 自动在两张 GPU 之间平衡
+        }
+    }
+    
+    logger.info("Applying optimization configurations...")
+    self.model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        config=config,
+        trust_remote_code=True,
+        max_memory=max_memory,
+        torch_dtype=torch.float16,
+        **model_kwargs
+    )
+    
+    # 输出优化配置信息
+    logger.info("Model optimization settings:")
+    logger.info("- Using FP16 precision")
+    logger.info("- Device mapping:")
+    for name, device in self.model.hf_device_map.items():
+        logger.info(f"  {name}: {device}")
+    
+    self.model.eval()
+```
+
+
+
+
+主要改动：
+1. 移除了 `use_cache` 参数
+2. 移除了 `low_cpu_mem_usage` 参数
+3. 移除了 `offload_folder` 和 `offload_state_dict` 参数
+4. 保留了设备映射和 FP16 精度设置
+
+这样应该能正常加载模型了。其他优化会通过 yaml 规则文件来应用。如果还有其他错误，请告诉我。
+
+---
+
+_**User**_
+
+ERROR:__main__:Error processing message: model.embed_tokens.weight doesn't have any device set.
+
+
+---
+
+_**Assistant**_
+
+
+
+---
+
 
 
 ---

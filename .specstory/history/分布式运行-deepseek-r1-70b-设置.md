@@ -5192,6 +5192,314 @@ def load_model(self, model_path: str, gguf_path: str):
 
 ---
 
+_**User**_
+
+每个进程推理时使用同一个模型，不然会oom
+
+---
+
+_**Assistant**_
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+是的，您说得对。让我们修改代码，让所有进程共享同一个模型实例：
+
+```python:ktransformers/worker.py
+def load_model(self, model_path: str, gguf_path: str):
+    # ... 其他代码保持不变 ...
+    
+    logger.info("Loading model...")
+    # 设置双 GPU 的内存分配
+    max_memory = {
+        0: "12GiB",    # 第一张 GPU 使用 12GB
+        1: "12GiB",    # 第二张 GPU 使用 12GB
+        'cpu': "138GiB" # 剩余放在 CPU 内存
+    }
+    
+    # 添加并行配置
+    model_kwargs = {
+        "device_map": "auto",  # 恢复自动设备映射
+        "max_memory": max_memory,
+        "low_cpu_mem_usage": True,
+    }
+    
+    logger.info("Applying optimization configurations...")
+    self.model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        config=config,
+        trust_remote_code=True,
+        torch_dtype=torch.float16,
+        **model_kwargs
+    )
+    
+    self.model.eval()
+    logger.info("Model loaded successfully")
+
+def generate_single(self, input_data: Dict[str, Any], process_id: int) -> Dict[str, Any]:
+    try:
+        logger.info(f"Process {process_id}: Starting generation...")
+        
+        # 使用共享模型，不再移动模型
+        gpu_id = process_id % 2  # 在两个 GPU 之间分配
+        device = f'cuda:{gpu_id}'
+        
+        # 只准备输入数据
+        input_ids = torch.tensor(input_data['input_ids'], device=device)
+        attention_mask = torch.tensor(input_data['attention_mask'], device=device)
+        
+        with torch.no_grad(), torch.amp.autocast('cuda'):
+            outputs = self.model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=input_data.get('max_new_tokens', 512),
+                temperature=input_data.get('temperature', 0.6),
+                top_p=input_data.get('top_p', 0.9),
+                do_sample=input_data.get('do_sample', True),
+                streamer=None,  # 并行模式下暂时不使用 streamer
+                use_cache=True,
+                num_beams=1,
+                synced_gpus=False,
+                repetition_penalty=1.0,
+                length_penalty=1.0,
+                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=self.tokenizer.eos_token_id
+            )
+        
+        return {
+            'process_id': process_id,
+            'status': 'success',
+            'output_ids': outputs.cpu().numpy().tolist()
+        }
+    except Exception as e:
+        logger.error(f"Process {process_id} error: {str(e)}")
+        return {
+            'process_id': process_id,
+            'status': 'error',
+            'error': str(e)
+        }
+```
+
+
+
+
+
+
+主要改动：
+1. 恢复使用自动设备映射
+2. 移除模型复制和移动的代码
+3. 所有进程共享同一个模型实例
+4. 只将输入数据移动到对应的 GPU
+
+这样应该能避免 OOM 问题，因为：
+1. 模型只加载一次
+2. 自动设备映射会优化内存使用
+3. 不同进程只处理输入输出数据
+
+如果还有其他问题，请告诉我。
+
+---
+
+_**User**_
+
+(ds) root@compute06:/archive/liugu/ds/ktransformers#  PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0,1 python -m ktransformers.worker --worker_address "10.21.22.206:29500"
+INFO:__main__:Worker started at 10.21.22.206:29500, listening on all interfaces
+INFO:__main__:Worker ready to receive requests
+INFO:__main__:Loading tokenizer...
+INFO:__main__:Loading model config...
+INFO:__main__:Initializing distributed environment...
+INFO:__main__:Loading model...
+INFO:__main__:Applying optimization configurations...
+Loading checkpoint shards: 100%|██████████████████████████████████████| 17/17 [21:02<00:00, 74.26s/it]WARNING:accelerate.big_modeling:Some parameters are on the meta device because they were offloaded to the cpu.
+INFO:__main__:Model loaded successfully
+INFO:__main__:Starting parallel generation...
+INFO:__main__:Process 0: Starting generation...
+INFO:__main__:Process 1: Starting generation...
+INFO:__main__:Process 2: Starting generation...
+INFO:__main__:Process 3: Starting generation...
+INFO:__main__:Process 4: Starting generation...
+INFO:__main__:Process 5: Starting generation...
+INFO:__main__:Process 6: Starting generation...
+INFO:__main__:Process 7: Starting generation...
+INFO:__main__:Process 8: Starting generation...
+INFO:__main__:Process 9: Starting generation...
+INFO:__main__:Process 10: Starting generation...
+INFO:__main__:Process 11: Starting generation...
+ERROR:__main__:Process 2 error: Tensor on device cuda:0 is not on the expected device meta!
+ERROR:__main__:Process 11 error: Tensor on device cuda:0 is not on the expected device meta!
+ERROR:__main__:Process 9 error: Tensor on device cuda:0 is not on the expected device meta!
+ERROR:__main__:Process 8 error: Tensor on device cuda:0 is not on the expected device meta!
+ERROR:__main__:Process 5 error: Tensor on device cuda:0 is not on the expected device meta!
+ERROR:__main__:Process 10 error: Tensor on device cuda:0 is not on the expected device meta!
+ERROR:__main__:Process 3 error: Tensor on device cuda:0 is not on the expected device meta!
+ERROR:__main__:Process 0 error: Tensor on device cuda:0 is not on the expected device meta!
+ERROR:__main__:Process 4 error: Tensor on device cuda:0 is not on the expected device meta!
+INFO:__main__:Process 11 completed
+INFO:__main__:Process 3 completed
+INFO:__main__:Process 2 completed
+INFO:__main__:Process 9 completed
+INFO:__main__:Process 5 completed
+INFO:__main__:Process 8 completed
+INFO:__main__:Process 0 completed
+INFO:__main__:Process 4 completed
+INFO:__main__:Process 10 completed
+ERROR:__main__:Process 1 error: Tensor on device cuda:0 is not on the expected device meta!
+INFO:__main__:Process 1 completed
+ERROR:__main__:Process 7 error: Tens
+
+---
+
+_**Assistant**_
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+看来问题出在模型的设备映射上。让我们修改代码，确保模型完全加载到 GPU：
+
+```python:ktransformers/worker.py
+def load_model(self, model_path: str, gguf_path: str):
+    logger.info("Loading tokenizer...")
+    self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    
+    logger.info("Loading model config...")
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    config.attn_implementation = "flash_attention_2"
+    torch.set_default_dtype(config.torch_dtype)
+    
+    logger.info("Loading model...")
+    # 修改内存配置
+    max_memory = {
+        0: "12GiB",
+        1: "12GiB",
+        'cpu': "24GiB"  # 减少 CPU 内存，强制更多层放在 GPU 上
+    }
+    
+    # 修改设备映射策略
+    model_kwargs = {
+        "device_map": "balanced_low_0",  # 使用平衡策略，优先使用 GPU 0
+        "max_memory": max_memory,
+        "low_cpu_mem_usage": True,
+        "offload_folder": None,  # 禁用 CPU 卸载
+        "offload_state_dict": False
+    }
+    
+    logger.info("Applying optimization configurations...")
+    self.model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        config=config,
+        trust_remote_code=True,
+        torch_dtype=torch.float16,
+        **model_kwargs
+    )
+    
+    # 确保模型完全加载到 GPU
+    logger.info("Moving model to GPU...")
+    self.model = self.model.cuda()
+    self.model.eval()
+    
+    # 打印设备分配信息
+    logger.info("Model device mapping:")
+    for name, param in self.model.named_parameters():
+        logger.info(f"{name}: {param.device}")
+    
+    logger.info("Model loaded successfully")
+
+def generate_single(self, input_data: Dict[str, Any], process_id: int) -> Dict[str, Any]:
+    try:
+        logger.info(f"Process {process_id}: Starting generation...")
+        
+        # 使用主 GPU
+        device = 'cuda:0'
+        
+        # 准备输入数据
+        input_ids = torch.tensor(input_data['input_ids'], device=device)
+        attention_mask = torch.tensor(input_data['attention_mask'], device=device)
+        
+        with torch.no_grad(), torch.amp.autocast('cuda'):
+            outputs = self.model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=input_data.get('max_new_tokens', 512),
+                temperature=input_data.get('temperature', 0.6),
+                top_p=input_data.get('top_p', 0.9),
+                do_sample=input_data.get('do_sample', True),
+                streamer=None,
+                use_cache=True,
+                num_beams=1,
+                synced_gpus=False,
+                repetition_penalty=1.0,
+                length_penalty=1.0,
+                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=self.tokenizer.eos_token_id
+            )
+        
+        return {
+            'process_id': process_id,
+            'status': 'success',
+            'output_ids': outputs.cpu().numpy().tolist()
+        }
+    except Exception as e:
+        logger.error(f"Process {process_id} error: {str(e)}")
+        return {
+            'process_id': process_id,
+            'status': 'error',
+            'error': str(e)
+        }
+```
+
+
+
+
+
+
+主要改动：
+1. 使用 "balanced_low_0" 设备映射策略
+2. 减少 CPU 内存分配，强制更多层放在 GPU 上
+3. 禁用 CPU 卸载
+4. 显式将模型移动到 GPU
+5. 所有进程都使用 GPU 0
+6. 添加了设备分配信息的日志
+
+这样应该能确保模型完全在 GPU 上，避免 meta device 的问题。如果还有其他错误，请告诉我。
+
+---
+
+_**User**_
+
+不行，现存不够，那看起来我们不能开那么多线程了，这样吧，只开两个线程，使用cuda0，cuda1两张显卡
+
+---
+
+_**Assistant**_
+
+
+
+---
+
 
 
 ---

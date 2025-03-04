@@ -38,195 +38,108 @@ class KVCacheServer:
         self.tokenizer = None
         self.kv_cache = {}
         self.lock = threading.Lock()
-        self.loaded_params = set()  # 记录已加载的参数
         self.param_usage_stats = {}  # 记录参数使用频率
         self.vocab_usage_stats = {}  # 记录词汇使用频率
+        self.loaded_layers = set()  # 记录已加载的层
         
     def load_model(self, model_path: str, gguf_path: str):
         logger.info("Loading tokenizer...")
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         
-        # 只加载最常用的 5000 个词汇
-        vocab_size = min(5000, len(self.tokenizer.vocab))
-        logger.info(f"Initially loading top {vocab_size} tokens")
-        
         logger.info("Loading model config...")
         config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         config.attn_implementation = "flash_attention_2"
-        
-        # 修改配置以支持动态加载
-        config.vocab_size = vocab_size  # 初始词汇表大小
         torch.set_default_dtype(config.torch_dtype)
         
         # 计算模型层数
-        num_layers = config.num_hidden_layers  # 应该是 80 层
+        num_layers = config.num_hidden_layers
         logger.info(f"Total layers: {num_layers}")
         
         # 调整层分配
         cpu_front_layers = 34  # 前34层放在CPU
         gpu_middle_layers = 12  # GPU总共处理12层(每个GPU 6层)
-        cpu_end_layers = num_layers - cpu_front_layers - gpu_middle_layers  # 剩余层放在CPU
+        cpu_end_layers = num_layers - cpu_front_layers - gpu_middle_layers
         
         # 创建详细的设备映射
         device_map = {
-            'model.embed_tokens': 'cpu',  # embedding 层放在 CPU
-            'model.norm': 'cpu',  # 最终的 norm 层放在 CPU
-            'lm_head': 'cpu',  # 输出层放在 CPU
+            'model.embed_tokens': 'meta',  # 先放在 meta 设备上
+            'model.norm': 'meta',
+            'lm_head': 'meta',
         }
         
-        # 前34层放在 CPU
-        for i in range(cpu_front_layers):
-            device_map[f'model.layers.{i}'] = 'cpu'
-        
-        # 中间12层在两个 GPU 之间平衡分配（每个GPU 6层）
-        gpu_layers_per_device = gpu_middle_layers // 2  # 每个GPU 6层
-        for i in range(cpu_front_layers, cpu_front_layers + gpu_middle_layers):
-            gpu_id = (i - cpu_front_layers) // gpu_layers_per_device
-            device_map[f'model.layers.{i}'] = f'cuda:{gpu_id}'
-        
-        # 剩余层放在 CPU
-        for i in range(cpu_front_layers + gpu_middle_layers, num_layers):
-            device_map[f'model.layers.{i}'] = 'cpu'
+        # 所有层初始都放在 meta 设备上
+        for i in range(num_layers):
+            device_map[f'model.layers.{i}'] = 'meta'
         
         # 设置内存限制
         max_memory = {
-            0: "12GiB",  # 第一个GPU分配12GB
-            1: "12GiB",  # 第二个GPU分配12GB
-            'cpu': "138GiB"  # CPU内存
+            0: "12GiB",
+            1: "12GiB",
+            'cpu': "138GiB"
         }
         
-        logger.info("Device mapping summary:")
-        logger.info(f"CPU front layers: 0-{cpu_front_layers-1}")
-        logger.info(f"GPU layers: {cpu_front_layers}-{cpu_front_layers+gpu_middle_layers-1}")
-        logger.info(f"CPU end layers: {cpu_front_layers+gpu_middle_layers}-{num_layers-1}")
+        # 记录最终的设备分配计划
+        self.layer_device_map = {
+            **{f'model.layers.{i}': 'cpu' for i in range(cpu_front_layers)},
+            **{f'model.layers.{i}': f'cuda:{(i-cpu_front_layers)//6}' 
+               for i in range(cpu_front_layers, cpu_front_layers + gpu_middle_layers)},
+            **{f'model.layers.{i}': 'cpu' 
+               for i in range(cpu_front_layers + gpu_middle_layers, num_layers)}
+        }
         
-        # 详细的设备映射日志
-        device_counts = {'cpu': 0, 'cuda:0': 0, 'cuda:1': 0}
-        for layer, device in device_map.items():
-            logger.info(f"{layer}: {device}")
-            device_counts[device] += 1
-        
-        logger.info("\nLayer distribution:")
-        for device, count in device_counts.items():
-            logger.info(f"{device}: {count} layers")
-        
-        if torch.cuda.is_available():
-            torch.backends.cudnn.benchmark = True
-            torch.backends.cudnn.enabled = True
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-        
-        # 修改模型加载方式
-        logger.info("Loading model with dynamic parameter loading...")
+        logger.info("Loading model with dynamic loading...")
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path,
             config=config,
             trust_remote_code=True,
             torch_dtype=torch.float16,
-            device_map=device_map,
+            device_map=device_map,  # 初始全部放在 meta 设备
             max_memory=max_memory,
             low_cpu_mem_usage=True,
-            offload_folder="model_offload",  # 存储未加载参数的目录
-            offload_state_dict=True  # 启用状态字典卸载
         )
         
-        # 初始化参数管理器
-        self.param_manager = self._init_param_manager(model_path)
+        # 创建模型参数存储目录
+        os.makedirs("model_offload", exist_ok=True)
         
-        logger.info("Converting CPU layers to float32...")
-        # 获取需要转换的模块列表
-        cpu_modules = []
-        for name, module in self.model.named_modules():
-            if any(device == 'cpu' for layer, device in device_map.items() if layer in name):
-                cpu_modules.append((name, module))
+        # 初始加载必要的组件
+        logger.info("Loading essential components...")
+        self._load_essential_components()
         
-        # 分批处理转换
-        batch_size = 4  # 每次处理4个模块
-        for i in range(0, len(cpu_modules), batch_size):
-            batch = cpu_modules[i:i + batch_size]
-            for name, module in batch:
-                logger.info(f"Converting {name} to float32")
-                try:
-                    # 对于大型模块，进一步分批处理参数
-                    for param_name, param in module.named_parameters():
-                        if param.device.type == 'cuda':
-                            # 如果参数在 GPU 上，先移到 CPU
-                            param.data = param.data.cpu()
-                        param.data = param.data.to(torch.float32)
-                    
-                    # 确保模块被正确分配到指定设备
-                    target_device = next(
-                        device for layer, device in device_map.items() 
-                        if layer in name
-                    )
-                    if 'cuda' in target_device:
-                        gpu_id = int(target_device.split(':')[1])
-                        # 在目标 GPU 上分配内存
-                        with torch.cuda.device(gpu_id):
-                            module.to(target_device)
-                    else:
-                        module.to('cpu')
-                    
-                except Exception as e:
-                    logger.error(f"Error converting {name}: {str(e)}")
-                    raise
-            
-            # 清理未使用的内存
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        
-        logger.info("Model conversion completed")
         self.model.eval()
-        
-        # 打印最终的内存使用情况
-        if torch.cuda.is_available():
-            for i in range(torch.cuda.device_count()):
-                memory_stats = torch.cuda.memory_stats(i)
-                allocated = memory_stats['allocated_bytes.all.current'] / 1024**3
-                reserved = memory_stats['reserved_bytes.all.current'] / 1024**3
-                logger.info(f"GPU {i} memory usage:")
-                logger.info(f"  Allocated: {allocated:.2f} GB")
-                logger.info(f"  Reserved: {reserved:.2f} GB")
-        
-        logger.info("Model loaded successfully with custom device mapping")
-
-    def _init_param_manager(self, model_path):
-        """初始化参数管理器"""
-        return {
-            'model_path': model_path,
-            'param_files': {},  # 参数文件映射
-            'loaded_params': set(),  # 已加载的参数
-            'param_usage': {},  # 参数使用统计
-            'vocab_usage': {},  # 词汇使用统计
-            'last_access': {},  # 最后访问时间
-        }
+        logger.info("Model initialized successfully")
     
-    def _load_param_on_demand(self, param_name):
-        """按需加载参数"""
-        if param_name not in self.param_manager['loaded_params']:
-            logger.info(f"Loading parameter {param_name} on demand")
-            param_path = os.path.join(self.param_manager['model_path'], f"{param_name}.bin")
-            
-            try:
-                # 加载参数
-                param_data = torch.load(param_path)
-                
-                # 获取目标设备
-                target_device = self._get_param_device(param_name)
-                
-                # 将参数加载到正确的设备
-                with torch.cuda.device(target_device if 'cuda' in target_device else 'cpu'):
-                    self.model.state_dict()[param_name].copy_(param_data)
-                
-                self.param_manager['loaded_params'].add(param_name)
-                self.param_manager['last_access'][param_name] = time.time()
-                
-                # 如果内存接近上限，卸载最少使用的参数
+    def _load_essential_components(self):
+        """加载必要的模型组件"""
+        # 加载 embedding 层
+        self._move_to_device('model.embed_tokens', 'cpu')
+        # 加载最终的 norm 层
+        self._move_to_device('model.norm', 'cpu')
+        # 加载输出层
+        self._move_to_device('lm_head', 'cpu')
+        
+        # 转换为 float32 以提高稳定性
+        self.model.embed_tokens.to(torch.float32)
+        self.model.norm.to(torch.float32)
+        self.model.lm_head.to(torch.float32)
+    
+    def _move_to_device(self, layer_name: str, device: str):
+        """将指定层移动到目标设备"""
+        try:
+            module = self.model.get_submodule(layer_name)
+            module.to(device)
+            self.loaded_layers.add(layer_name)
+            logger.info(f"Moved {layer_name} to {device}")
+        except Exception as e:
+            logger.error(f"Error moving {layer_name} to {device}: {str(e)}")
+            raise
+    
+    def _ensure_layer_loaded(self, layer_name: str):
+        """确保指定层已加载到正确的设备"""
+        if layer_name not in self.loaded_layers:
+            target_device = self.layer_device_map.get(layer_name)
+            if target_device:
+                self._move_to_device(layer_name, target_device)
                 self._maybe_offload_params()
-                
-            except Exception as e:
-                logger.error(f"Error loading parameter {param_name}: {str(e)}")
-                raise
     
     def _maybe_offload_params(self):
         """如果需要，卸载最少使用的参数"""
@@ -244,12 +157,12 @@ class KVCacheServer:
         """卸载指定 GPU 上最少使用的参数"""
         # 获取该 GPU 上的参数
         gpu_params = [
-            p for p in self.param_manager['loaded_params']
+            p for p in self.loaded_layers
             if self._get_param_device(p) == f'cuda:{gpu_id}'
         ]
         
         # 按最后访问时间排序
-        gpu_params.sort(key=lambda p: self.param_manager['last_access'][p])
+        gpu_params.sort(key=lambda p: self.param_usage_stats.get(p, 0))
         
         # 卸载 20% 最少使用的参数
         num_to_offload = max(1, len(gpu_params) // 5)
@@ -266,7 +179,7 @@ class KVCacheServer:
         
         # 从 GPU 移除
         self.model.state_dict()[param_name].data = torch.empty(1, device='meta')
-        self.param_manager['loaded_params'].remove(param_name)
+        self.loaded_layers.remove(param_name)
         torch.cuda.empty_cache()
 
     def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:

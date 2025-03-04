@@ -6753,7 +6753,227 @@ _**User**_
 
 _**Assistant**_
 
+好主意！我们可以实现一个动态加载机制，只加载最常用的词汇和必要的模型参数。让我们修改代码：
 
+```python:ktransformers/worker.py
+class KVCacheServer:
+    def __init__(self):
+        self.model = None
+        self.tokenizer = None
+        self.kv_cache = {}
+        self.lock = threading.Lock()
+        self.loaded_params = set()  # 记录已加载的参数
+        self.param_usage_stats = {}  # 记录参数使用频率
+        self.vocab_usage_stats = {}  # 记录词汇使用频率
+        
+    def load_model(self, model_path: str, gguf_path: str):
+        logger.info("Loading tokenizer...")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        
+        # 只加载最常用的 5000 个词汇
+        vocab_size = min(5000, len(self.tokenizer.vocab))
+        logger.info(f"Initially loading top {vocab_size} tokens")
+        
+        logger.info("Loading model config...")
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        config.attn_implementation = "flash_attention_2"
+        
+        # 修改配置以支持动态加载
+        config.vocab_size = vocab_size  # 初始词汇表大小
+        torch.set_default_dtype(config.torch_dtype)
+        
+        # 设备映射保持不变...
+        
+        # 修改模型加载方式
+        logger.info("Loading model with dynamic parameter loading...")
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            config=config,
+            trust_remote_code=True,
+            torch_dtype=torch.float16,
+            device_map=device_map,
+            max_memory=max_memory,
+            low_cpu_mem_usage=True,
+            offload_folder="model_offload",  # 存储未加载参数的目录
+            offload_state_dict=True  # 启用状态字典卸载
+        )
+        
+        # 初始化参数管理器
+        self.param_manager = self._init_param_manager(model_path)
+        
+    def _init_param_manager(self, model_path):
+        """初始化参数管理器"""
+        return {
+            'model_path': model_path,
+            'param_files': {},  # 参数文件映射
+            'loaded_params': set(),  # 已加载的参数
+            'param_usage': {},  # 参数使用统计
+            'vocab_usage': {},  # 词汇使用统计
+            'last_access': {},  # 最后访问时间
+        }
+    
+    def _load_param_on_demand(self, param_name):
+        """按需加载参数"""
+        if param_name not in self.param_manager['loaded_params']:
+            logger.info(f"Loading parameter {param_name} on demand")
+            param_path = os.path.join(self.param_manager['model_path'], f"{param_name}.bin")
+            
+            try:
+                # 加载参数
+                param_data = torch.load(param_path)
+                
+                # 获取目标设备
+                target_device = self._get_param_device(param_name)
+                
+                # 将参数加载到正确的设备
+                with torch.cuda.device(target_device if 'cuda' in target_device else 'cpu'):
+                    self.model.state_dict()[param_name].copy_(param_data)
+                
+                self.param_manager['loaded_params'].add(param_name)
+                self.param_manager['last_access'][param_name] = time.time()
+                
+                # 如果内存接近上限，卸载最少使用的参数
+                self._maybe_offload_params()
+                
+            except Exception as e:
+                logger.error(f"Error loading parameter {param_name}: {str(e)}")
+                raise
+    
+    def _maybe_offload_params(self):
+        """如果需要，卸载最少使用的参数"""
+        if torch.cuda.is_available():
+            # 检查 GPU 内存使用情况
+            for i in range(torch.cuda.device_count()):
+                memory_stats = torch.cuda.memory_stats(i)
+                allocated = memory_stats['allocated_bytes.all.current'] / 1024**3
+                
+                # 如果使用超过 80%，开始卸载
+                if allocated > 9.6:  # 12GB * 0.8
+                    self._offload_least_used_params(i)
+    
+    def _offload_least_used_params(self, gpu_id):
+        """卸载指定 GPU 上最少使用的参数"""
+        # 获取该 GPU 上的参数
+        gpu_params = [
+            p for p in self.param_manager['loaded_params']
+            if self._get_param_device(p) == f'cuda:{gpu_id}'
+        ]
+        
+        # 按最后访问时间排序
+        gpu_params.sort(key=lambda p: self.param_manager['last_access'][p])
+        
+        # 卸载 20% 最少使用的参数
+        num_to_offload = max(1, len(gpu_params) // 5)
+        for param_name in gpu_params[:num_to_offload]:
+            self._offload_param(param_name)
+    
+    def _offload_param(self, param_name):
+        """将参数卸载到 CPU 或磁盘"""
+        logger.info(f"Offloading parameter {param_name}")
+        param_data = self.model.state_dict()[param_name]
+        
+        # 保存到磁盘
+        torch.save(param_data, f"model_offload/{param_name}.bin")
+        
+        # 从 GPU 移除
+        self.model.state_dict()[param_name].data = torch.empty(1, device='meta')
+        self.param_manager['loaded_params'].remove(param_name)
+        torch.cuda.empty_cache()
+
+    def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+        # 在生成前确保需要的参数已加载
+        self._ensure_required_params(input_data)
+        
+        # 继续原有的生成逻辑...
+```
+
+主要改进：
+1. 动态参数加载：
+   - 初始只加载最常用词汇
+   - 按需加载其他参数
+   - 跟踪参数使用情况
+2. 内存管理：
+   - 监控 GPU 内存使用
+   - 自动卸载不常用参数
+   - 参数在 CPU 和 GPU 间迁移
+3. 性能优化：
+   - 预测并预加载可能需要的参数
+   - 缓存热门参数
+   - 智能参数放置
+
+需要我继续完善其他部分吗？
+
+---
+
+_**User**_
+
+Loading checkpoint shards: 100%|██████████████████████████████████████| 17/17 [27:35<00:00, 97.38s/it]
+INFO:__main__:Worker shutdown complete
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 352, in <module>
+    main()
+    ^^^^^^
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 349, in main
+    worker.run()
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 321, in run
+    self.kv_server.load_model(
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 121, in load_model
+    self.model = AutoModelForCausalLM.from_pretrained(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/models/auto/auto_factory.py", line 564, in from_pretrained
+    return model_class.from_pretrained(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/modeling_utils.py", line 3916, in from_pretrained
+    ) = cls._load_pretrained_model(
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/modeling_utils.py", line 4439, in _load_pretrained_model
+    load_offloaded_weights(model_to_load, state_dict_index, state_dict_folder)
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/accelerate/utils/modeling.py", line 880, in load_offloaded_weights
+    set_module_tensor_to_device(model, param_name, "cpu", value=weight, fp16_statistics=fp16_statistics)
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/accelerate/utils/modeling.py", line 287, in set_module_tensor_to_device
+    raise ValueError(
+ValueError: Trying to set a tensor of shape torch.Size([128256, 8192]) in "weight" (which has shape torch.Size([5000, 8192])), this looks incorrect.
+
+---
+
+_**Assistant**_
+
+啊，我明白问题了。我们不能直接修改 vocab_size，这会导致 embedding 层的维度不匹配。让我们改用另一种方式实现动态加载：
+
+```python:ktransformers/worker.py
+class KVCacheServer:
+    def __init__(self):
+        self.model = None
+        self.tokenizer = None
+        self.kv_cache = {}
+        self.lock = threading.Lock()
+        self.param_usage_stats = {}  # 记录参数使用频率
+        self.vocab_usage_stats = {}  # 记录词汇使用频率
+        self.loaded_layers = set()  # 记录已加载的层
+        
+    def load_model(self, model_path: str, gguf_path: str):
+        logger.info("Loading tokenizer...")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        
+        logger.info("Loading model config...")
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        config.attn_implementation = "flash_attention_2"
+        torch.set_default_dtype(config.torch_dtype)
+        
+        # 计算模型层数
+        num_layers = config.num_hidden_layers
+        logger.info(f"Total layers: {num_layers}")
+        
+        # 调整层分配
+        cpu_front_layers = 34  # 前34层放在CPU
+        gpu_middle_layers = 12  # GPU总共处理12层(每个GPU 6层)
+        cpu_end_layers = num_layers - cpu_front_layers - gpu_middle_layers
+        
+        # 创建详细的设备映射
+        device_map = {
+            'model.embed_tokens':
 
 ---
 

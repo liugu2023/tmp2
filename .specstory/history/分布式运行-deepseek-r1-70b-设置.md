@@ -6395,6 +6395,109 @@ class ModelWorker:
 
 ---
 
+_**User**_
+
+GPU上的层数降到各6层
+
+---
+
+_**Assistant**_
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+好的，让我们修改 KVCacheServer 中的层分配，将每个 GPU 的层数降到 6 层：
+
+```python:ktransformers/worker.py
+def load_model(self, model_path: str, gguf_path: str):
+    # ... 前面的代码保持不变 ...
+    
+    # 计算模型层数
+    num_layers = config.num_hidden_layers  # 应该是 80 层
+    logger.info(f"Total layers: {num_layers}")
+    
+    # 调整层分配
+    cpu_front_layers = 34  # 前34层放在CPU
+    gpu_middle_layers = 12  # GPU总共处理12层(每个GPU 6层)
+    cpu_end_layers = num_layers - cpu_front_layers - gpu_middle_layers  # 剩余层放在CPU
+    
+    # 创建详细的设备映射
+    device_map = {
+        'model.embed_tokens': 'cpu',  # embedding 层放在 CPU
+        'model.norm': 'cpu',  # 最终的 norm 层放在 CPU
+        'lm_head': 'cpu',  # 输出层放在 CPU
+    }
+    
+    # 前34层放在 CPU
+    for i in range(cpu_front_layers):
+        device_map[f'model.layers.{i}'] = 'cpu'
+    
+    # 中间12层在两个 GPU 之间平衡分配（每个GPU 6层）
+    gpu_layers_per_device = gpu_middle_layers // 2  # 每个GPU 6层
+    for i in range(cpu_front_layers, cpu_front_layers + gpu_middle_layers):
+        gpu_id = (i - cpu_front_layers) // gpu_layers_per_device
+        device_map[f'model.layers.{i}'] = f'cuda:{gpu_id}'
+    
+    # 剩余层放在 CPU
+    for i in range(cpu_front_layers + gpu_middle_layers, num_layers):
+        device_map[f'model.layers.{i}'] = 'cpu'
+    
+    # 设置内存限制
+    max_memory = {
+        0: "12GiB",  # 第一个GPU分配12GB
+        1: "12GiB",  # 第二个GPU分配12GB
+        'cpu': "138GiB"  # CPU内存
+    }
+    
+    logger.info("Device mapping summary:")
+    logger.info(f"CPU front layers: 0-{cpu_front_layers-1}")
+    logger.info(f"GPU layers: {cpu_front_layers}-{cpu_front_layers+gpu_middle_layers-1}")
+    logger.info(f"CPU end layers: {cpu_front_layers+gpu_middle_layers}-{num_layers-1}")
+    
+    # 详细的设备映射日志
+    device_counts = {'cpu': 0, 'cuda:0': 0, 'cuda:1': 0}
+    for layer, device in device_map.items():
+        logger.info(f"{layer}: {device}")
+        device_counts[device] += 1
+    
+    logger.info("\nLayer distribution:")
+    for device, count in device_counts.items():
+        logger.info(f"{device}: {count} layers")
+```
+
+
+
+
+
+
+主要改动：
+1. 调整了层分配：
+   - 前34层放在 CPU
+   - 中间12层分配给两个 GPU（每个6层）
+   - 剩余层放在 CPU
+2. 保持了其他优化不变：
+   - embedding 层在 CPU
+   - norm 和输出层在 CPU
+   - CPU 层使用 float32
+   - GPU 层使用 float16
+
+这样应该能更好地平衡 GPU 内存使用。如果还需要调整，请告诉我。
+
+---
+
 
 
 ---

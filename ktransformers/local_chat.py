@@ -66,31 +66,35 @@ class DistributedModel:
                 }
             }
             
-            logger.info("Starting parallel generation...")
+            logger.info("Starting generation...")
             self.socket.send_pyobj(message)
             
             # 接收流式响应
-            response = self.socket.recv_pyobj()
-            
-            if response['status'] == 'error':
-                raise Exception(f"Generation failed: {response.get('error')}")
-            
-            # 处理多个结果
-            results = response['results']
-            successful_results = [r for r in results if r['status'] == 'success']
-            
-            if not successful_results:
-                raise Exception("No successful generations")
-            
-            # 打印所有生成的文本
-            for i, result in enumerate(successful_results):
-                output_ids = torch.tensor(result['output_ids'])
-                text = self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
-                print(f"\nGeneration {i+1}:")
-                print(text)
-            
-            # 返回第一个成功的结果
-            return torch.tensor(successful_results[0]['output_ids'])
+            full_text = ""
+            while True:
+                response = self.socket.recv_pyobj()
+                
+                if response['status'] == 'error':
+                    raise Exception(f"Generation failed: {response.get('error')}")
+                
+                if response['status'] == 'streaming':
+                    # 打印新生成的文本部分
+                    new_text = response['text'][len(full_text):]
+                    if new_text:
+                        print(new_text, end='', flush=True)
+                    full_text = response['text']
+                    
+                    # 发送确认
+                    self.socket.send_pyobj({'status': 'received'})
+                    
+                    # 如果生成结束，退出循环
+                    if response.get('finished', False):
+                        print()  # 换行
+                        # 不要在这里 break，等待最终的 token IDs
+                
+                elif response['status'] == 'success':
+                    # 最终的完整响应
+                    return torch.tensor(response['output_ids'])
         
         except Exception as e:
             logger.error(f"Error in generate: {str(e)}")

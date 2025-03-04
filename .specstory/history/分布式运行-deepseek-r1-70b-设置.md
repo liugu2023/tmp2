@@ -5498,6 +5498,901 @@ _**Assistant**_
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+好的，让我们修改代码，只使用两个线程，每个线程对应一个 GPU：
+
+```python:ktransformers/worker.py
+def __init__(self, address: str):
+    self.context = zmq.Context()
+    self.socket = self.context.socket(zmq.REP)
+    host, port = address.split(':')
+    self.socket.bind(f"tcp://0.0.0.0:{port}")
+    self.socket.setsockopt(zmq.RCVHWM, 0)
+    self.socket.setsockopt(zmq.SNDHWM, 0)
+    
+    self.model = None
+    self.tokenizer = None
+    self.num_processes = 2  # 只使用 2 个进程
+    self.process_pool = None
+    self.generation_queue = multiprocessing.Queue()
+    self.result_queue = multiprocessing.Queue()
+    logger.info(f"Worker started at {address}, listening on all interfaces")
+
+def generate_single(self, input_data: Dict[str, Any], process_id: int) -> Dict[str, Any]:
+    try:
+        logger.info(f"Process {process_id}: Starting generation on GPU {process_id}")
+        
+        # 每个进程使用固定的 GPU
+        device = f'cuda:{process_id}'  # process 0 -> cuda:0, process 1 -> cuda:1
+        
+        # 准备输入数据
+        input_ids = torch.tensor(input_data['input_ids'], device=device)
+        attention_mask = torch.tensor(input_data['attention_mask'], device=device)
+        
+        with torch.no_grad(), torch.amp.autocast('cuda'):
+            outputs = self.model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=input_data.get('max_new_tokens', 512),
+                temperature=input_data.get('temperature', 0.6),
+                top_p=input_data.get('top_p', 0.9),
+                do_sample=input_data.get('do_sample', True),
+                streamer=None,  # 并行模式下不使用 streamer
+                use_cache=True,
+                num_beams=1,
+                synced_gpus=False,
+                repetition_penalty=1.0,
+                length_penalty=1.0,
+                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=self.tokenizer.eos_token_id
+            )
+        
+        return {
+            'process_id': process_id,
+            'status': 'success',
+            'output_ids': outputs.cpu().numpy().tolist()
+        }
+    except Exception as e:
+        logger.error(f"Process {process_id} error: {str(e)}")
+        return {
+            'process_id': process_id,
+            'status': 'error',
+            'error': str(e)
+        }
+```
+
+
+
+
+
+
+主要改动：
+1. 将进程数从 12 减少到 2
+2. 每个进程固定使用一个 GPU
+3. 进程 0 使用 cuda:0，进程 1 使用 cuda:1
+
+这样应该能更好地利用 GPU 资源，避免内存不足的问题。每个 GPU 只需要处理一个生成任务，应该能正常工作。如果还有其他问题，请告诉我。
+
+---
+
+_**User**_
+
+剩下的8个线程也别闲着，使用纯CPU方法推理
+
+---
+
+_**Assistant**_
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+让我们修改代码，让剩余的线程使用 CPU 进行推理：
+
+```python:ktransformers/worker.py
+def __init__(self, address: str):
+    # ... 其他代码保持不变 ...
+    self.num_gpu_processes = 2  # GPU 进程数
+    self.num_cpu_processes = 8  # CPU 进程数
+    self.num_processes = self.num_gpu_processes + self.num_cpu_processes
+
+def generate_single(self, input_data: Dict[str, Any], process_id: int) -> Dict[str, Any]:
+    try:
+        if process_id < self.num_gpu_processes:
+            # GPU 进程
+            logger.info(f"Process {process_id}: Starting generation on GPU {process_id}")
+            device = f'cuda:{process_id}'
+        else:
+            # CPU 进程
+            logger.info(f"Process {process_id}: Starting generation on CPU")
+            device = 'cpu'
+        
+        # 准备输入数据
+        input_ids = torch.tensor(input_data['input_ids'], device=device)
+        attention_mask = torch.tensor(input_data['attention_mask'], device=device)
+        
+        # 如果是 CPU 进程，使用 float32 以提高数值稳定性
+        dtype = torch.float16 if 'cuda' in str(device) else torch.float32
+        
+        with torch.no_grad():
+            # GPU 使用 amp，CPU 不使用
+            if 'cuda' in str(device):
+                with torch.amp.autocast('cuda'):
+                    outputs = self.model.generate(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        max_new_tokens=input_data.get('max_new_tokens', 512),
+                        temperature=input_data.get('temperature', 0.6),
+                        top_p=input_data.get('top_p', 0.9),
+                        do_sample=input_data.get('do_sample', True),
+                        streamer=None,
+                        use_cache=True,
+                        num_beams=1,
+                        synced_gpus=False,
+                        repetition_penalty=1.0,
+                        length_penalty=1.0,
+                        pad_token_id=self.tokenizer.pad_token_id,
+                        eos_token_id=self.tokenizer.eos_token_id
+                    )
+            else:
+                # CPU 生成使用较小的 batch size 和较少的 tokens
+                outputs = self.model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    max_new_tokens=min(input_data.get('max_new_tokens', 512), 256),  # 限制 CPU 生成长度
+                    temperature=input_data.get('temperature', 0.6),
+                    top_p=input_data.get('top_p', 0.9),
+                    do_sample=input_data.get('do_sample', True),
+                    streamer=None,
+                    use_cache=True,
+                    num_beams=1,
+                    repetition_penalty=1.0,
+                    length_penalty=1.0,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id
+                )
+        
+        return {
+            'process_id': process_id,
+            'device': str(device),
+            'status': 'success',
+            'output_ids': outputs.cpu().numpy().tolist()
+        }
+    except Exception as e:
+        logger.error(f"Process {process_id} error: {str(e)}")
+        return {
+            'process_id': process_id,
+            'device': str(device) if 'device' in locals() else 'unknown',
+            'status': 'error',
+            'error': str(e)
+        }
+
+def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        logger.info("Starting parallel generation...")
+        results = self.generate_parallel(input_data)
+        
+        # 统计成功的生成结果
+        successful_results = [r for r in results if r['status'] == 'success']
+        if not successful_results:
+            raise Exception("No successful generations")
+        
+        # 分别计算 GPU 和 CPU 的统计信息
+        gpu_results = [r for r in successful_results if 'cuda' in r['device']]
+        cpu_results = [r for r in successful_results if r['device'] == 'cpu']
+        
+        # 计算统计信息
+        gpu_tokens = sum(len(r['output_ids'][0]) for r in gpu_results) if gpu_results else 0
+        cpu_tokens = sum(len(r['output_ids'][0]) for r in cpu_results) if cpu_results else 0
+        
+        logger.info(f"Parallel generation completed:")
+        logger.info(f"- GPU generations: {len(gpu_results)}/{self.num_gpu_processes}")
+        logger.info(f"- CPU generations: {len(cpu_results)}/{self.num_cpu_processes}")
+        if gpu_results:
+            logger.info(f"- Average GPU tokens: {gpu_tokens/len(gpu_results):.2f}")
+        if cpu_results:
+            logger.info(f"- Average CPU tokens: {cpu_tokens/len(cpu_results):.2f}")
+        
+        # 返回所有结果
+        return {
+            'status': 'success',
+            'results': results
+        }
+        
+    except Exception as e:
+        logger.error(f"Generation error: {str(e)}")
+        return {
+            'status': 'error',
+            'error': str(e)
+        }
+```
+
+
+
+
+
+
+主要改动：
+1. 区分 GPU 和 CPU 进程数
+2. 根据进程 ID 决定使用 GPU 还是 CPU
+3. CPU 进程：
+   - 使用 float32 以提高稳定性
+   - 限制生成长度
+   - 不使用 amp
+4. 分别统计 GPU 和 CPU 的生成结果
+
+这样可以：
+1. 充分利用所有计算资源
+2. GPU 进程处理主要负载
+3. CPU 进程提供额外的生成能力
+4. 可以比较 GPU 和 CPU 的性能差异
+
+如果需要调整参数或有其他需求，请告诉我。
+
+---
+
+_**User**_
+
+你现在按照我给你的架构来分配模型，首先，咱们使用一个进程，创建一个全局的KV Cache Server，让十个进程共享这个缓存，而不是每个进程都加载一遍模型
+
+---
+
+_**Assistant**_
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+明白了，让我们修改代码来实现 KV Cache Server 的架构。首先需要创建一个新的 KVCacheServer 类：
+
+```python:ktransformers/worker.py
+class KVCacheServer:
+    def __init__(self):
+        self.model = None
+        self.tokenizer = None
+        self.kv_cache = {}  # 存储每个进程的 KV Cache
+        self.lock = threading.Lock()  # 用于同步访问
+        
+    def load_model(self, model_path: str, gguf_path: str):
+        logger.info("Loading tokenizer...")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        
+        logger.info("Loading model config...")
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        config.attn_implementation = "flash_attention_2"
+        torch.set_default_dtype(config.torch_dtype)
+        
+        logger.info("Loading model...")
+        max_memory = {
+            0: "12GiB",
+            1: "12GiB",
+            'cpu': "138GiB"
+        }
+        
+        model_kwargs = {
+            "device_map": "auto",
+            "max_memory": max_memory,
+            "low_cpu_mem_usage": True,
+        }
+        
+        if torch.cuda.is_available():
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cudnn.enabled = True
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            config=config,
+            trust_remote_code=True,
+            torch_dtype=torch.float16,
+            **model_kwargs
+        )
+        
+        self.model.eval()
+        logger.info("Model loaded successfully")
+```
+
+然后修改 ModelWorker 类：
+
+```python:ktransformers/worker.py
+class ModelWorker:
+    def __init__(self, address: str):
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.REP)
+        host, port = address.split(':')
+        self.socket.bind(f"tcp://0.0.0.0:{port}")
+        self.socket.setsockopt(zmq.RCVHWM, 0)
+        self.socket.setsockopt(zmq.SNDHWM, 0)
+        
+        # 创建 KV Cache Server
+        self.kv_server = KVCacheServer()
+        
+        # 创建进程池
+        self.num_gpu_processes = 2
+        self.num_cpu_processes = 8
+        self.num_processes = self.num_gpu_processes + self.num_cpu_processes
+        
+        logger.info(f"Worker started at {address}, listening on all interfaces")
+
+    def load_model(self, model_path: str, gguf_path: str):
+        # 只在 KV Cache Server 中加载模型
+        self.kv_server.load_model(model_path, gguf_path)
+
+    def generate_single(self, input_data: Dict[str, Any], process_id: int) -> Dict[str, Any]:
+        try:
+            if process_id < self.num_gpu_processes:
+                logger.info(f"Process {process_id}: Starting generation on GPU {process_id}")
+                device = f'cuda:{process_id}'
+            else:
+                logger.info(f"Process {process_id}: Starting generation on CPU")
+                device = 'cpu'
+            
+            # 准备输入数据
+            input_ids = torch.tensor(input_data['input_ids'], device=device)
+            attention_mask = torch.tensor(input_data['attention_mask'], device=device)
+            
+            with self.kv_server.lock:  # 获取锁以访问共享模型
+                with torch.no_grad():
+                    if 'cuda' in str(device):
+                        with torch.amp.autocast('cuda'):
+                            outputs = self.kv_server.model.generate(
+                                input_ids=input_ids,
+                                attention_mask=attention_mask,
+                                max_new_tokens=input_data.get('max_new_tokens', 512),
+                                temperature=input_data.get('temperature', 0.6),
+                                top_p=input_data.get('top_p', 0.9),
+                                do_sample=input_data.get('do_sample', True),
+                                streamer=None,
+                                use_cache=True,
+                                num_beams=1,
+                                synced_gpus=False,
+                                repetition_penalty=1.0,
+                                length_penalty=1.0,
+                                pad_token_id=self.kv_server.tokenizer.pad_token_id,
+                                eos_token_id=self.kv_server.tokenizer.eos_token_id
+                            )
+                    else:
+                        outputs = self.kv_server.model.generate(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            max_new_tokens=min(input_data.get('max_new_tokens', 512), 256),
+                            temperature=input_data.get('temperature', 0.6),
+                            top_p=input_data.get('top_p', 0.9),
+                            do_sample=input_data.get('do_sample', True),
+                            streamer=None,
+                            use_cache=True,
+                            num_beams=1,
+                            repetition_penalty=1.0,
+                            length_penalty=1.0,
+                            pad_token_id=self.kv_server.tokenizer.pad_token_id,
+                            eos_token_id=self.kv_server.tokenizer.eos_token_id
+                        )
+            
+            return {
+                'process_id': process_id,
+                'device': str(device),
+                'status': 'success',
+                'output_ids': outputs.cpu().numpy().tolist()
+            }
+        except Exception as e:
+            logger.error(f"Process {process_id} error: {str(e)}")
+            return {
+                'process_id': process_id,
+                'device': str(device) if 'device' in locals() else 'unknown',
+                'status': 'error',
+                'error': str(e)
+            }
+```
+
+主要改动：
+1. 创建了 KVCacheServer 类来管理共享模型和 KV Cache
+2. 使用锁来同步对共享模型的访问
+3. 所有进程共享同一个模型实例
+4. 移除了重复的模型加载代码
+
+这样可以：
+1. 减少内存使用
+2. 共享 KV Cache
+3. 避免模型复制
+4. 保持线程安全
+
+需要我继续优化其他部分吗？
+
+---
+
+_**User**_
+
+然后embedding层+前几层分配给CPU，中间最核心的attention层分给GPU，后处理和logits sampling给CPU
+
+---
+
+_**Assistant**_
+
+好的，让我们修改 KVCacheServer 的模型加载部分，实现更细粒度的层分配：
+
+```python:ktransformers/worker.py
+class KVCacheServer:
+    def __init__(self):
+        self.model = None
+        self.tokenizer = None
+        self.kv_cache = {}
+        self.lock = threading.Lock()
+        
+    def load_model(self, model_path: str, gguf_path: str):
+        logger.info("Loading tokenizer...")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        
+        logger.info("Loading model config...")
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        config.attn_implementation = "flash_attention_2"
+        torch.set_default_dtype(config.torch_dtype)
+        
+        logger.info("Loading model...")
+        
+        # 计算模型层数
+        num_layers = config.num_hidden_layers
+        cpu_front_layers = 4  # 前4层放在CPU
+        gpu_middle_layers = num_layers - 8  # 中间层放在GPU
+        cpu_end_layers = 4  # 后4层放在CPU
+        
+        # 创建详细的设备映射
+        device_map = {
+            'model.embed_tokens': 'cpu',  # embedding 层放在 CPU
+            'model.norm': 'cpu',  # 最终的 norm 层放在 CPU
+            'lm_head': 'cpu',  # 输出层放在 CPU
+        }
+        
+        # 前几层放在 CPU
+        for i in range(cpu_front_layers):
+            device_map[f'model.layers.{i}'] = 'cpu'
+        
+        # 中间层在两个 GPU 之间平衡分配
+        gpu_layers_per_device = gpu_middle_layers // 2
+        for i in range(cpu_front_layers, cpu_front_layers + gpu_middle_layers):
+            gpu_id = (i - cpu_front_layers) // gpu_layers_per_device
+            device_map[f'model.layers.{i}'] = f'cuda:{gpu_id}'
+        
+        # 后几层放在 CPU
+        for i in range(num_layers - cpu_end_layers, num_layers):
+            device_map[f'model.layers.{i}'] = 'cpu'
+        
+        # 设置内存限制
+        max_memory = {
+            0: "12GiB",
+            1: "12GiB",
+            'cpu': "138GiB"
+        }
+        
+        logger.info("Device mapping:")
+        for layer, device in device_map.items():
+            logger.info(f"{layer}: {device}")
+        
+        model_kwargs = {
+            "device_map": device_map,  # 使用自定义设备映射
+            "max_memory": max_memory,
+            "low_cpu_mem_usage": True,
+        }
+        
+        if torch.cuda.is_available():
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cudnn.enabled = True
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            config=config,
+            trust_remote_code=True,
+            torch_dtype=torch.float16,
+            **model_kwargs
+        )
+        
+        # 优化 CPU 上的层
+        for name, module in self.model.named_modules():
+            if any(device == 'cpu' for layer, device in device_map.items() if layer in name):
+                # 对于 CPU 上的层，使用 float32 以提高数值稳定性
+                module.to(torch.float32)
+        
+        self.model.eval()
+        logger.info("Model loaded successfully with custom device mapping")
+```
+
+主要改动：
+1. 实现了细粒度的层分配：
+   - embedding 层放在 CPU
+   - 前 4 层放在 CPU
+   - 中间层平均分配到两个 GPU
+   - 后 4 层放在 CPU
+   - norm 和输出层放在 CPU
+2. 对 CPU 上的层使用 float32 以提高稳定性
+3. 详细记录每一层的设备分配
+
+这样的分配策略可以：
+1. 减少 GPU 内存使用
+2. 充分利用 CPU 资源
+3. 将计算密集的中间层放在 GPU
+4. 保持输入输出在 CPU 以方便数据传输
+
+如果需要调整层的分配或其他参数，请告诉我。
+
+---
+
+_**User**_
+
+两块GPU加起来只能分配14层，改
+
+---
+
+_**Assistant**_
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+让我们调整层的分配策略，考虑到 GPU 内存限制。修改 KVCacheServer 的 load_model 方法：
+
+```python:ktransformers/worker.py
+def load_model(self, model_path: str, gguf_path: str):
+    logger.info("Loading tokenizer...")
+    self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    
+    logger.info("Loading model config...")
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    config.attn_implementation = "flash_attention_2"
+    torch.set_default_dtype(config.torch_dtype)
+    
+    logger.info("Loading model...")
+    
+    # 计算模型层数
+    num_layers = config.num_hidden_layers  # 应该是 80 层
+    logger.info(f"Total layers: {num_layers}")
+    
+    # 调整层分配
+    cpu_front_layers = 33  # 前33层放在CPU
+    gpu_middle_layers = 14  # GPU总共处理14层
+    cpu_end_layers = num_layers - cpu_front_layers - gpu_middle_layers  # 剩余层放在CPU
+    
+    # 创建详细的设备映射
+    device_map = {
+        'model.embed_tokens': 'cpu',  # embedding 层放在 CPU
+        'model.norm': 'cpu',  # 最终的 norm 层放在 CPU
+        'lm_head': 'cpu',  # 输出层放在 CPU
+    }
+    
+    # 前33层放在 CPU
+    for i in range(cpu_front_layers):
+        device_map[f'model.layers.{i}'] = 'cpu'
+    
+    # 中间14层在两个 GPU 之间平衡分配（每个GPU 7层）
+    gpu_layers_per_device = gpu_middle_layers // 2
+    for i in range(cpu_front_layers, cpu_front_layers + gpu_middle_layers):
+        gpu_id = (i - cpu_front_layers) // gpu_layers_per_device
+        device_map[f'model.layers.{i}'] = f'cuda:{gpu_id}'
+    
+    # 剩余层放在 CPU
+    for i in range(cpu_front_layers + gpu_middle_layers, num_layers):
+        device_map[f'model.layers.{i}'] = 'cpu'
+    
+    # 设置内存限制
+    max_memory = {
+        0: "12GiB",  # 第一个GPU分配12GB
+        1: "12GiB",  # 第二个GPU分配12GB
+        'cpu': "138GiB"  # CPU内存
+    }
+    
+    logger.info("Device mapping summary:")
+    logger.info(f"CPU front layers: 0-{cpu_front_layers-1}")
+    logger.info(f"GPU layers: {cpu_front_layers}-{cpu_front_layers+gpu_middle_layers-1}")
+    logger.info(f"CPU end layers: {cpu_front_layers+gpu_middle_layers}-{num_layers-1}")
+    
+    # 详细的设备映射日志
+    device_counts = {'cpu': 0, 'cuda:0': 0, 'cuda:1': 0}
+    for layer, device in device_map.items():
+        logger.info(f"{layer}: {device}")
+        device_counts[device] += 1
+    
+    logger.info("\nLayer distribution:")
+    for device, count in device_counts.items():
+        logger.info(f"{device}: {count} layers")
+```
+
+
+
+
+
+
+主要改动：
+1. 调整了层分配策略：
+   - 前33层放在 CPU
+   - 中间14层分配给两个 GPU（每个7层）
+   - 剩余层放在 CPU
+2. 添加了更详细的日志输出：
+   - 总层数
+   - 每个设备的层分配范围
+   - 每个设备的层数统计
+
+这样的分配策略可以：
+1. 确保 GPU 内存使用在限制范围内
+2. 将最关键的中间层放在 GPU 上
+3. 充分利用 CPU 资源处理其他层
+4. 保持输入输出在 CPU 以方便数据传输
+
+如果需要进一步调整分配策略，请告诉我。
+
+---
+
+_**User**_
+
+然后Scheduler负责排队+分发，Worker纯算力，拿来就干，不要逻辑判断，进行负载均衡
+
+---
+
+_**Assistant**_
+
+好的，让我们创建一个 Scheduler 类来处理任务调度，并简化 Worker 的逻辑。首先创建 Scheduler：
+
+```python:ktransformers/scheduler.py
+import zmq
+import threading
+import queue
+import logging
+from typing import Dict, Any, List
+import time
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class Scheduler:
+    def __init__(self, worker_addresses: List[str]):
+        self.context = zmq.Context()
+        self.task_queue = queue.Queue()
+        self.worker_stats = {}  # 记录每个 worker 的状态
+        self.workers = {}  # worker 连接池
+        self.lock = threading.Lock()
+        
+        # 初始化与所有 worker 的连接
+        for addr in worker_addresses:
+            socket = self.context.socket(zmq.REQ)
+            socket.connect(f"tcp://{addr}")
+            self.workers[addr] = {
+                'socket': socket,
+                'busy': False,
+                'last_task_time': 0,
+                'total_tasks': 0,
+                'avg_time': 0
+            }
+            logger.info(f"Connected to worker at {addr}")
+    
+    def get_best_worker(self) -> str:
+        """选择最合适的 worker"""
+        with self.lock:
+            available_workers = [
+                addr for addr, info in self.workers.items() 
+                if not info['busy']
+            ]
+            if not available_workers:
+                return None
+            
+            # 根据历史性能选择最快的 worker
+            return min(
+                available_workers,
+                key=lambda addr: self.workers[addr]['avg_time']
+            )
+    
+    def submit_task(self, task: Dict[str, Any]):
+        """提交任务到队列"""
+        self.task_queue.put(task)
+        logger.info(f"Task queued. Queue size: {self.task_queue.qsize()}")
+    
+    def process_tasks(self):
+        """处理任务队列"""
+        while True:
+            try:
+                # 获取任务
+                task = self.task_queue.get()
+                
+                # 等待可用的 worker
+                worker_addr = None
+                while worker_addr is None:
+                    worker_addr = self.get_best_worker()
+                    if worker_addr is None:
+                        time.sleep(0.1)
+                
+                # 分配任务给 worker
+                worker = self.workers[worker_addr]
+                worker['busy'] = True
+                start_time = time.time()
+                
+                try:
+                    # 发送任务
+                    worker['socket'].send_pyobj({
+                        'command': 'generate',
+                        'data': task
+                    })
+                    
+                    # 获取结果
+                    result = worker['socket'].recv_pyobj()
+                    
+                    # 更新 worker 统计信息
+                    end_time = time.time()
+                    task_time = end_time - start_time
+                    with self.lock:
+                        worker['total_tasks'] += 1
+                        worker['avg_time'] = (
+                            (worker['avg_time'] * (worker['total_tasks'] - 1) + task_time)
+                            / worker['total_tasks']
+                        )
+                        worker['last_task_time'] = end_time
+                        worker['busy'] = False
+                    
+                    logger.info(f"Task completed by worker {worker_addr}")
+                    
+                except Exception as e:
+                    logger.error(f"Error processing task on worker {worker_addr}: {e}")
+                    worker['busy'] = False
+                    # 重新入队
+                    self.task_queue.put(task)
+                
+            except Exception as e:
+                logger.error(f"Error in task processing loop: {e}")
+                time.sleep(1)
+    
+    def start(self):
+        """启动调度器"""
+        # 启动任务处理线程
+        self.process_thread = threading.Thread(target=self.process_tasks)
+        self.process_thread.daemon = True
+        self.process_thread.start()
+        logger.info("Scheduler started")
+    
+    def shutdown(self):
+        """关闭调度器"""
+        logger.info("Shutting down scheduler...")
+        # 关闭所有 worker 连接
+        for addr, worker in self.workers.items():
+            try:
+                worker['socket'].send_pyobj({'command': 'shutdown'})
+                worker['socket'].recv_pyobj()  # 等待确认
+                worker['socket'].close()
+            except Exception as e:
+                logger.error(f"Error shutting down worker {addr}: {e}")
+        
+        self.context.term()
+        logger.info("Scheduler shutdown complete")
+```
+
+然后简化 Worker 类：
+
+```python:ktransformers/worker.py
+class ModelWorker:
+    def __init__(self, address: str):
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.REP)
+        self.socket.bind(f"tcp://{address}")
+        self.kv_server = KVCacheServer()
+        logger.info(f"Worker started at {address}")
+
+    def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            with self.kv_server.lock:
+                with torch.no_grad():
+                    outputs = self.kv_server.model.generate(
+                        input_ids=input_data['input_ids'],
+                        attention_mask=input_data['attention_mask'],
+                        max_new_tokens=input_data.get('max_new_tokens', 512),
+                        temperature=input_data.get('temperature', 0.6),
+                        top_p=input_data.get('top_p', 0.9),
+                        do_sample=input_data.get('do_sample', True),
+                        use_cache=True,
+                        num_beams=1,
+                        repetition_penalty=1.0,
+                        length_penalty=1.0,
+                        pad_token_id=self.kv_server.tokenizer.pad_token_id,
+                        eos_token_id=self.kv_server.tokenizer.eos_token_id
+                    )
+            
+            return {
+                'status': 'success',
+                'output_ids': outputs.cpu().numpy().tolist()
+            }
+        except Exception as e:
+            logger.error(f"Generation error: {str(e)}")
+            return {
+                'status': 'error',
+                'error': str(e)
+            }
+
+    def run(self):
+        logger.info("Worker ready")
+        try:
+            while True:
+                message = self.socket.recv_pyobj()
+                command = message.get('command')
+                
+                if command == 'load_model':
+                    self.kv_server.load_model(
+                        message['model_path'],
+                        message['gguf_path']
+                    )
+                    self.socket.send_pyobj({'status': 'success'})
+                
+                elif command == 'generate':
+                    result = self.generate(message['data'])
+                    self.socket.send_pyobj(result)
+                
+                elif command == 'shutdown':
+                    self.socket.send_pyobj({'status': 'shutdown'})
+                    break
+                
+        finally:
+            if hasattr(self, 'kv_server'):
+                del self.kv_server
+            self.socket.close()
+            self.context.term()
+            logger.info("Worker shutdown complete")
+```
+
+主要改进：
+1. Scheduler 负责：
+   - 任务队列管理
+   - Worker 负载均衡
+   - 性能统计和最优分配
+   - 错误处理和重试
+2. Worker 简化为：
+   - 纯计算单元
+   - 无需关心任务调度
+   - 专注于模型推理
+3. 负载均衡基于：
+   - Worker 状态
+   - 历史性能
+   - 平均处理时间
+
+需要我继续完善其他部分吗？
+
 ---
 
 

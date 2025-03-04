@@ -51,40 +51,36 @@ class KVCacheServer:
         logger.info("Loading model...")
         
         # 计算模型层数
-        num_layers = config.num_hidden_layers  # 应该是 80 层
+        num_layers = config.num_hidden_layers
         logger.info(f"Total layers: {num_layers}")
         
         # 调整层分配
         cpu_front_layers = 34  # 前34层放在CPU
         gpu_middle_layers = 12  # GPU总共处理12层(每个GPU 6层)
-        cpu_end_layers = num_layers - cpu_front_layers - gpu_middle_layers  # 剩余层放在CPU
+        cpu_end_layers = num_layers - cpu_front_layers - gpu_middle_layers
         
         # 创建详细的设备映射
         device_map = {
-            'model.embed_tokens': 'cpu',  # embedding 层放在 CPU
-            'model.norm': 'cpu',  # 最终的 norm 层放在 CPU
-            'lm_head': 'cpu',  # 输出层放在 CPU
+            'model.embed_tokens': 'cpu',
+            'model.norm': 'cpu',
+            'lm_head': 'cpu',
         }
         
-        # 前34层放在 CPU
-        for i in range(cpu_front_layers):
-            device_map[f'model.layers.{i}'] = 'cpu'
-        
-        # 中间12层在两个 GPU 之间平衡分配（每个GPU 6层）
-        gpu_layers_per_device = gpu_middle_layers // 2  # 每个GPU 6层
-        for i in range(cpu_front_layers, cpu_front_layers + gpu_middle_layers):
-            gpu_id = (i - cpu_front_layers) // gpu_layers_per_device
-            device_map[f'model.layers.{i}'] = f'cuda:{gpu_id}'
-        
-        # 剩余层放在 CPU
-        for i in range(cpu_front_layers + gpu_middle_layers, num_layers):
-            device_map[f'model.layers.{i}'] = 'cpu'
+        # 分配层到不同设备
+        for i in range(num_layers):
+            if i < cpu_front_layers:
+                device_map[f'model.layers.{i}'] = 'cpu'
+            elif i < cpu_front_layers + gpu_middle_layers:
+                gpu_id = (i - cpu_front_layers) // (gpu_middle_layers // 2)
+                device_map[f'model.layers.{i}'] = f'cuda:{gpu_id}'
+            else:
+                device_map[f'model.layers.{i}'] = 'cpu'
         
         # 设置内存限制
         max_memory = {
-            0: "12GiB",  # 第一个GPU分配12GB
-            1: "12GiB",  # 第二个GPU分配12GB
-            'cpu': "138GiB"  # CPU内存
+            0: "12GiB",
+            1: "12GiB",
+            'cpu': "138GiB"
         }
         
         logger.info("Device mapping summary:")
@@ -108,123 +104,24 @@ class KVCacheServer:
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
         
-        logger.info("Loading model with custom device mapping...")
+        # 加载模型时直接设置 dtype
+        model_kwargs = {
+            'device_map': device_map,
+            'max_memory': max_memory,
+            'low_cpu_mem_usage': True,
+            'torch_dtype': {
+                'cpu': torch.float32,
+                'cuda:0': torch.float16,
+                'cuda:1': torch.float16
+            }
+        }
+        
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path,
             config=config,
             trust_remote_code=True,
-            torch_dtype=torch.float16,
-            device_map=device_map,
-            max_memory=max_memory,
-            low_cpu_mem_usage=True,
+            **model_kwargs
         )
         
-        # 分批优化 CPU 上的层
-        logger.info("Optimizing CPU layers...")
-        cpu_modules = []
-        for name, module in self.model.named_modules():
-            if any(device == 'cpu' for layer, device in device_map.items() if layer in name):
-                cpu_modules.append((name, module))
-        
-        # 每批处理 5 个模块
-        batch_size = 5
-        for i in range(0, len(cpu_modules), batch_size):
-            batch = cpu_modules[i:i + batch_size]
-            logger.info(f"Converting batch {i//batch_size + 1}/{(len(cpu_modules) + batch_size - 1)//batch_size}")
-            
-            # 清理 GPU 缓存
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            
-            # 转换这一批的模块
-            for name, module in batch:
-                try:
-                    # 先将模块移到 CPU
-                    module.cpu()
-                    # 然后转换数据类型
-                    module.to(torch.float32)
-                    logger.info(f"Converted {name} to float32 on CPU")
-                except Exception as e:
-                    logger.error(f"Error converting {name}: {str(e)}")
-        
         self.model.eval()
-        logger.info("Model loaded and optimized successfully")
-
-class ModelWorker:
-    def __init__(self, address: str):
-        self.context = zmq.Context()
-        self.socket = self.context.socket(zmq.REP)
-        self.socket.bind(f"tcp://{address}")
-        self.kv_server = KVCacheServer()
-        logger.info(f"Worker started at {address}")
-
-    def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
-        try:
-            with self.kv_server.lock:
-                with torch.no_grad():
-                    outputs = self.kv_server.model.generate(
-                        input_ids=input_data['input_ids'],
-                        attention_mask=input_data['attention_mask'],
-                        max_new_tokens=input_data.get('max_new_tokens', 512),
-                        temperature=input_data.get('temperature', 0.6),
-                        top_p=input_data.get('top_p', 0.9),
-                        do_sample=input_data.get('do_sample', True),
-                        use_cache=True,
-                        num_beams=1,
-                        repetition_penalty=1.0,
-                        length_penalty=1.0,
-                        pad_token_id=self.kv_server.tokenizer.pad_token_id,
-                        eos_token_id=self.kv_server.tokenizer.eos_token_id
-                    )
-            
-            return {
-                'status': 'success',
-                'output_ids': outputs.cpu().numpy().tolist()
-            }
-        except Exception as e:
-            logger.error(f"Generation error: {str(e)}")
-            return {
-                'status': 'error',
-                'error': str(e)
-            }
-
-    def run(self):
-        logger.info("Worker ready")
-        try:
-            while True:
-                message = self.socket.recv_pyobj()
-                command = message.get('command')
-                
-                if command == 'load_model':
-                    self.kv_server.load_model(
-                        message['model_path'],
-                        message['gguf_path']
-                    )
-                    self.socket.send_pyobj({'status': 'success'})
-                
-                elif command == 'generate':
-                    result = self.generate(message['data'])
-                    self.socket.send_pyobj(result)
-                
-                elif command == 'shutdown':
-                    self.socket.send_pyobj({'status': 'shutdown'})
-                    break
-                
-        finally:
-            if hasattr(self, 'kv_server'):
-                del self.kv_server
-            self.socket.close()
-            self.context.term()
-            logger.info("Worker shutdown complete")
-
-def main():
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--worker_address', type=str, required=True)
-    args = parser.parse_args()
-    
-    worker = ModelWorker(args.worker_address)
-    worker.run()
-
-if __name__ == '__main__':
-    main() 
+        logger.info("Model loaded successfully with custom device mapping")

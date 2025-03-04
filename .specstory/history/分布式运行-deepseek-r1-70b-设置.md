@@ -4406,6 +4406,18 @@ def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
 
 ---
 
+_**User**_
+
+我的cpu是6核12线程的，充分利用上
+
+---
+
+_**Assistant**_
+
+
+
+---
+
 
 
 ---

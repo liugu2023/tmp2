@@ -5,6 +5,7 @@ from typing import Dict, Any
 import logging
 from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM, GenerationConfig, TextStreamer
 import time
+import os
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -70,15 +71,32 @@ class ModelWorker:
             'cpu': "138GiB" # 剩余放在 CPU 内存
         }
         
+        # 设置 CPU 线程数为物理核心数
+        num_physical_cores = 6
+        num_threads = 12  # 总线程数
+        
+        # 设置 PyTorch 线程数
+        torch.set_num_threads(num_threads)  # 使用所有逻辑核心
+        
+        # 设置 OpenMP 线程数
+        os.environ["OMP_NUM_THREADS"] = str(num_physical_cores)  # OpenMP 使用物理核心数
+        os.environ["MKL_NUM_THREADS"] = str(num_physical_cores)  # MKL 使用物理核心数
+        
+        logger.info("CPU threading configuration:")
+        logger.info(f"- Physical cores: {num_physical_cores}")
+        logger.info(f"- Total threads: {num_threads}")
+        logger.info(f"- PyTorch threads: {torch.get_num_threads()}")
+        logger.info(f"- OpenMP threads: {os.environ.get('OMP_NUM_THREADS')}")
+        logger.info(f"- MKL threads: {os.environ.get('MKL_NUM_THREADS')}")
+        
         # 添加并行配置
         model_kwargs = {
-            "device_map": "auto",  # 让 transformers 自动处理设备分配
+            "device_map": "auto",
             "max_memory": max_memory,
             "low_cpu_mem_usage": True,
         }
         
         # 设置并行环境
-        torch.set_num_threads(8)  # 设置 CPU 线程数
         if torch.cuda.is_available():
             torch.cuda.set_device('cuda:0')  # 设置主 GPU
         
@@ -95,7 +113,12 @@ class ModelWorker:
         logger.info("Model optimization settings:")
         logger.info("- Using FP16 precision")
         logger.info("- Flash Attention 2 enabled")
-        logger.info("- CPU threads: 8")
+        logger.info("- CPU threads:")
+        logger.info(f"- Physical cores: {num_physical_cores}")
+        logger.info(f"- Total threads: {num_threads}")
+        logger.info(f"- PyTorch threads: {torch.get_num_threads()}")
+        logger.info(f"- OpenMP threads: {os.environ.get('OMP_NUM_THREADS')}")
+        logger.info(f"- MKL threads: {os.environ.get('MKL_NUM_THREADS')}")
         logger.info("- Device mapping:")
         for name, device in self.model.hf_device_map.items():
             logger.info(f"  {name}: {device}")
@@ -179,12 +202,12 @@ class ModelWorker:
             # 生成文本
             logger.info("Starting text generation...")
             start_time = time.time()
+            
+            # 设置生成时的线程配置
+            torch.set_grad_enabled(False)
+            torch.set_num_threads(12)  # 使用所有逻辑核心
+            
             with torch.no_grad(), torch.amp.autocast('cuda'):
-                # 启用并行生成
-                torch.set_grad_enabled(False)
-                torch.set_num_threads(8)  # 设置 CPU 线程数
-                
-                # 使用多 GPU 生成
                 outputs = self.model.generate(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
@@ -193,9 +216,14 @@ class ModelWorker:
                     top_p=top_p,
                     do_sample=input_data.get('do_sample', True),
                     streamer=streamer,
-                    use_cache=True,  # 启用 KV 缓存
-                    num_beams=1,  # 单束搜索
-                    synced_gpus=False  # 禁用 GPU 同步，因为我们已经手动设置了
+                    use_cache=True,
+                    num_beams=1,
+                    synced_gpus=False,
+                    # 添加批处理参数以提高 CPU 利用率
+                    batch_size=1,
+                    num_return_sequences=1,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    max_concurrent_sequences=6  # 使用物理核心数
                 )
             
             end_time = time.time()

@@ -52,6 +52,16 @@ class ModelWorker:
         config.attn_implementation = "flash_attention_2"  # 新的 Flash Attention 2 配置
         torch.set_default_dtype(config.torch_dtype)
         
+        # 初始化分布式环境
+        if not torch.distributed.is_initialized():
+            logger.info("Initializing distributed environment...")
+            torch.distributed.init_process_group(
+                backend='nccl',
+                init_method='tcp://localhost:29501',
+                world_size=1,
+                rank=0
+            )
+        
         logger.info("Loading model...")
         # 设置双 GPU 的内存分配和并行配置
         max_memory = {
@@ -184,8 +194,8 @@ class ModelWorker:
                     do_sample=input_data.get('do_sample', True),
                     streamer=streamer,
                     use_cache=True,  # 启用 KV 缓存
-                    num_beams=1,  # 单束搜索，但启用并行
-                    synced_gpus=True  # 启用 GPU 同步
+                    num_beams=1,  # 单束搜索
+                    synced_gpus=False  # 禁用 GPU 同步，因为我们已经手动设置了
                 )
             
             end_time = time.time()

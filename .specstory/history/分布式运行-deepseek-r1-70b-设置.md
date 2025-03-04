@@ -4183,6 +4183,227 @@ _**Assistant**_
 
 
 
+
+
+
+
+
+
+
+
+
+
+啊，是的，我们在 generate 方法中忘记创建 streamer 了。让我们修复这个问题：
+
+```python:ktransformers/worker.py
+def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        logger.info("Received generation request")
+        logger.info(f"Input sequence length: {len(input_data['input_ids'])}")
+        
+        # 创建输入张量
+        logger.info("Moving input tensors to GPU...")
+        input_ids = torch.tensor(input_data['input_ids'], device='cuda')
+        attention_mask = torch.tensor(input_data['attention_mask'], device='cuda')
+        
+        # 生成参数日志
+        max_new_tokens = input_data.get('max_new_tokens', 512)
+        temperature = input_data.get('temperature', 0.6)
+        top_p = input_data.get('top_p', 0.9)
+        logger.info(f"Generation parameters: max_new_tokens={max_new_tokens}, "
+                   f"temperature={temperature}, "
+                   f"top_p={top_p}")
+        
+        # 创建自定义流式处理器
+        class StreamingHandler:
+            def __init__(self, socket, tokenizer):
+                self.socket = socket
+                self.tokenizer = tokenizer
+                self.current_text = ""
+                self.last_send_time = time.time()
+                
+            def __call__(self, text_chunk: str, stream_end: bool = False):
+                current_time = time.time()
+                self.current_text += text_chunk
+                
+                # 每0.5秒或结束时发送一次
+                if stream_end or (current_time - self.last_send_time) > 0.5:
+                    self.socket.send_pyobj({
+                        'status': 'streaming',
+                        'text': self.current_text,
+                        'finished': stream_end
+                    })
+                    # 等待客户端确认
+                    self.socket.recv_pyobj()
+                    self.last_send_time = current_time
+        
+        # 创建流式处理器
+        streamer = self.CustomStreamer(
+            self.tokenizer,
+            on_text_chunk=StreamingHandler(self.socket, self.tokenizer),
+            skip_prompt=True,
+            skip_special_tokens=True
+        )
+        
+        # 生成文本
+        logger.info("Starting text generation...")
+        start_time = time.time()
+        with torch.no_grad(), torch.amp.autocast('cuda'):
+            # 启用并行生成
+            torch.set_grad_enabled(False)
+            torch.set_num_threads(8)  # 设置 CPU 线程数
+            
+            # 使用多 GPU 生成
+            outputs = self.model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                do_sample=input_data.get('do_sample', True),
+                streamer=streamer,
+                use_cache=True,  # 启用 KV 缓存
+                num_beams=1,  # 单束搜索，但启用并行
+                synced_gpus=True  # 启用 GPU 同步
+            )
+        
+        # ... 其余代码保持不变 ...
+```
+
+
+
+
+
+主要改动：
+1. 添加了 StreamingHandler 类的定义
+2. 在生成前创建了 streamer 实例
+3. 保持了其他优化配置
+
+现在应该能正常工作了。如果还有其他问题，请告诉我。
+
+---
+
+_**User**_
+
+ERROR:__main__:Error in generate: Generation failed: Default process group has not been initialized, please make sure to call init_process_group.
+ERROR:__main__:Error: Generation failed: Default process group has not been initialized, please make sure to call init_process_group.
+
+---
+
+_**Assistant**_
+
+
+
+
+
+
+
+
+
+
+
+
+
+需要初始化进程组来支持多 GPU。让我们修改 worker.py：
+
+```python:ktransformers/worker.py
+def load_model(self, model_path: str, gguf_path: str):
+    logger.info("Loading tokenizer...")
+    self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    
+    logger.info("Loading model config...")
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    
+    # 更新配置
+    config.attn_implementation = "flash_attention_2"  # 新的 Flash Attention 2 配置
+    torch.set_default_dtype(config.torch_dtype)
+    
+    # 初始化分布式环境
+    if not torch.distributed.is_initialized():
+        logger.info("Initializing distributed environment...")
+        torch.distributed.init_process_group(
+            backend='nccl',
+            init_method='tcp://localhost:29501',
+            world_size=1,
+            rank=0
+        )
+    
+    logger.info("Loading model...")
+    # 设置双 GPU 的内存分配和并行配置
+    max_memory = {
+        0: "12GiB",    # 第一张 GPU 使用 12GB
+        1: "12GiB",    # 第二张 GPU 使用 12GB
+        'cpu': "138GiB" # 剩余放在 CPU 内存
+    }
+    
+    # 添加并行配置
+    model_kwargs = {
+        "device_map": "auto",  # 让 transformers 自动处理设备分配
+        "max_memory": max_memory,
+        "low_cpu_mem_usage": True,
+    }
+    
+    # 设置并行环境
+    torch.set_num_threads(8)  # 设置 CPU 线程数
+    if torch.cuda.is_available():
+        torch.cuda.set_device('cuda:0')  # 设置主 GPU
+    
+    logger.info("Applying optimization configurations...")
+    self.model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        config=config,
+        trust_remote_code=True,
+        torch_dtype=torch.float16,
+        **model_kwargs
+    )
+```
+
+
+
+
+
+同时在 generate 方法中修改：
+
+```python:ktransformers/worker.py
+def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        # ... 其他代码保持不变 ...
+        
+        # 生成文本
+        logger.info("Starting text generation...")
+        start_time = time.time()
+        with torch.no_grad(), torch.amp.autocast('cuda'):
+            # 启用并行生成
+            torch.set_grad_enabled(False)
+            torch.set_num_threads(8)  # 设置 CPU 线程数
+            
+            # 使用多 GPU 生成
+            outputs = self.model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                do_sample=input_data.get('do_sample', True),
+                streamer=streamer,
+                use_cache=True,  # 启用 KV 缓存
+                num_beams=1,  # 单束搜索
+                synced_gpus=False  # 禁用 GPU 同步，因为我们已经手动设置了
+            )
+```
+
+
+
+
+
+主要改动：
+1. 添加了分布式环境初始化
+2. 使用 NCCL 后端（专为 NVIDIA GPU 优化）
+3. 设置了本地进程组
+4. 调整了生成参数
+
+这样应该能正确处理多 GPU 了。如果还有其他问题，请告诉我。
+
 ---
 
 

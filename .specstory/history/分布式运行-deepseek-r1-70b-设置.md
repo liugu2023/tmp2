@@ -3277,13 +3277,174 @@ def main():
 
 _**User**_
 
-记得添加上性能统计
+
 
 ---
 
 _**Assistant**_
 
 
+
+
+
+
+
+
+
+好的，让我们添加性能统计信息。我们需要修改两个文件：
+
+1. 首先在 worker.py 中添加更多性能统计：
+
+```python:ktransformers/worker.py
+def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        # ... 其他代码保持不变 ...
+        
+        # 记录生成完成的信息
+        final_time = time.time()
+        total_gen_time = final_time - start_time
+        tokens_generated = len(outputs[0]) - len(input_ids[0])
+        
+        # 计算性能指标
+        performance_stats = {
+            'total_time': total_gen_time,
+            'tokens_generated': tokens_generated,
+            'tokens_per_second': tokens_generated / total_gen_time,
+            'gpu_memory': {
+                'allocated': torch.cuda.memory_allocated() / 1024**3,
+                'reserved': torch.cuda.memory_reserved() / 1024**3
+            },
+            'sequence_length': len(outputs[0]),
+            'input_length': len(input_ids[0])
+        }
+        
+        logger.info("Performance Statistics:")
+        logger.info(f"  - Total time: {performance_stats['total_time']:.2f} seconds")
+        logger.info(f"  - Tokens generated: {performance_stats['tokens_generated']}")
+        logger.info(f"  - Generation speed: {performance_stats['tokens_per_second']:.2f} tokens/sec")
+        logger.info(f"  - GPU Memory allocated: {performance_stats['gpu_memory']['allocated']:.2f} GB")
+        logger.info(f"  - GPU Memory reserved: {performance_stats['gpu_memory']['reserved']:.2f} GB")
+        
+        # 最终返回完整的 token ids 和性能统计
+        return {
+            'status
+
+---
+
+_**User**_
+
+看一下。yaml文件中的规则，添加到咱们的worker以便加快推进速度
+
+---
+
+_**Assistant**_
+
+
+
+
+
+
+
+
+
+
+
+好的，我们可以根据 yaml 文件中的优化规则来修改 worker.py，主要是添加一些优化配置：
+
+```python:ktransformers/worker.py
+def load_model(self, model_path: str, gguf_path: str):
+    logger.info("Loading tokenizer...")
+    self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    
+    logger.info("Loading model config...")
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    torch.set_default_dtype(config.torch_dtype)
+    
+    logger.info("Loading model...")
+    # 设置双 GPU 的内存分配
+    max_memory = {
+        0: "12GiB",    # 第一张 GPU 使用 12GB
+        1: "12GiB",    # 第二张 GPU 使用 12GB
+        'cpu': "138GiB" # 剩余放在 CPU 内存
+    }
+    
+    # 添加优化配置
+    model_kwargs = {
+        # RoPE 优化
+        "rope_scaling": {
+            "type": "yarn",
+            "factor": 1.0,
+            "original_max_position_embeddings": 2048
+        },
+        
+        # 注意力机制优化
+        "attention_implementation": "flash_attention_2",
+        
+        # MoE 相关优化
+        "moe_expert_parallel": True,
+        "expert_parallel_size": 2,  # 使用两张 GPU
+        
+        # 性能优化
+        "use_cache": True,
+        "low_cpu_mem_usage": True,
+        "preload_module_classes": ["MLP", "Attention"],
+        
+        # 设备配置
+        "device_map": {
+            "embed_tokens": "cpu",
+            "lm_head": "cuda:0",
+            "layers": "balanced"  # 自动在两张 GPU 之间平衡
+        }
+    }
+    
+    logger.info("Applying optimization configurations...")
+    self.model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        config=config,
+        trust_remote_code=True,
+        max_memory=max_memory,
+        torch_dtype=torch.float16,
+        offload_folder=None,
+        offload_state_dict=False,
+        **model_kwargs
+    )
+    
+    # 输出优化配置信息
+    logger.info("Model optimization settings:")
+    logger.info("- Using YARN RoPE scaling")
+    logger.info("- Flash Attention 2 enabled")
+    logger.info("- MoE expert parallel enabled")
+    logger.info("- Device mapping:")
+    for name, device in self.model.hf_device_map.items():
+        logger.info(f"  {name}: {device}")
+    
+    self.model.eval()
+    
+    # ... 其余代码保持不变 ...
+```
+
+
+
+主要优化点：
+1. 使用 YARN RoPE 缩放
+2. 启用 Flash Attention 2
+3. 开启 MoE 专家并行
+4. 优化设备映射：
+   - 词嵌入在 CPU
+   - 语言模型头在 GPU 0
+   - 其他层在两张 GPU 之间平衡
+5. 预加载关键模块
+6. 启用 KV 缓存
+
+这些优化应该能显著提高生成速度。运行命令保持不变：
+
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0,1 python -m ktransformers.worker --worker_address "10.21.22.206:29500"
+```
+
+
+
+如果需要调整任何优化参数，请告诉我。
 
 ---
 

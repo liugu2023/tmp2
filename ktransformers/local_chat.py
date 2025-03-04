@@ -100,6 +100,20 @@ class DistributedModel:
             logger.error(f"Error in generate: {str(e)}")
             raise
 
+    def shutdown(self):
+        """发送关闭命令给worker"""
+        try:
+            logger.info("Sending shutdown command to worker...")
+            message = {'command': 'shutdown'}
+            self.socket.send_pyobj(message)
+            response = self.socket.recv_pyobj()
+            if response['status'] == 'shutdown':
+                logger.info("Worker shutdown successfully")
+            self.socket.close()
+            self.context.term()
+        except Exception as e:
+            logger.error(f"Error during shutdown: {e}")
+
 def main():
     # 设置终端编码
     if sys.platform.startswith('win'):
@@ -125,14 +139,14 @@ def main():
         model.load_model(args.model_path, args.gguf_path)
         tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
         
-        while True:
-            try:
+        try:
+            while True:
                 content = input("Chat: ")
                 if content.lower() in ['quit', 'exit']:
+                    logger.info("Shutting down...")
+                    model.shutdown()  # 发送关闭命令
                     break
-                    
-                logger.info("Processing input...")
-                if content == "":
+                elif content == "":
                     content = "Please write a piece of quicksort code in C++."
                 elif os.path.isfile(content):
                     logger.info(f"Reading from file: {content}")
@@ -163,13 +177,12 @@ def main():
                 else:
                     logger.warning("No output tokens received")
                 
-            except UnicodeDecodeError as e:
-                logger.error(f"Encoding error: {str(e)}")
-                print("请使用UTF-8编码输入文本")
-                continue
-            except Exception as e:
-                logger.error(f"Error: {str(e)}")
-                continue
+        except KeyboardInterrupt:
+            logger.info("Received keyboard interrupt, shutting down...")
+            model.shutdown()
+        except Exception as e:
+            logger.error(f"Error: {str(e)}")
+            model.shutdown()
 
     else:
         # 本地模式，动态导入所需模块

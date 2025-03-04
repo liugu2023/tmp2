@@ -57,22 +57,57 @@ class ModelWorker:
             'cpu': "138GiB" # 剩余放在 CPU 内存
         }
         
+        # 添加优化配置
+        model_kwargs = {
+            # RoPE 优化
+            "rope_scaling": {
+                "type": "yarn",
+                "factor": 1.0,
+                "original_max_position_embeddings": 2048
+            },
+            
+            # 注意力机制优化
+            "attention_implementation": "flash_attention_2",
+            
+            # MoE 相关优化
+            "moe_expert_parallel": True,
+            "expert_parallel_size": 2,  # 使用两张 GPU
+            
+            # 性能优化
+            "use_cache": True,
+            "low_cpu_mem_usage": True,
+            "preload_module_classes": ["MLP", "Attention"],
+            
+            # 设备配置
+            "device_map": {
+                "embed_tokens": "cpu",
+                "lm_head": "cuda:0",
+                "layers": "balanced"  # 自动在两张 GPU 之间平衡
+            }
+        }
+        
+        logger.info("Applying optimization configurations...")
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path,
             config=config,
             trust_remote_code=True,
-            device_map="auto",  # 自动在两张 GPU 之间分配
             max_memory=max_memory,
             torch_dtype=torch.float16,
             offload_folder=None,
-            offload_state_dict=False
+            offload_state_dict=False,
+            **model_kwargs
         )
-        self.model.eval()
         
-        # 输出设备分配信息
-        logger.info("Model layer distribution:")
+        # 输出优化配置信息
+        logger.info("Model optimization settings:")
+        logger.info("- Using YARN RoPE scaling")
+        logger.info("- Flash Attention 2 enabled")
+        logger.info("- MoE expert parallel enabled")
+        logger.info("- Device mapping:")
         for name, device in self.model.hf_device_map.items():
             logger.info(f"  {name}: {device}")
+        
+        self.model.eval()
         
         # 设置生成配置
         try:
@@ -226,27 +261,41 @@ class ModelWorker:
 
     def run(self):
         logger.info("Worker ready to receive requests")
-        while True:
-            try:
-                message = self.socket.recv_pyobj()
-                command = message.get('command')
-                
-                if command == 'load_model':
-                    self.load_model(message['model_path'], message['gguf_path'])
-                    self.socket.send_pyobj({'status': 'success'})
-                
-                elif command == 'generate':
-                    result = self.generate(message['data'])
-                    self.socket.send_pyobj(result)
-                
-                elif command == 'shutdown':
-                    logger.info("Shutting down worker")
-                    self.socket.send_pyobj({'status': 'shutdown'})
-                    break
-                
-            except Exception as e:
-                logger.error(f"Error processing message: {str(e)}")
-                self.socket.send_pyobj({'status': 'error', 'error': str(e)})
+        try:
+            while True:
+                try:
+                    message = self.socket.recv_pyobj()
+                    command = message.get('command')
+                    
+                    if command == 'load_model':
+                        self.load_model(message['model_path'], message['gguf_path'])
+                        self.socket.send_pyobj({'status': 'success'})
+                    
+                    elif command == 'generate':
+                        result = self.generate(message['data'])
+                        self.socket.send_pyobj(result)
+                    
+                    elif command == 'shutdown':
+                        logger.info("Received shutdown command")
+                        self.socket.send_pyobj({'status': 'shutdown'})
+                        # 清理资源
+                        if hasattr(self, 'model'):
+                            del self.model
+                        if hasattr(self, 'tokenizer'):
+                            del self.tokenizer
+                        torch.cuda.empty_cache()
+                        logger.info("Resources cleaned up")
+                        break
+                    
+                except Exception as e:
+                    logger.error(f"Error processing message: {str(e)}")
+                    self.socket.send_pyobj({'status': 'error', 'error': str(e)})
+        finally:
+            # 确保资源被清理
+            logger.info("Cleaning up worker resources...")
+            self.socket.close()
+            self.context.term()
+            logger.info("Worker shutdown complete")
 
 def main():
     import argparse

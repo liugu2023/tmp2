@@ -3610,6 +3610,197 @@ _**Assistant**_
 
 
 
+
+
+
+
+
+
+
+
+看来 DeepSeek 模型不支持这些优化参数。让我们修改 worker.py 中的优化配置：
+
+```python:ktransformers/worker.py
+def load_model(self, model_path: str, gguf_path: str):
+    logger.info("Loading tokenizer...")
+    self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    
+    logger.info("Loading model config...")
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    torch.set_default_dtype(config.torch_dtype)
+    
+    logger.info("Loading model...")
+    # 设置双 GPU 的内存分配
+    max_memory = {
+        0: "12GiB",    # 第一张 GPU 使用 12GB
+        1: "12GiB",    # 第二张 GPU 使用 12GB
+        'cpu': "138GiB" # 剩余放在 CPU 内存
+    }
+    
+    # 添加基本优化配置
+    model_kwargs = {
+        # 性能优化
+        "use_cache": True,
+        "low_cpu_mem_usage": True,
+        
+        # 设备配置
+        "device_map": {
+            "embed_tokens": "cpu",
+            "lm_head": "cuda:0",
+            "layers": "balanced"  # 自动在两张 GPU 之间平衡
+        }
+    }
+    
+    logger.info("Applying optimization configurations...")
+    self.model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        config=config,
+        trust_remote_code=True,
+        max_memory=max_memory,
+        torch_dtype=torch.float16,
+        offload_folder=None,
+        offload_state_dict=False,
+        **model_kwargs
+    )
+    
+    # 输出优化配置信息
+    logger.info("Model optimization settings:")
+    logger.info("- Using FP16 precision")
+    logger.info("- KV cache enabled")
+    logger.info("- Device mapping:")
+    for name, device in self.model.hf_device_map.items():
+        logger.info(f"  {name}: {device}")
+    
+    self.model.eval()
+```
+
+
+
+
+主要改动：
+1. 移除了不支持的优化参数：
+   - rope_scaling
+   - attention_implementation
+   - moe_expert_parallel
+   - preload_module_classes
+2. 保留了基本的优化：
+   - FP16 精度
+   - KV 缓存
+   - 设备映射
+   - 低 CPU 内存使用
+
+这样应该能正常工作了。运行命令保持不变：
+
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0,1 python -m ktransformers.worker --worker_address "10.21.22.206:29500"
+```
+
+
+
+
+如果还有其他错误，请告诉我。
+
+---
+
+_**User**_
+
+算了，你直接根据优化文件自己写一个支持r170b的规则吧
+
+---
+
+_**Assistant**_
+
+
+
+
+
+
+
+
+
+好的，让我根据 DeepSeek-V3-Chat.yaml 的规则来创建一个适用于 DeepSeek-R1-70B 的优化规则文件：
+
+```yaml:ktransformers/optimize/optimize_rules/DeepSeek-R1-70B.yaml
+# 优化 RoPE 实现
+- match:
+    class: ktransformers.models.modeling_llama.LlamaRotaryEmbedding
+  replace:
+    class: ktransformers.operators.RoPE.YarnRotaryEmbeddingV3
+    kwargs:
+      generate_device: "cuda"
+      prefill_device: "cuda"
+
+# 优化线性层
+- match:
+    name: "^lm_head$"
+    class: torch.nn.Linear
+  replace:
+    class: ktransformers.operators.linear.KTransformersLinear
+    kwargs:
+      generate_device: "cuda"
+      prefill_device: "cuda"
+      generate_op: "KLinearMarlin"
+      prefill_op: "KLinearTorch"
+
+# 优化其他线性层
+- match:
+    name: "^model\\.layers\\..*$"
+    class: torch.nn.Linear
+  replace:
+    class: ktransformers.operators.linear.KTransformersLinear
+    kwargs:
+      generate_device: "cuda"
+      prefill_device: "cuda"
+      generate_op: "KLinearMarlin"
+      prefill_op: "KLinearTorch"
+
+# 优化注意力机制
+- match:
+    name: "^model\\.layers\\..*\\.self_attn$"
+  replace:
+    class: ktransformers.operators.attention.KLlamaAttention
+    kwargs:
+      generate_device: "cuda"
+      prefill_device: "cuda"
+      absorb_for_prefill: True  # 启用长上下文优化
+
+# 优化模型主体
+- match:
+    name: "^model$"
+  replace:
+    class: "ktransformers.operators.models.KLlamaModel"
+    kwargs:
+      per_layer_prefill_intput_threshold: 8192  # 启用分层预填充
+
+# 优化词嵌入层
+- match:
+    name: "^model.embed_tokens"
+  replace:
+    class: "default"
+    kwargs:
+      generate_device: "cpu"
+      prefill_device: "cpu"
+```
+
+
+
+主要优化点：
+1. 使用 YARN RoPE 实现以支持更长上下文
+2. 使用 Marlin 优化线性层计算
+3. 优化注意力机制实现
+4. 启用分层预填充
+5. 将词嵌入层放在 CPU 上以节省 GPU 内存
+
+这些优化应该能：
+1. 提高生成速度
+2. 减少显存使用
+3. 支持更长的上下文
+4. 优化多 GPU 使用
+
+您需要将这个文件放在 `ktransformers/optimize/optimize_rules/` 目录下，然后系统会自动应用这些优化规则。
+
+如果需要调整任何优化参数，请告诉我。
+
 ---
 
 

@@ -1,0 +1,59 @@
+# 优化 RoPE 实现
+- match:
+    class: ktransformers.models.modeling_llama.LlamaRotaryEmbedding
+  replace:
+    class: ktransformers.operators.RoPE.YarnRotaryEmbeddingV3
+    kwargs:
+      generate_device: "cuda"
+      prefill_device: "cuda"
+
+# 优化线性层
+- match:
+    name: "^lm_head$"
+    class: torch.nn.Linear
+  replace:
+    class: ktransformers.operators.linear.KTransformersLinear
+    kwargs:
+      generate_device: "cuda"
+      prefill_device: "cuda"
+      generate_op: "KLinearMarlin"
+      prefill_op: "KLinearTorch"
+
+# 优化其他线性层
+- match:
+    name: "^model\\.layers\\..*$"
+    class: torch.nn.Linear
+  replace:
+    class: ktransformers.operators.linear.KTransformersLinear
+    kwargs:
+      generate_device: "cuda"
+      prefill_device: "cuda"
+      generate_op: "KLinearMarlin"
+      prefill_op: "KLinearTorch"
+
+# 优化注意力机制
+- match:
+    name: "^model\\.layers\\..*\\.self_attn$"
+  replace:
+    class: ktransformers.operators.attention.KLlamaAttention
+    kwargs:
+      generate_device: "cuda"
+      prefill_device: "cuda"
+      absorb_for_prefill: True  # 启用长上下文优化
+
+# 优化模型主体
+- match:
+    name: "^model$"
+  replace:
+    class: "ktransformers.operators.models.KLlamaModel"
+    kwargs:
+      per_layer_prefill_intput_threshold: 8192  # 启用分层预填充
+
+# 优化词嵌入层
+- match:
+    name: "^model.embed_tokens"
+  replace:
+    class: "default"
+    kwargs:
+      generate_device: "cpu"
+      prefill_device: "cpu" 

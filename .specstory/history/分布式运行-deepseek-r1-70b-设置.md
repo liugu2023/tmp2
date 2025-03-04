@@ -4872,7 +4872,132 @@ class ModelWorker:
             avg_tokens = total_tokens / len(successful_results)
             
             logger.info(f"Parallel generation completed:")
-            logger.info(f"
+            logger.info(f"- Successful generations: {len(successful_results)}/{self.num_processes}")
+            logger.info(f"- Average tokens per generation: {avg_tokens:.2f}")
+            
+            # 返回所有结果
+            return {
+                'status': 'success',
+                'results': results
+            }
+            
+        except Exception as e:
+            logger.error(f"Generation error: {str(e)}")
+            return {
+                'status': 'error',
+                'error': str(e)
+            }
+```
+
+
+
+
+
+同时需要修改客户端代码来处理多个结果：
+
+```python:ktransformers/local_chat.py
+def generate(self, input_ids, attention_mask, **kwargs):
+    try:
+        # ... 其他代码保持不变 ...
+        
+        logger.info("Starting parallel generation...")
+        response = self.socket.recv_pyobj()
+        
+        if response['status'] == 'error':
+            raise Exception(f"Generation failed: {response.get('error')}")
+        
+        # 处理多个结果
+        results = response['results']
+        successful_results = [r for r in results if r['status'] == 'success']
+        
+        if not successful_results:
+            raise Exception("No successful generations")
+        
+        # 打印所有生成的文本
+        for i, result in enumerate(successful_results):
+            output_ids = torch.tensor(result['output_ids'])
+            text = self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
+            print(f"\nGeneration {i+1}:")
+            print(text)
+        
+        # 返回第一个成功的结果
+        return torch.tensor(successful_results[0]['output_ids'])
+```
+
+
+
+
+
+主要改动：
+1. 添加了并行生成支持
+2. 每个进程使用不同的 GPU
+3. 使用线程池管理并行任务
+4. 收集和统计所有结果
+5. 在客户端显示多个生成结果
+
+这样应该能充分利用所有 CPU 核心和 GPU 资源。需要注意的是：
+1. 每个进程都会占用一些 GPU 内存
+2. 需要确保有足够的系统内存
+3. 可能需要调整进程数量以获得最佳性能
+
+如果需要调整参数或有其他需求，请告诉我。
+
+---
+
+_**User**_
+
+ERROR:__main__:Process 8 error: Tensor on device cuda:0 is not on the expected device meta!
+ERROR:__main__:Process 1 error: Tensor on device cuda:0 is not on the expected device meta!
+ERROR:__main__:Process 4 error: Tensor on device cuda:0 is not on the expected device meta!
+ERROR:__main__:Process 6 error: Tensor on device cuda:0 is not on the expected device meta!
+ERROR:__main__:Process 7 error: Tensor on device cuda:0 is not on the expected device meta!
+INFO:__main__:Process 4 completed
+INFO:__main__:Process 8 completed
+INFO:__main__:Process 6 completed
+INFO:__main__:Process 7 completed
+INFO:__main__:Process 1 completed
+ERROR:__main__:Process 2 error: Tensor on device cuda:0 is not on the expected device meta!
+ERROR:__main__:Process 10 error: Tensor on device cuda:0 is not on the expected device meta!
+ERROR:__main__:Process 11 error: Tensor on device cuda:0 is not on the expected device meta!
+INFO:__main__:Process 11 completed
+INFO:__main__:Process 2 completed
+INFO:__main__:Process 10 completed
+ERROR:__main__:Process 9 error: Tensor on device cuda:0 is not on the expected device meta!
+INFO:__main__:Process 9 completed
+ERROR:__main__:Process 0 error: Tensor on device cuda:0 is not on the expected device meta!
+INFO:__main__:Process 0 completed
+ERROR:__main__:Process 5 error: Tensor on device cuda:0 is not on the expected device meta!
+INFO:__main__:Process 5 completed
+
+---
+
+_**Assistant**_
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+看起来是设备分配的问题。我们需要在每个进程中重新加载模型到指定的 GPU。让我们修改代码：
+
+```python:ktransformers/worker.py
+def generate_single(self, input_data: Dict[str, Any], process_id: int) -> Dict[str, Any]:
+    try:
+        logger.info(f"Process {process_id}: Starting generation...")
+        
+        # 设置当前进程使用的 GPU
+        gpu_id = process_id % 2  # 在两个 GPU 之间分配
+        device = f'cuda:{gpu_id}'
+        torch.cuda.set_device(device
 
 ---
 

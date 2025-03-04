@@ -97,7 +97,7 @@ class ModelWorker:
         
         # 添加并行配置
         model_kwargs = {
-            "device_map": "auto",
+            "device_map": None,  # 不使用自动设备映射
             "max_memory": max_memory,
             "low_cpu_mem_usage": True,
         }
@@ -119,6 +119,10 @@ class ModelWorker:
             **model_kwargs
         )
         
+        # 初始化时将模型放在 CPU 上
+        self.model = self.model.cpu()
+        self.model.eval()
+        
         # 应用模型优化
         if hasattr(self.model, "config"):
             self.model.config.use_cache = True  # 启用 KV 缓存
@@ -139,21 +143,6 @@ class ModelWorker:
         for name, device in self.model.hf_device_map.items():
             logger.info(f"  {name}: {device}")
         
-        self.model.eval()
-        
-        # 设置生成配置
-        try:
-            self.model.generation_config = GenerationConfig.from_pretrained(model_path)
-        except Exception as e:
-            logger.warning(f"Generation config can't auto create, making default. Message: {e}")
-            self.model.generation_config = GenerationConfig(
-                temperature=0.6,
-                top_p=0.9,
-                do_sample=True
-            )
-        if self.model.generation_config.pad_token_id is None:
-            self.model.generation_config.pad_token_id = self.model.generation_config.eos_token_id
-            
         logger.info("Model loaded successfully")
 
     # 修改 CustomStreamer 类定义
@@ -172,13 +161,23 @@ class ModelWorker:
             
             # 设置当前进程使用的 GPU
             gpu_id = process_id % 2  # 在两个 GPU 之间分配
-            torch.cuda.set_device(f'cuda:{gpu_id}')
+            device = f'cuda:{gpu_id}'
+            torch.cuda.set_device(device)
             
-            input_ids = torch.tensor(input_data['input_ids'], device=f'cuda:{gpu_id}')
-            attention_mask = torch.tensor(input_data['attention_mask'], device=f'cuda:{gpu_id}')
+            # 将模型移动到当前进程的 GPU
+            model = self.model.to(device)
+            
+            # 确保模型在正确的设备上
+            for param in model.parameters():
+                if param.device != torch.device(device):
+                    param.data = param.data.to(device)
+            
+            # 准备输入数据
+            input_ids = torch.tensor(input_data['input_ids'], device=device)
+            attention_mask = torch.tensor(input_data['attention_mask'], device=device)
             
             with torch.no_grad(), torch.amp.autocast('cuda'):
-                outputs = self.model.generate(
+                outputs = model.generate(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     max_new_tokens=input_data.get('max_new_tokens', 512),
@@ -194,6 +193,10 @@ class ModelWorker:
                     pad_token_id=self.tokenizer.pad_token_id,
                     eos_token_id=self.tokenizer.eos_token_id
                 )
+            
+            # 清理 GPU 内存
+            del model
+            torch.cuda.empty_cache()
             
             return {
                 'process_id': process_id,

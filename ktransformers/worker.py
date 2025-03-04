@@ -55,8 +55,8 @@ class KVCacheServer:
         logger.info(f"Total layers: {num_layers}")
         
         # 调整层分配
-        cpu_front_layers = 33  # 前33层放在CPU
-        gpu_middle_layers = 14  # GPU总共处理14层
+        cpu_front_layers = 34  # 前34层放在CPU
+        gpu_middle_layers = 12  # GPU总共处理12层(每个GPU 6层)
         cpu_end_layers = num_layers - cpu_front_layers - gpu_middle_layers  # 剩余层放在CPU
         
         # 创建详细的设备映射
@@ -66,66 +66,9 @@ class KVCacheServer:
             'lm_head': 'cpu',  # 输出层放在 CPU
         }
         
-        # 前33层放在 CPU
+        # 前34层放在 CPU
         for i in range(cpu_front_layers):
-            device_map[f'model.layers.{i}'] = 'cpu'
-        
-        # 中间14层在两个 GPU 之间平衡分配（每个GPU 7层）
-        gpu_layers_per_device = gpu_middle_layers // 2
-        for i in range(cpu_front_layers, cpu_front_layers + gpu_middle_layers):
-            gpu_id = (i - cpu_front_layers) // gpu_layers_per_device
-            device_map[f'model.layers.{i}'] = f'cuda:{gpu_id}'
-        
-        # 剩余层放在 CPU
-        for i in range(cpu_front_layers + gpu_middle_layers, num_layers):
-            device_map[f'model.layers.{i}'] = 'cpu'
-        
-        # 设置内存限制
-        max_memory = {
-            0: "12GiB",  # 第一个GPU分配12GB
-            1: "12GiB",  # 第二个GPU分配12GB
-            'cpu': "138GiB"  # CPU内存
-        }
-        
-        logger.info("Device mapping summary:")
-        logger.info(f"CPU front layers: 0-{cpu_front_layers-1}")
-        logger.info(f"GPU layers: {cpu_front_layers}-{cpu_front_layers+gpu_middle_layers-1}")
-        logger.info(f"CPU end layers: {cpu_front_layers+gpu_middle_layers}-{num_layers-1}")
-        
-        # 详细的设备映射日志
-        device_counts = {'cpu': 0, 'cuda:0': 0, 'cuda:1': 0}
-        for layer, device in device_map.items():
-            logger.info(f"{layer}: {device}")
-            device_counts[device] += 1
-        
-        logger.info("\nLayer distribution:")
-        for device, count in device_counts.items():
-            logger.info(f"{device}: {count} layers")
-        
-        if torch.cuda.is_available():
-            torch.backends.cudnn.benchmark = True
-            torch.backends.cudnn.enabled = True
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-        
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            config=config,
-            trust_remote_code=True,
-            torch_dtype=torch.float16,
-            device_map=device_map,
-            max_memory=max_memory,
-            low_cpu_mem_usage=True,
-        )
-        
-        # 优化 CPU 上的层
-        for name, module in self.model.named_modules():
-            if any(device == 'cpu' for layer, device in device_map.items() if layer in name):
-                # 对于 CPU 上的层，使用 float32 以提高数值稳定性
-                module.to(torch.float32)
-        
-        self.model.eval()
-        logger.info("Model loaded successfully with custom device mapping")
+            device_map[f'model.layers.{i}']
 
 class ModelWorker:
     def __init__(self, address: str):

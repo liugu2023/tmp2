@@ -70,34 +70,16 @@ class ModelWorker:
             )
         
         logger.info("Loading model...")
-        # 设置双 GPU 的内存分配和并行配置
+        # 设置双 GPU 的内存分配
         max_memory = {
             0: "12GiB",    # 第一张 GPU 使用 12GB
             1: "12GiB",    # 第二张 GPU 使用 12GB
             'cpu': "138GiB" # 剩余放在 CPU 内存
         }
         
-        # 设置 CPU 线程数为物理核心数
-        num_physical_cores = 6
-        num_threads = 12  # 总线程数
-        
-        # 设置 PyTorch 线程数
-        torch.set_num_threads(num_threads)  # 使用所有逻辑核心
-        
-        # 设置 OpenMP 线程数
-        os.environ["OMP_NUM_THREADS"] = str(num_physical_cores)  # OpenMP 使用物理核心数
-        os.environ["MKL_NUM_THREADS"] = str(num_physical_cores)  # MKL 使用物理核心数
-        
-        logger.info("CPU threading configuration:")
-        logger.info(f"- Physical cores: {num_physical_cores}")
-        logger.info(f"- Total threads: {num_threads}")
-        logger.info(f"- PyTorch threads: {torch.get_num_threads()}")
-        logger.info(f"- OpenMP threads: {os.environ.get('OMP_NUM_THREADS')}")
-        logger.info(f"- MKL threads: {os.environ.get('MKL_NUM_THREADS')}")
-        
         # 添加并行配置
         model_kwargs = {
-            "device_map": None,  # 不使用自动设备映射
+            "device_map": "auto",  # 恢复自动设备映射
             "max_memory": max_memory,
             "low_cpu_mem_usage": True,
         }
@@ -119,30 +101,7 @@ class ModelWorker:
             **model_kwargs
         )
         
-        # 初始化时将模型放在 CPU 上
-        self.model = self.model.cpu()
         self.model.eval()
-        
-        # 应用模型优化
-        if hasattr(self.model, "config"):
-            self.model.config.use_cache = True  # 启用 KV 缓存
-            if hasattr(self.model.config, "pretraining_tp"):
-                self.model.config.pretraining_tp = 1  # 设置张量并行度
-        
-        # 输出优化配置信息
-        logger.info("Model optimization settings:")
-        logger.info("- Using FP16 precision")
-        logger.info("- Flash Attention 2 enabled")
-        logger.info("- CPU threads:")
-        logger.info(f"- Physical cores: {num_physical_cores}")
-        logger.info(f"- Total threads: {num_threads}")
-        logger.info(f"- PyTorch threads: {torch.get_num_threads()}")
-        logger.info(f"- OpenMP threads: {os.environ.get('OMP_NUM_THREADS')}")
-        logger.info(f"- MKL threads: {os.environ.get('MKL_NUM_THREADS')}")
-        logger.info("- Device mapping:")
-        for name, device in self.model.hf_device_map.items():
-            logger.info(f"  {name}: {device}")
-        
         logger.info("Model loaded successfully")
 
     # 修改 CustomStreamer 类定义
@@ -159,25 +118,16 @@ class ModelWorker:
         try:
             logger.info(f"Process {process_id}: Starting generation...")
             
-            # 设置当前进程使用的 GPU
+            # 使用共享模型，不再移动模型
             gpu_id = process_id % 2  # 在两个 GPU 之间分配
             device = f'cuda:{gpu_id}'
-            torch.cuda.set_device(device)
             
-            # 将模型移动到当前进程的 GPU
-            model = self.model.to(device)
-            
-            # 确保模型在正确的设备上
-            for param in model.parameters():
-                if param.device != torch.device(device):
-                    param.data = param.data.to(device)
-            
-            # 准备输入数据
+            # 只准备输入数据
             input_ids = torch.tensor(input_data['input_ids'], device=device)
             attention_mask = torch.tensor(input_data['attention_mask'], device=device)
             
             with torch.no_grad(), torch.amp.autocast('cuda'):
-                outputs = model.generate(
+                outputs = self.model.generate(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     max_new_tokens=input_data.get('max_new_tokens', 512),
@@ -193,10 +143,6 @@ class ModelWorker:
                     pad_token_id=self.tokenizer.pad_token_id,
                     eos_token_id=self.tokenizer.eos_token_id
                 )
-            
-            # 清理 GPU 内存
-            del model
-            torch.cuda.empty_cache()
             
             return {
                 'process_id': process_id,

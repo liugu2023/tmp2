@@ -4997,7 +4997,198 @@ def generate_single(self, input_data: Dict[str, Any], process_id: int) -> Dict[s
         # 设置当前进程使用的 GPU
         gpu_id = process_id % 2  # 在两个 GPU 之间分配
         device = f'cuda:{gpu_id}'
-        torch.cuda.set_device(device
+        torch.cuda.set_device(device)
+        
+        # 将模型移动到当前进程的 GPU
+        model = self.model.to(device)
+        
+        # 确保模型在正确的设备上
+        for param in model.parameters():
+            if param.device != torch.device(device):
+                param.data = param.data.to(device)
+        
+        # 准备输入数据
+        input_ids = torch.tensor(input_data['input_ids'], device=device)
+        attention_mask = torch.tensor(input_data['attention_mask'], device=device)
+        
+        with torch.no_grad(), torch.amp.autocast('cuda'):
+            outputs = model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=input_data.get('max_new_tokens', 512),
+                temperature=input_data.get('temperature', 0.6),
+                top_p=input_data.get('top_p', 0.9),
+                do_sample=input_data.get('do_sample', True),
+                streamer=None,  # 并行模式下暂时不使用 streamer
+                use_cache=True,
+                num_beams=1,
+                synced_gpus=False,
+                repetition_penalty=1.0,
+                length_penalty=1.0,
+                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=self.tokenizer.eos_token_id
+            )
+        
+        # 清理 GPU 内存
+        del model
+        torch.cuda.empty_cache()
+        
+        return {
+            'process_id': process_id,
+            'status': 'success',
+            'output_ids': outputs.cpu().numpy().tolist()
+        }
+    except Exception as e:
+        logger.error(f"Process {process_id} error: {str(e)}")
+        return {
+            'process_id': process_id,
+            'status': 'error',
+            'error': str(e)
+        }
+```
+
+
+
+
+
+
+同时修改模型加载部分：
+
+```python:ktransformers/worker.py
+def load_model(self, model_path: str, gguf_path: str):
+    # ... 其他代码保持不变 ...
+    
+    # 添加并行配置
+    model_kwargs = {
+        "device_map": None,  # 不使用自动设备映射
+        "max_memory": max_memory,
+        "low_cpu_mem_usage": True,
+    }
+    
+    logger.info("Applying optimization configurations...")
+    self.model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        config=config,
+        trust_remote_code=True,
+        torch_dtype=torch.float16,
+        **model_kwargs
+    )
+    
+    # 初始化时将模型放在 CPU 上
+    self.model = self.model.cpu()
+    self.model.eval()
+```
+
+
+
+
+
+
+主要改动：
+1. 禁用自动设备映射
+2. 初始时将模型放在 CPU 上
+3. 在每个进程中将模型复制到指定 GPU
+4. 确保所有参数都在正确的设备上
+5. 生成完成后清理 GPU 内存
+
+这样应该能解决设备分配的问题。如果还有其他错误，请告诉我。
+
+---
+
+_**User**_
+
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/archive/liugu/ds/ktransformers/ktransformers/local_chat.py", line 193, in <module>
+    main()
+  File "/archive/liugu/ds/ktransformers/ktransformers/local_chat.py", line 135, in main
+    model.load_model(args.model_path, args.gguf_path)
+  File "/archive/liugu/ds/ktransformers/ktransformers/local_chat.py", line 54, in load_model
+    raise Exception(f"Failed to load model: {response.get('error')}")
+Exception: Failed to load model: 'LlamaForCausalLM' object has no attribute 'hf_device_map'
+
+---
+
+_**Assistant**_
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+啊，是的，因为我们禁用了自动设备映射，所以没有 `hf_device_map` 属性。让我们修改代码：
+
+```python:ktransformers/worker.py
+def load_model(self, model_path: str, gguf_path: str):
+    # ... 其他代码保持不变 ...
+    
+    # 添加并行配置
+    model_kwargs = {
+        "device_map": None,  # 不使用自动设备映射
+        "max_memory": max_memory,
+        "low_cpu_mem_usage": True,
+    }
+    
+    logger.info("Applying optimization configurations...")
+    self.model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        config=config,
+        trust_remote_code=True,
+        torch_dtype=torch.float16,
+        **model_kwargs
+    )
+    
+    # 初始化时将模型放在 CPU 上
+    self.model = self.model.cpu()
+    self.model.eval()
+    
+    # 应用模型优化
+    if hasattr(self.model, "config"):
+        self.model.config.use_cache = True  # 启用 KV 缓存
+        if hasattr(self.model.config, "pretraining_tp"):
+            self.model.config.pretraining_tp = 1  # 设置张量并行度
+    
+    # 输出优化配置信息
+    logger.info("Model optimization settings:")
+    logger.info("- Using FP16 precision")
+    logger.info("- Flash Attention 2 enabled")
+    logger.info("- CPU threads:")
+    logger.info(f"- Physical cores: {num_physical_cores}")
+    logger.info(f"- Total threads: {num_threads}")
+    logger.info(f"- PyTorch threads: {torch.get_num_threads()}")
+    logger.info(f"- OpenMP threads: {os.environ.get('OMP_NUM_THREADS')}")
+    logger.info(f"- MKL threads: {os.environ.get('MKL_NUM_THREADS')}")
+    logger.info("- Initial device: CPU")
+    logger.info("- Will distribute across GPUs during generation")
+    
+    logger.info("Model loaded successfully")
+```
+
+
+
+
+
+
+主要改动：
+1. 移除了 `hf_device_map` 相关的日志
+2. 添加了更清晰的设备分配说明
+
+这样应该能正常工作了。模型会：
+1. 初始加载到 CPU
+2. 在生成时复制到各个 GPU
+3. 每个进程使用独立的模型副本
+
+如果还有其他错误，请告诉我。
 
 ---
 

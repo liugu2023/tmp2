@@ -234,8 +234,7 @@ class ModelWorker:
                     length_penalty=1.0,
                     early_stopping=True,
                     pad_token_id=self.tokenizer.pad_token_id,
-                    eos_token_id=self.tokenizer.eos_token_id,
-                    use_attention_mask=True
+                    eos_token_id=self.tokenizer.eos_token_id
                 )
             
             end_time = time.time()

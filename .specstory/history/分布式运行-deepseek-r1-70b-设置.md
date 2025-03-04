@@ -7101,7 +7101,247 @@ _**Assistant**_
 
 
 
-啊，我明白了。当使用 meta
+啊，我明白了。当使用 meta 设备时，我们需要使用 `to_empty()` 方法。让我们修改代码：
+
+```python:ktransformers/worker.py
+def load_model(self, model_path: str, gguf_path: str):
+    logger.info("Loading tokenizer...")
+    self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    
+    logger.info("Loading model config...")
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    config.attn_implementation = "flash_attention_2"
+    torch.set_default_dtype(config.torch_dtype)
+    
+    # 计算模型层数
+    num_layers = config.num_hidden_layers
+    logger.info(f"Total layers: {num_layers}")
+    
+    # 调整层分配
+    cpu_front_layers = 34  # 前34层放在CPU
+    gpu_middle_layers = 12  # GPU总共处理12层(每个GPU 6层)
+    cpu_end_layers = num_layers - cpu_front_layers - gpu_middle_layers
+    
+    # 记录最终的设备分配计划
+    self.layer_device_map = {
+        'model.embed_tokens': 'cpu',
+        'model.norm': 'cpu',
+        'lm_head': 'cpu',
+        **{f'model.layers.{i}': 'cpu' for i in range(cpu_front_layers)},
+        **{f'model.layers.{i}': f'cuda:{(i-cpu_front_layers)//6}' 
+           for i in range(cpu_front_layers, cpu_front_layers + gpu_middle_layers)},
+        **{f'model.layers.{i}': 'cpu' 
+           for i in range(cpu_front_layers + gpu_middle_layers, num_layers)}
+    }
+    
+    logger.info("Loading model with dynamic loading...")
+    # 首先加载空模型
+    self.model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        config=config,
+        trust_remote_code=True,
+        torch_dtype=torch.float16,
+        device_map='meta',  # 先全部放在 meta 设备
+        low_cpu_mem_usage=True,
+    ).to_empty(device='meta')
+    
+    # 创建模型参数存储目录
+    os.makedirs("model_offload", exist_ok=True)
+    
+    # 初始加载必要的组件
+    logger.info("Loading essential components...")
+    self._load_essential_components()
+    
+    self.model.eval()
+    logger.info("Model initialized successfully")
+
+def _load_essential_components(self):
+    """加载必要的模型组件"""
+    # 从预训练模型加载实际权重
+    state_dict = AutoModelForCausalLM.from_pretrained(
+        self.model_path,
+        config=self.model.config,
+        trust_remote_code=True,
+        torch_dtype=torch.float32,  # 使用 float32 加载
+        device_map=None,  # 不使用设备映射
+        state_dict=True,  # 只加载状态字典
+        low_cpu_mem_usage=True,
+    ).state_dict()
+    
+    # 加载必要组件
+    essential_components = ['model.embed_tokens', 'model.norm', 'lm_head']
+    for name in essential_components:
+        logger.info(f"Loading {name}")
+        try:
+            module = self.model.get_submodule(name)
+            # 加载权重并移动到 CPU
+            for param_name, param in module.named_parameters():
+                full_name = f"{name}.{param_name}"
+                if full_name in state_dict:
+                    param.data = state_dict[full_name].to('cpu')
+            
+            self.loaded_layers.add(name)
+            logger.info(f"Loaded {name} to CPU")
+            
+        except Exception as e:
+            logger.error(f"Error loading {name}: {str(e)}")
+            raise
+
+def _move_to_device(self, layer_name: str, device: str):
+    """将指定层移动到目标设备"""
+    try:
+        # 从预训练模型加载实际权重
+        state_dict = AutoModelForCausalLM.from_pretrained(
+            self.model_path,
+            config=self.model.config,
+            trust_remote_code=True,
+            torch_dtype=torch.float16,
+            device_map=None,
+            state_dict=True,
+            low_cpu_mem_usage=True,
+        ).state_dict()
+        
+        # 获取模块
+        module = self.model.get_submodule(layer_name)
+        
+        # 加载权重并移动到目标设备
+        for param_name, param in module.named_parameters():
+            full_name = f"{layer_name}.{param_name}"
+            if full_name in state_dict:
+                param.data = state_dict[full_name].to(device)
+        
+        self.loaded_layers.add(layer_name)
+        logger.info(f"Moved {layer_name} to {device}")
+        
+    except Exception as e:
+        logger.error(f"Error moving {layer_name} to {device}: {str(e)}")
+        raise
+```
+
+主要改动：
+1. 使用 `to_empty()` 初始化空模型
+2. 分别加载每个组件的实际权重
+3. 直接从预训练模型加载状态字典
+4. 按需将权重移动到指定设备
+
+这样应该能正确处理 meta 设备的问题。如果还有其他错误，请告诉我。
+
+---
+
+_**User**_
+
+INFO:__main__:Loading essential components...
+INFO:__main__:Worker shutdown complete
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 287, in <module>
+    main()
+    ^^^^^^
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 284, in main
+    worker.run()
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 256, in run
+    self.kv_server.load_model(
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 91, in load_model
+    self._load_essential_components()
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 100, in _load_essential_components
+    self.model_path,
+    ^^^^^^^^^^^^^^^
+AttributeError: 'KVCacheServer' object has no attribute 'model_path'
+
+---
+
+_**Assistant**_
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+啊，抱歉，我们需要保存 model_path。让我们修改 load_model 方法：
+
+```python:ktransformers/worker.py
+def load_model(self, model_path: str, gguf_path: str):
+    logger.info("Loading tokenizer...")
+    self.model_path = model_path  # 保存模型路径
+    self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    
+    logger.info("Loading model config...")
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    config.attn_implementation = "flash_attention_2"
+    torch.set_default_dtype(config.torch_dtype)
+    
+    # 计算模型层数
+    num_layers = config.num_hidden_layers
+    logger.info(f"Total layers: {num_layers}")
+    
+    # 调整层分配
+    cpu_front_layers = 34  # 前34层放在CPU
+    gpu_middle_layers = 12  # GPU总共处理12层(每个GPU 6层)
+    cpu_end_layers = num_layers - cpu_front_layers - gpu_middle_layers
+    
+    # 记录最终的设备分配计划
+    self.layer_device_map = {
+        'model.embed_tokens': 'cpu',
+        'model.norm': 'cpu',
+        'lm_head': 'cpu',
+        **{f'model.layers.{i}': 'cpu' for i in range(cpu_front_layers)},
+        **{f'model.layers.{i}': f'cuda:{(i-cpu_front_layers)//6}' 
+           for i in range(cpu_front_layers, cpu_front_layers + gpu_middle_layers)},
+        **{f'model.layers.{i}': 'cpu' 
+           for i in range(cpu_front_layers + gpu_middle_layers, num_layers)}
+    }
+    
+    logger.info("Loading model with dynamic loading...")
+    # 首先加载空模型
+    self.model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        config=config,
+        trust_remote_code=True,
+        torch_dtype=torch.float16,
+        device_map='meta',  # 先全部放在 meta 设备
+        low_cpu_mem_usage=True,
+    ).to_empty(device='meta')
+    
+    # 创建模型参数存储目录
+    os.makedirs("model_offload", exist_ok=True)
+    
+    # 初始加载必要的组件
+    logger.info("Loading essential components...")
+    self._load_essential_components()
+    
+    self.model.eval()
+    logger.info("Model initialized successfully")
+```
+
+主要改动：
+1. 在 load_model 方法开始时保存 model_path
+2. 其他代码保持不变
+
+这样 _load_essential_components 就能访问到 model_path 了。如果还有其他错误，请告诉我。
+
+---
+
+_**User**_
+
+Loading essential components这一步再加上常用词，内存不够，如果不能加载完全的话，直接下放到磁盘
+
+---
+
+_**Assistant**_
+
+
 
 ---
 

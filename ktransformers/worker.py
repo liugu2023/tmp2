@@ -9,6 +9,7 @@ import os
 import multiprocessing
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
+import psutil
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -95,37 +96,136 @@ class KVCacheServer:
         logger.info("Model initialized successfully")
     
     def _load_essential_components(self):
-        """加载必要的模型组件"""
-        # 从预训练模型加载实际权重
-        state_dict = AutoModelForCausalLM.from_pretrained(
-            self.model_path,
-            config=self.model.config,
-            trust_remote_code=True,
-            torch_dtype=torch.float32,  # 使用 float32 加载
-            device_map=None,  # 不使用设备映射
-            state_dict=True,  # 只加载状态字典
-            low_cpu_mem_usage=True,
-        ).state_dict()
-        
-        # 加载必要组件
-        essential_components = ['model.embed_tokens', 'model.norm', 'lm_head']
-        for name in essential_components:
-            logger.info(f"Loading {name}")
+        """加载必要的模型组件和常用词"""
+        logger.info("Loading state dict...")
+        try:
+            # 从预训练模型加载实际权重
+            state_dict = AutoModelForCausalLM.from_pretrained(
+                self.model_path,
+                config=self.model.config,
+                trust_remote_code=True,
+                torch_dtype=torch.float32,  # 使用 float32 加载
+                device_map=None,  # 不使用设备映射
+                state_dict=True,  # 只加载状态字典
+                low_cpu_mem_usage=True,
+            ).state_dict()
+            
+            # 创建词表缓存目录
+            vocab_cache_dir = "vocab_cache"
+            os.makedirs(vocab_cache_dir, exist_ok=True)
+            
+            # 加载必要组件
+            essential_components = ['model.embed_tokens', 'model.norm', 'lm_head']
+            for name in essential_components:
+                logger.info(f"Loading {name}")
+                try:
+                    module = self.model.get_submodule(name)
+                    # 加载权重并移动到 CPU
+                    for param_name, param in module.named_parameters():
+                        full_name = f"{name}.{param_name}"
+                        if full_name in state_dict:
+                            try:
+                                # 尝试加载到 CPU
+                                param.data = state_dict[full_name].to('cpu')
+                            except RuntimeError as e:
+                                if "out of memory" in str(e):
+                                    logger.warning(f"Not enough memory for {full_name}, saving to disk")
+                                    # 保存到磁盘
+                                    torch.save(state_dict[full_name], f"{vocab_cache_dir}/{full_name.replace('/', '_')}.pt")
+                                    # 使用 meta tensor 占位
+                                    param.data = torch.empty(1, device='meta')
+                
+                    self.loaded_layers.add(name)
+                    logger.info(f"Loaded {name}")
+                    
+                except Exception as e:
+                    logger.error(f"Error loading {name}: {str(e)}")
+                    raise
+            
+            # 尝试加载常用词嵌入
+            logger.info("Loading common token embeddings...")
             try:
-                module = self.model.get_submodule(name)
-                # 加载权重并移动到 CPU
-                for param_name, param in module.named_parameters():
-                    full_name = f"{name}.{param_name}"
-                    if full_name in state_dict:
-                        param.data = state_dict[full_name].to('cpu')
+                # 获取词嵌入矩阵
+                embed_weight = state_dict['model.embed_tokens.weight']
+                vocab_size = embed_weight.size(0)
+                embed_dim = embed_weight.size(1)
                 
-                self.loaded_layers.add(name)
-                logger.info(f"Loaded {name} to CPU")
+                # 计算每个批次的大小（基于可用内存）
+                available_mem = psutil.virtual_memory().available
+                token_size = embed_dim * 4  # 每个token的近似内存大小（以字节为单位）
+                batch_size = min(1000, max(100, available_mem // (token_size * 2)))  # 留出一半内存作为缓冲
                 
+                # 分批处理词嵌入
+                for start_idx in range(0, vocab_size, batch_size):
+                    end_idx = min(start_idx + batch_size, vocab_size)
+                    batch_tokens = list(range(start_idx, end_idx))
+                    
+                    try:
+                        # 尝试加载到内存
+                        batch_embeds = embed_weight[batch_tokens].to('cpu')
+                        # 保存到缓存文件
+                        cache_file = f"{vocab_cache_dir}/token_embeds_{start_idx}_{end_idx}.pt"
+                        torch.save(batch_embeds, cache_file)
+                        logger.info(f"Cached tokens {start_idx}-{end_idx}")
+                    except RuntimeError as e:
+                        if "out of memory" in str(e):
+                            logger.warning(f"Memory full at token {start_idx}, remaining tokens will be loaded on demand")
+                            break
+                        raise
+                    
+                    # 释放内存
+                    del batch_embeds
+                    torch.cuda.empty_cache()
+                    
             except Exception as e:
-                logger.error(f"Error loading {name}: {str(e)}")
-                raise
-    
+                logger.error(f"Error caching token embeddings: {str(e)}")
+                logger.warning("Will load tokens on demand")
+            
+            # 清理原始状态字典以释放内存
+            del state_dict
+            torch.cuda.empty_cache()
+            
+        except Exception as e:
+            logger.error(f"Error in essential components loading: {str(e)}")
+            raise
+
+    def _load_token_embedding(self, token_id: int):
+        """按需加载单个词的嵌入"""
+        vocab_cache_dir = "vocab_cache"
+        
+        # 确定token所在的缓存文件
+        for cache_file in os.listdir(vocab_cache_dir):
+            if cache_file.startswith("token_embeds_"):
+                start_idx, end_idx = map(int, cache_file.split("_")[2:4])
+                if start_idx <= token_id < end_idx:
+                    try:
+                        # 加载整个批次
+                        batch_embeds = torch.load(f"{vocab_cache_dir}/{cache_file}")
+                        # 获取特定token的嵌入
+                        token_embed = batch_embeds[token_id - start_idx]
+                        return token_embed
+                    except Exception as e:
+                        logger.error(f"Error loading token {token_id}: {str(e)}")
+                        raise
+        
+        # 如果找不到缓存，从原始模型加载
+        try:
+            state_dict = AutoModelForCausalLM.from_pretrained(
+                self.model_path,
+                config=self.model.config,
+                trust_remote_code=True,
+                state_dict=True,
+                low_cpu_mem_usage=True,
+            ).state_dict()
+            
+            token_embed = state_dict['model.embed_tokens.weight'][token_id]
+            del state_dict
+            return token_embed
+            
+        except Exception as e:
+            logger.error(f"Error loading token {token_id} from model: {str(e)}")
+            raise
+
     def _move_to_device(self, layer_name: str, device: str):
         """将指定层移动到目标设备"""
         try:

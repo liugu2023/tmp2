@@ -135,6 +135,37 @@ class ModelWorker:
                        f"temperature={temperature}, "
                        f"top_p={top_p}")
             
+            # 创建自定义流式处理器
+            class StreamingHandler:
+                def __init__(self, socket, tokenizer):
+                    self.socket = socket
+                    self.tokenizer = tokenizer
+                    self.current_text = ""
+                    self.last_send_time = time.time()
+                    
+                def __call__(self, text_chunk: str, stream_end: bool = False):
+                    current_time = time.time()
+                    self.current_text += text_chunk
+                    
+                    # 每0.5秒或结束时发送一次
+                    if stream_end or (current_time - self.last_send_time) > 0.5:
+                        self.socket.send_pyobj({
+                            'status': 'streaming',
+                            'text': self.current_text,
+                            'finished': stream_end
+                        })
+                        # 等待客户端确认
+                        self.socket.recv_pyobj()
+                        self.last_send_time = current_time
+            
+            # 创建流式处理器
+            streamer = self.CustomStreamer(
+                self.tokenizer,
+                on_text_chunk=StreamingHandler(self.socket, self.tokenizer),
+                skip_prompt=True,
+                skip_special_tokens=True
+            )
+            
             # 生成文本
             logger.info("Starting text generation...")
             start_time = time.time()
@@ -156,7 +187,7 @@ class ModelWorker:
                     num_beams=1,  # 单束搜索，但启用并行
                     synced_gpus=True  # 启用 GPU 同步
                 )
-                
+            
             end_time = time.time()
             generation_time = end_time - start_time
             tokens_generated = len(outputs[0]) - len(input_ids[0])

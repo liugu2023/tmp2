@@ -4165,6 +4165,26 @@ def load_model(self, model_path: str, gguf_path: str):
 
 ---
 
+_**User**_
+
+INFO:__main__:Creating chat messages...
+INFO:__main__:Tokenizing input...
+INFO:__main__:Starting generation...
+INFO:__main__:Preparing generation request...
+INFO:__main__:Starting generation...
+ERROR:__main__:Error in generate: Generation failed: name 'streamer' is not defined
+ERROR:__main__:Error: Generation failed: name 'streamer' is not defined
+INFO:__main__:Sending shutdown command to worker...
+INFO:__main__:Worker shutdown successfully
+
+---
+
+_**Assistant**_
+
+
+
+---
+
 
 
 ---

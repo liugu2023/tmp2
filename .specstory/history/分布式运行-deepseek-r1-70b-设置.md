@@ -4416,6 +4416,227 @@ _**Assistant**_
 
 
 
+
+
+
+
+
+
+
+
+好的，让我们根据您的 CPU 配置来优化线程设置。我们需要修改几个地方：
+
+```python:ktransformers/worker.py
+def load_model(self, model_path: str, gguf_path: str):
+    # ... 前面的代码保持不变 ...
+    
+    # 设置 CPU 线程数为物理核心数
+    num_physical_cores = 6
+    num_threads = 12  # 总线程数
+    
+    # 设置 PyTorch 线程数
+    torch.set_num_threads(num_threads)  # 使用所有逻辑核心
+    
+    # 设置 OpenMP 线程数
+    import os
+    os.environ["OMP_NUM_THREADS"] = str(num_physical_cores)  # OpenMP 使用物理核心数
+    os.environ["MKL_NUM_THREADS"] = str(num_physical_cores)  # MKL 使用物理核心数
+    
+    logger.info("CPU threading configuration:")
+    logger.info(f"- Physical cores: {num_physical_cores}")
+    logger.info(f"- Total threads: {num_threads}")
+    logger.info(f"- PyTorch threads: {torch.get_num_threads()}")
+    logger.info(f"- OpenMP threads: {os.environ.get('OMP_NUM_THREADS')}")
+    logger.info(f"- MKL threads: {os.environ.get('MKL_NUM_THREADS')}")
+    
+    # 添加并行配置
+    model_kwargs = {
+        "device_map": "auto",
+        "max_memory": max_memory,
+        "low_cpu_mem_usage": True,
+    }
+    
+    # ... 其余代码保持不变 ...
+```
+
+
+
+在 generate 方法中也相应更新：
+
+```python:ktransformers/worker.py
+def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        # ... 其他代码保持不变 ...
+        
+        # 生成文本
+        logger.info("Starting text generation...")
+        start_time = time.time()
+        
+        # 设置生成时的线程配置
+        torch.set_grad_enabled(False)
+        torch.set_num_threads(12)  # 使用所有逻辑核心
+        
+        with torch.no_grad(), torch.amp.autocast('cuda'):
+            outputs = self.model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                do_sample=input_data.get('do_sample', True),
+                streamer=streamer,
+                use_cache=True,
+                num_beams=1,
+                synced_gpus=False,
+                # 添加批处理参数以提高 CPU 利用率
+                batch_size=1,
+                num_return_sequences=1,
+                pad_token_id=self.tokenizer.pad_token_id,
+                max_concurrent_sequences=6  # 使用物理核心数
+            )
+```
+
+
+
+主要优化点：
+1. 使用所有 12 个逻辑线程进行 PyTorch 计算
+2. 使用 6 个物理核心进行 OpenMP 和 MKL 计算
+3. 设置最大并发序列数为物理核心数
+4. 分别优化了不同计算库的线程配置
+
+这样应该能更好地利用您的 CPU 资源。运行命令保持不变：
+
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0,1 python -m ktransformers.worker --worker_address "10.21.22.206:29500"
+```
+
+如果需要进一步调整线程配置，请告诉我。
+
+---
+
+_**User**_
+
+ERROR:__main__:Error in generate: Generation failed: The following `model_kwargs` are not used by the model: ['batch_size', 'max_concurrent_sequences'] (note: typos in the generate arguments will also show up in this list)
+ERROR:__main__:Error: Generation failed: The following `model_kwargs` are not used by the model: ['batch_size', 'max_concurrent_sequences'] (note: typos in the generate arguments will also show up in this list)
+INFO:__main__:Sending shutdown command to worker...
+INFO:__main__:Worker shutdown successfully
+
+---
+
+_**Assistant**_
+
+
+
+
+
+
+
+
+
+
+
+
+
+看来这些参数不被模型支持。让我们修改生成配置，移除不支持的参数并添加其他优化：
+
+```python:ktransformers/worker.py
+def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        # ... 其他代码保持不变 ...
+        
+        # 生成文本
+        logger.info("Starting text generation...")
+        start_time = time.time()
+        
+        # 设置生成时的线程配置
+        torch.set_grad_enabled(False)
+        torch.set_num_threads(12)  # 使用所有逻辑核心
+        
+        with torch.no_grad(), torch.amp.autocast('cuda'):
+            outputs = self.model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                do_sample=input_data.get('do_sample', True),
+                streamer=streamer,
+                use_cache=True,
+                num_beams=1,
+                synced_gpus=False,
+                # 添加其他可用的优化参数
+                repetition_penalty=1.0,
+                length_penalty=1.0,
+                early_stopping=True,
+                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=self.tokenizer.eos_token_id,
+                use_attention_mask=True
+            )
+```
+
+
+
+
+同时，我们可以在模型加载时添加一些额外的优化：
+
+```python:ktransformers/worker.py
+def load_model(self, model_path: str, gguf_path: str):
+    # ... 其他代码保持不变 ...
+    
+    # 添加并行配置
+    model_kwargs = {
+        "device_map": "auto",
+        "max_memory": max_memory,
+        "low_cpu_mem_usage": True,
+    }
+    
+    # 设置并行环境
+    if torch.cuda.is_available():
+        # 启用 CUDA 优化
+        torch.backends.cudnn.benchmark = True  # 启用 cuDNN 自动调优
+        torch.backends.cudnn.enabled = True
+        torch.backends.cuda.matmul.allow_tf32 = True  # 允许使用 TF32
+        torch.backends.cudnn.allow_tf32 = True
+    
+    logger.info("Applying optimization configurations...")
+    self.model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        config=config,
+        trust_remote_code=True,
+        torch_dtype=torch.float16,
+        **model_kwargs
+    )
+    
+    # 应用模型优化
+    if hasattr(self.model, "config"):
+        self.model.config.use_cache = True  # 启用 KV 缓存
+        if hasattr(self.model.config, "pretraining_tp"):
+            self.model.config.pretraining_tp = 1  # 设置张量并行度
+```
+
+
+
+
+主要改动：
+1. 移除了不支持的批处理参数
+2. 添加了其他有效的生成参数
+3. 启用了 CUDA 相关优化
+4. 添加了模型级别的优化配置
+
+这些优化应该能在不引发错误的情况下提高性能。如果还有其他问题，请告诉我。
+
+---
+
+_**User**_
+
+允许将模型卸载到磁盘上
+
+---
+
+_**Assistant**_
+
+
+
 ---
 
 

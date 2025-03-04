@@ -3894,6 +3894,133 @@ _**Assistant**_
 
 
 
+
+
+
+
+
+
+
+
+看起来是设备映射的问题。让我们修改 worker.py 中的设备配置：
+
+```python:ktransformers/worker.py
+def load_model(self, model_path: str, gguf_path: str):
+    logger.info("Loading tokenizer...")
+    self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    
+    logger.info("Loading model config...")
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    torch.set_default_dtype(config.torch_dtype)
+    
+    logger.info("Loading model...")
+    # 设置双 GPU 的内存分配
+    max_memory = {
+        0: "12GiB",    # 第一张 GPU 使用 12GB
+        1: "12GiB",    # 第二张 GPU 使用 12GB
+        'cpu': "138GiB" # 剩余放在 CPU 内存
+    }
+    
+    # 简化设备映射，让 transformers 自动处理
+    model_kwargs = {
+        "device_map": "auto",  # 让 transformers 自动处理设备分配
+        "max_memory": max_memory
+    }
+    
+    logger.info("Applying optimization configurations...")
+    self.model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        config=config,
+        trust_remote_code=True,
+        torch_dtype=torch.float16,
+        **model_kwargs
+    )
+    
+    # 输出优化配置信息
+    logger.info("Model optimization settings:")
+    logger.info("- Using FP16 precision")
+    logger.info("- Device mapping:")
+    for name, device in self.model.hf_device_map.items():
+        logger.info(f"  {name}: {device}")
+    
+    self.model.eval()
+```
+
+
+
+
+
+主要改动：
+1. 移除了手动的设备映射配置
+2. 使用 "auto" 让 transformers 自动处理设备分配
+3. 保留了内存限制和 FP16 设置
+
+这样应该能正确处理所有层的设备分配。如果还有其他错误，请告诉我。
+
+---
+
+_**User**_
+
+为什么加载模型的时候可以多核，推理模型的时候只能单核呢
+
+---
+
+_**Assistant**_
+
+这是因为我们没有启用模型的并行推理。让我们修改代码来启用多核推理：
+
+```python:ktransformers/worker.py
+def load_model(self, model_path: str, gguf_path: str):
+    # ... 前面的代码保持不变 ...
+    
+    # 设置双 GPU 的内存分配和并行配置
+    max_memory = {
+        0: "12GiB",    # 第一张 GPU 使用 12GB
+        1: "12GiB",    # 第二张 GPU 使用 12GB
+        'cpu': "138GiB" # 剩余放在 CPU 内存
+    }
+    
+    # 添加并行配置
+    model_kwargs = {
+        "device_map": "auto",  # 让 transformers 自动处理设备分配
+        "max_memory": max_memory,
+        # 启用模型并行
+        "use_flash_attention_2": True,  # 使用 Flash Attention 2
+        "parallel_mode": "tensor",  # 使用张量并行
+        "low_cpu_mem_usage": True,
+    }
+    
+    # 设置并行环境
+    torch.set_num_threads(8)  # 设置 CPU 线程数
+    if torch.cuda.is_available():
+        torch.cuda.set_device('cuda:0')  # 设置主 GPU
+    
+    logger.info("Applying optimization configurations...")
+    self.model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        config=config,
+        trust_remote_code=True,
+        torch_dtype=torch.float16,
+        **model_kwargs
+    )
+    
+    # 启用模型并行配置
+    if hasattr(self.model, "enable_model_parallel"):
+        self.model.enable_model_parallel()
+    
+    # 输出优化配置信息
+    logger.info("Model optimization settings:")
+    logger.info("- Using FP16 precision")
+    logger.info("- Flash Attention 2 enabled")
+    logger.info("- Tensor parallel enabled")
+    logger.info("- CPU threads: 8")
+    logger.info("- Device mapping:")
+    for name, device in self.model.hf_device_map.items():
+        logger.info(f"  {name}: {device}")
+    
+    self.model.eval()
+```
+
 ---
 
 

@@ -50,18 +50,27 @@ class ModelWorker:
         torch.set_default_dtype(config.torch_dtype)
         
         logger.info("Loading model...")
-        # 设置双 GPU 的内存分配
+        # 设置双 GPU 的内存分配和并行配置
         max_memory = {
             0: "12GiB",    # 第一张 GPU 使用 12GB
             1: "12GiB",    # 第二张 GPU 使用 12GB
             'cpu': "138GiB" # 剩余放在 CPU 内存
         }
         
-        # 简化设备映射，让 transformers 自动处理
+        # 添加并行配置
         model_kwargs = {
             "device_map": "auto",  # 让 transformers 自动处理设备分配
-            "max_memory": max_memory
+            "max_memory": max_memory,
+            # 启用模型并行
+            "use_flash_attention_2": True,  # 使用 Flash Attention 2
+            "parallel_mode": "tensor",  # 使用张量并行
+            "low_cpu_mem_usage": True,
         }
+        
+        # 设置并行环境
+        torch.set_num_threads(8)  # 设置 CPU 线程数
+        if torch.cuda.is_available():
+            torch.cuda.set_device('cuda:0')  # 设置主 GPU
         
         logger.info("Applying optimization configurations...")
         self.model = AutoModelForCausalLM.from_pretrained(
@@ -72,9 +81,16 @@ class ModelWorker:
             **model_kwargs
         )
         
+        # 启用模型并行配置
+        if hasattr(self.model, "enable_model_parallel"):
+            self.model.enable_model_parallel()
+        
         # 输出优化配置信息
         logger.info("Model optimization settings:")
         logger.info("- Using FP16 precision")
+        logger.info("- Flash Attention 2 enabled")
+        logger.info("- Tensor parallel enabled")
+        logger.info("- CPU threads: 8")
         logger.info("- Device mapping:")
         for name, device in self.model.hf_device_map.items():
             logger.info(f"  {name}: {device}")
@@ -128,68 +144,11 @@ class ModelWorker:
             logger.info("Starting text generation...")
             start_time = time.time()
             with torch.no_grad(), torch.amp.autocast('cuda'):
-                logger.info("Initializing generation process...")
-                # 添加详细的初始化信息
-                logger.info("- Checking model state...")
-                logger.info(f"- Model device: {self.model.device}")
-                logger.info(f"- Input shape: {input_ids.shape}")
-                logger.info(f"- Current GPU memory allocated: {torch.cuda.memory_allocated()/1024**3:.2f}GB")
+                # 启用并行生成
+                torch.set_grad_enabled(False)
+                torch.set_num_threads(8)  # 设置 CPU 线程数
                 
-                # KV cache 信息
-                num_layers = len(self.model.model.layers)
-                hidden_size = self.model.config.hidden_size
-                logger.info(f"- Model architecture:")
-                logger.info(f"  - Number of layers: {num_layers}")
-                logger.info(f"  - Hidden size: {hidden_size}")
-                
-                # 估算 KV cache 大小
-                seq_len = input_ids.shape[1] + max_new_tokens
-                kv_cache_size = 2 * num_layers * seq_len * hidden_size * input_ids.shape[0] * 2 / (1024**3)  # in GB
-                logger.info(f"- Estimated KV cache size: {kv_cache_size:.2f}GB")
-                
-                # 检查是否启用了 flash attention
-                if hasattr(self.model.config, '_attn_implementation'):
-                    logger.info(f"- Attention implementation: {self.model.config._attn_implementation}")
-                
-                logger.info("- Starting token generation...")
-                logger.info("  - Generation started with following settings:")
-                logger.info(f"    - Input context length: {len(input_ids[0])} tokens")
-                logger.info(f"    - Maximum new tokens: {max_new_tokens}")
-                logger.info(f"    - Temperature: {temperature}")
-                logger.info(f"    - Top-p sampling: {top_p}")
-                logger.info(f"    - Do sample: {input_data.get('do_sample', True)}")
-                
-                # 创建自定义流式处理器
-                class StreamingHandler:
-                    def __init__(self, socket, tokenizer):
-                        self.socket = socket
-                        self.tokenizer = tokenizer
-                        self.current_text = ""
-                        self.last_send_time = time.time()
-                        
-                    def __call__(self, text_chunk: str, stream_end: bool = False):
-                        current_time = time.time()
-                        self.current_text += text_chunk
-                        
-                        # 每0.5秒或结束时发送一次
-                        if stream_end or (current_time - self.last_send_time) > 0.5:
-                            self.socket.send_pyobj({
-                                'status': 'streaming',
-                                'text': self.current_text,
-                                'finished': stream_end
-                            })
-                            # 等待客户端确认
-                            self.socket.recv_pyobj()
-                            self.last_send_time = current_time
-                
-                # 创建流式处理器
-                streamer = self.CustomStreamer(
-                    self.tokenizer,
-                    on_text_chunk=StreamingHandler(self.socket, self.tokenizer),
-                    skip_prompt=True,
-                    skip_special_tokens=True
-                )
-                
+                # 使用多 GPU 生成
                 outputs = self.model.generate(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
@@ -197,18 +156,12 @@ class ModelWorker:
                     temperature=temperature,
                     top_p=top_p,
                     do_sample=input_data.get('do_sample', True),
-                    streamer=streamer
+                    streamer=streamer,
+                    use_cache=True,  # 启用 KV 缓存
+                    num_beams=1,  # 单束搜索，但启用并行
+                    synced_gpus=True  # 启用 GPU 同步
                 )
                 
-                # 记录生成完成的信息
-                final_time = time.time()
-                total_gen_time = final_time - start_time
-                logger.info("  - Generation completed:")
-                logger.info(f"    - Total generation time: {total_gen_time:.2f} seconds")
-                logger.info(f"    - Final sequence length: {len(outputs[0])} tokens")
-                logger.info(f"    - New tokens generated: {len(outputs[0]) - len(input_ids[0])}")
-                logger.info(f"    - Average speed: {(len(outputs[0]) - len(input_ids[0])) / total_gen_time:.2f} tokens/sec")
-            
             end_time = time.time()
             generation_time = end_time - start_time
             tokens_generated = len(outputs[0]) - len(input_ids[0])

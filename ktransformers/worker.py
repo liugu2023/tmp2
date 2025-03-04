@@ -47,6 +47,9 @@ class ModelWorker:
         
         logger.info("Loading model config...")
         config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        
+        # 更新配置
+        config.attn_implementation = "flash_attention_2"  # 新的 Flash Attention 2 配置
         torch.set_default_dtype(config.torch_dtype)
         
         logger.info("Loading model...")
@@ -61,9 +64,6 @@ class ModelWorker:
         model_kwargs = {
             "device_map": "auto",  # 让 transformers 自动处理设备分配
             "max_memory": max_memory,
-            # 启用模型并行
-            "use_flash_attention_2": True,  # 使用 Flash Attention 2
-            "parallel_mode": "tensor",  # 使用张量并行
             "low_cpu_mem_usage": True,
         }
         
@@ -81,15 +81,10 @@ class ModelWorker:
             **model_kwargs
         )
         
-        # 启用模型并行配置
-        if hasattr(self.model, "enable_model_parallel"):
-            self.model.enable_model_parallel()
-        
         # 输出优化配置信息
         logger.info("Model optimization settings:")
         logger.info("- Using FP16 precision")
         logger.info("- Flash Attention 2 enabled")
-        logger.info("- Tensor parallel enabled")
         logger.info("- CPU threads: 8")
         logger.info("- Device mapping:")
         for name, device in self.model.hf_device_map.items():

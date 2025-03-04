@@ -4021,6 +4021,148 @@ def load_model(self, model_path: str, gguf_path: str):
     self.model.eval()
 ```
 
+在 generate 方法中也添加并行处理：
+
+```python:ktransformers/worker.py
+def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        # ... 其他代码保持不变 ...
+        
+        # 生成文本
+        logger.info("Starting text generation...")
+        start_time = time.time()
+        with torch.no_grad(), torch.amp.autocast('cuda'):
+            # 启用并行生成
+            torch.set_grad_enabled(False)
+            torch.set_num_threads(8)  # 设置 CPU 线程数
+            
+            # 使用多 GPU 生成
+            outputs = self.model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                do_sample=input_data.get('do_sample', True),
+                streamer=streamer,
+                use_cache=True,  # 启用 KV 缓存
+                num_beams=1,  # 单束搜索，但启用并行
+                synced_gpus=True  # 启用 GPU 同步
+            )
+            
+        # ... 其他代码保持不变 ...
+```
+
+主要改动：
+1. 启用 Flash Attention 2
+2. 启用张量并行
+3. 设置 CPU 线程数
+4. 启用模型并行
+5. 启用 GPU 同步
+6. 优化生成参数
+
+这样应该能充分利用多核和多 GPU 进行推理。如果需要调整并行参数，请告诉我。
+
+---
+
+_**User**_
+
+The model was loaded with use_flash_attention_2=True, which is deprecated and may be removed in a future release. Please use `attn_implementation="flash_attention_2"` instead.
+ERROR:__main__:Error processing message: LlamaForCausalLM.__init__() got an unexpected keyword argument 'parallel_mode'
+
+
+---
+
+_**Assistant**_
+
+
+
+
+
+
+
+
+
+
+
+
+
+让我们修正这些参数问题。根据错误信息，我们需要更新配置：
+
+```python:ktransformers/worker.py
+def load_model(self, model_path: str, gguf_path: str):
+    logger.info("Loading tokenizer...")
+    self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    
+    logger.info("Loading model config...")
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    
+    # 更新配置
+    config.attn_implementation = "flash_attention_2"  # 新的 Flash Attention 2 配置
+    torch.set_default_dtype(config.torch_dtype)
+    
+    logger.info("Loading model...")
+    # 设置双 GPU 的内存分配和并行配置
+    max_memory = {
+        0: "12GiB",    # 第一张 GPU 使用 12GB
+        1: "12GiB",    # 第二张 GPU 使用 12GB
+        'cpu': "138GiB" # 剩余放在 CPU 内存
+    }
+    
+    # 添加并行配置
+    model_kwargs = {
+        "device_map": "auto",  # 让 transformers 自动处理设备分配
+        "max_memory": max_memory,
+        "low_cpu_mem_usage": True,
+    }
+    
+    # 设置并行环境
+    torch.set_num_threads(8)  # 设置 CPU 线程数
+    if torch.cuda.is_available():
+        torch.cuda.set_device('cuda:0')  # 设置主 GPU
+    
+    logger.info("Applying optimization configurations...")
+    self.model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        config=config,
+        trust_remote_code=True,
+        torch_dtype=torch.float16,
+        **model_kwargs
+    )
+    
+    # 输出优化配置信息
+    logger.info("Model optimization settings:")
+    logger.info("- Using FP16 precision")
+    logger.info("- Flash Attention 2 enabled")
+    logger.info("- CPU threads: 8")
+    logger.info("- Device mapping:")
+    for name, device in self.model.hf_device_map.items():
+        logger.info(f"  {name}: {device}")
+    
+    self.model.eval()
+```
+
+
+
+
+
+主要改动：
+1. 移除了 `use_flash_attention_2` 参数，改用 `config.attn_implementation`
+2. 移除了不支持的 `parallel_mode` 参数
+3. 保留了基本的优化配置：
+   - Flash Attention 2
+   - 自动设备映射
+   - CPU 线程设置
+   - FP16 精度
+
+这样应该能正常工作了。并行处理主要通过：
+1. Flash Attention 2 优化
+2. 自动设备映射
+3. CPU 多线程
+4. yaml 规则文件中的优化
+
+如果还有其他错误，请告诉我。
+
 ---
 
 

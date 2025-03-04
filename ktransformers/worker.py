@@ -44,6 +44,7 @@ class KVCacheServer:
         
     def load_model(self, model_path: str, gguf_path: str):
         logger.info("Loading tokenizer...")
+        self.model_path = model_path  # 保存模型路径
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         
         logger.info("Loading model config...")

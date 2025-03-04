@@ -60,26 +60,11 @@ class KVCacheServer:
         gpu_middle_layers = 12  # GPU总共处理12层(每个GPU 6层)
         cpu_end_layers = num_layers - cpu_front_layers - gpu_middle_layers
         
-        # 创建详细的设备映射
-        device_map = {
-            'model.embed_tokens': 'meta',  # 先放在 meta 设备上
-            'model.norm': 'meta',
-            'lm_head': 'meta',
-        }
-        
-        # 所有层初始都放在 meta 设备上
-        for i in range(num_layers):
-            device_map[f'model.layers.{i}'] = 'meta'
-        
-        # 设置内存限制
-        max_memory = {
-            0: "12GiB",
-            1: "12GiB",
-            'cpu': "138GiB"
-        }
-        
         # 记录最终的设备分配计划
         self.layer_device_map = {
+            'model.embed_tokens': 'cpu',
+            'model.norm': 'cpu',
+            'lm_head': 'cpu',
             **{f'model.layers.{i}': 'cpu' for i in range(cpu_front_layers)},
             **{f'model.layers.{i}': f'cuda:{(i-cpu_front_layers)//6}' 
                for i in range(cpu_front_layers, cpu_front_layers + gpu_middle_layers)},
@@ -88,15 +73,15 @@ class KVCacheServer:
         }
         
         logger.info("Loading model with dynamic loading...")
+        # 首先加载空模型
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path,
             config=config,
             trust_remote_code=True,
             torch_dtype=torch.float16,
-            device_map=device_map,  # 初始全部放在 meta 设备
-            max_memory=max_memory,
+            device_map='meta',  # 先全部放在 meta 设备
             low_cpu_mem_usage=True,
-        )
+        ).to_empty(device='meta')
         
         # 创建模型参数存储目录
         os.makedirs("model_offload", exist_ok=True)
@@ -110,25 +95,62 @@ class KVCacheServer:
     
     def _load_essential_components(self):
         """加载必要的模型组件"""
-        # 加载 embedding 层
-        self._move_to_device('model.embed_tokens', 'cpu')
-        # 加载最终的 norm 层
-        self._move_to_device('model.norm', 'cpu')
-        # 加载输出层
-        self._move_to_device('lm_head', 'cpu')
+        # 从预训练模型加载实际权重
+        state_dict = AutoModelForCausalLM.from_pretrained(
+            self.model_path,
+            config=self.model.config,
+            trust_remote_code=True,
+            torch_dtype=torch.float32,  # 使用 float32 加载
+            device_map=None,  # 不使用设备映射
+            state_dict=True,  # 只加载状态字典
+            low_cpu_mem_usage=True,
+        ).state_dict()
         
-        # 转换为 float32 以提高稳定性
-        self.model.embed_tokens.to(torch.float32)
-        self.model.norm.to(torch.float32)
-        self.model.lm_head.to(torch.float32)
+        # 加载必要组件
+        essential_components = ['model.embed_tokens', 'model.norm', 'lm_head']
+        for name in essential_components:
+            logger.info(f"Loading {name}")
+            try:
+                module = self.model.get_submodule(name)
+                # 加载权重并移动到 CPU
+                for param_name, param in module.named_parameters():
+                    full_name = f"{name}.{param_name}"
+                    if full_name in state_dict:
+                        param.data = state_dict[full_name].to('cpu')
+                
+                self.loaded_layers.add(name)
+                logger.info(f"Loaded {name} to CPU")
+                
+            except Exception as e:
+                logger.error(f"Error loading {name}: {str(e)}")
+                raise
     
     def _move_to_device(self, layer_name: str, device: str):
         """将指定层移动到目标设备"""
         try:
+            # 从预训练模型加载实际权重
+            state_dict = AutoModelForCausalLM.from_pretrained(
+                self.model_path,
+                config=self.model.config,
+                trust_remote_code=True,
+                torch_dtype=torch.float16,
+                device_map=None,
+                state_dict=True,
+                low_cpu_mem_usage=True,
+            ).state_dict()
+            
+            # 获取模块
             module = self.model.get_submodule(layer_name)
-            module.to(device)
+            
+            # 加载权重并移动到目标设备
+            for param_name, param in module.named_parameters():
+                full_name = f"{layer_name}.{param_name}"
+                if full_name in state_dict:
+                    param.data = state_dict[full_name].to(device)
+            
             self.loaded_layers.add(layer_name)
             logger.info(f"Moved {layer_name} to {device}")
+            
         except Exception as e:
             logger.error(f"Error moving {layer_name} to {device}: {str(e)}")
             raise

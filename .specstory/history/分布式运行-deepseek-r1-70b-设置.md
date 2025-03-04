@@ -6973,7 +6973,135 @@ class KVCacheServer:
         
         # 创建详细的设备映射
         device_map = {
-            'model.embed_tokens':
+            'model.embed_tokens': 'meta',  # 先放在 meta 设备上
+            'model.norm': 'meta',
+            'lm_head': 'meta',
+        }
+        
+        # 所有层初始都放在 meta 设备上
+        for i in range(num_layers):
+            device_map[f'model.layers.{i}'] = 'meta'
+        
+        # 设置内存限制
+        max_memory = {
+            0: "12GiB",
+            1: "12GiB",
+            'cpu': "138GiB"
+        }
+        
+        # 记录最终的设备分配计划
+        self.layer_device_map = {
+            **{f'model.layers.{i}': 'cpu' for i in range(cpu_front_layers)},
+            **{f'model.layers.{i}': f'cuda:{(i-cpu_front_layers)//6}' 
+               for i in range(cpu_front_layers, cpu_front_layers + gpu_middle_layers)},
+            **{f'model.layers.{i}': 'cpu' 
+               for i in range(cpu_front_layers + gpu_middle_layers, num_layers)}
+        }
+        
+        logger.info("Loading model with dynamic loading...")
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            config=config,
+            trust_remote_code=True,
+            torch_dtype=torch.float16,
+            device_map=device_map,  # 初始全部放在 meta 设备
+            max_memory=max_memory,
+            low_cpu_mem_usage=True,
+        )
+        
+        # 创建模型参数存储目录
+        os.makedirs("model_offload", exist_ok=True)
+        
+        # 初始加载必要的组件
+        logger.info("Loading essential components...")
+        self._load_essential_components()
+        
+        self.model.eval()
+        logger.info("Model initialized successfully")
+    
+    def _load_essential_components(self):
+        """加载必要的模型组件"""
+        # 加载 embedding 层
+        self._move_to_device('model.embed_tokens', 'cpu')
+        # 加载最终的 norm 层
+        self._move_to_device('model.norm', 'cpu')
+        # 加载输出层
+        self._move_to_device('lm_head', 'cpu')
+        
+        # 转换为 float32 以提高稳定性
+        self.model.embed_tokens.to(torch.float32)
+        self.model.norm.to(torch.float32)
+        self.model.lm_head.to(torch.float32)
+    
+    def _move_to_device(self, layer_name: str, device: str):
+        """将指定层移动到目标设备"""
+        try:
+            module = self.model.get_submodule(layer_name)
+            module.to(device)
+            self.loaded_layers.add(layer_name)
+            logger.info(f"Moved {layer_name} to {device}")
+        except Exception as e:
+            logger.error(f"Error moving {layer_name} to {device}: {str(e)}")
+            raise
+    
+    def _ensure_layer_loaded(self, layer_name: str):
+        """确保指定层已加载到正确的设备"""
+        if layer_name not in self.loaded_layers:
+            target_device = self.layer_device_map.get(layer_name)
+            if target_device:
+                self._move_to_device(layer_name, target_device)
+                self._maybe_offload_params()
+```
+
+主要改进：
+1. 不修改 vocab_size，保持原始维度
+2. 使用 meta 设备初始化模型
+3. 只加载必要的组件
+4. 按需加载其他层
+5. 动态管理层的加载和卸载
+
+需要我继续完善其他部分吗？
+
+---
+
+_**User**_
+
+INFO:__main__:Loading essential components...
+ERROR:__main__:Error moving model.embed_tokens to cpu: Cannot copy out of meta tensor; no data! Please use torch.nn.Module.to_empty() instead of torch.nn.Module.to() when moving module from meta to a different device.
+INFO:__main__:Worker shutdown complete
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 265, in <module>
+    main()
+    ^^^^^^
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 262, in main
+    worker.run()
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 234, in run
+    self.kv_server.load_model(
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 106, in load_model
+    self._load_essential_components()
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 114, in _load_essential_components
+    self._move_to_device('model.embed_tokens', 'cpu')
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 129, in _move_to_device
+    module.to(device)
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1340, in to
+    return self._apply(convert)
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/torch/nn/modules/module.py", line 927, in _apply
+    param_applied = fn(param)
+                    ^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1333, in convert
+    raise NotImplementedError(
+NotImplementedError: Cannot copy out of meta tensor; no data! Please use torch.nn.Module.to_empty() instead of torch.nn.Module.to() when moving module from meta to a different device.
+
+---
+
+_**Assistant**_
+
+
+
+啊，我明白了。当使用 meta
 
 ---
 

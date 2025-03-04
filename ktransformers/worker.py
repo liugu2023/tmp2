@@ -38,17 +38,25 @@ class KVCacheServer:
         self.tokenizer = None
         self.kv_cache = {}
         self.lock = threading.Lock()
+        self.loaded_params = set()  # 记录已加载的参数
+        self.param_usage_stats = {}  # 记录参数使用频率
+        self.vocab_usage_stats = {}  # 记录词汇使用频率
         
     def load_model(self, model_path: str, gguf_path: str):
         logger.info("Loading tokenizer...")
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         
+        # 只加载最常用的 5000 个词汇
+        vocab_size = min(5000, len(self.tokenizer.vocab))
+        logger.info(f"Initially loading top {vocab_size} tokens")
+        
         logger.info("Loading model config...")
         config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         config.attn_implementation = "flash_attention_2"
-        torch.set_default_dtype(config.torch_dtype)
         
-        logger.info("Loading model...")
+        # 修改配置以支持动态加载
+        config.vocab_size = vocab_size  # 初始词汇表大小
+        torch.set_default_dtype(config.torch_dtype)
         
         # 计算模型层数
         num_layers = config.num_hidden_layers  # 应该是 80 层
@@ -108,6 +116,8 @@ class KVCacheServer:
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
         
+        # 修改模型加载方式
+        logger.info("Loading model with dynamic parameter loading...")
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path,
             config=config,
@@ -116,7 +126,12 @@ class KVCacheServer:
             device_map=device_map,
             max_memory=max_memory,
             low_cpu_mem_usage=True,
+            offload_folder="model_offload",  # 存储未加载参数的目录
+            offload_state_dict=True  # 启用状态字典卸载
         )
+        
+        # 初始化参数管理器
+        self.param_manager = self._init_param_manager(model_path)
         
         logger.info("Converting CPU layers to float32...")
         # 获取需要转换的模块列表
@@ -175,19 +190,93 @@ class KVCacheServer:
         
         logger.info("Model loaded successfully with custom device mapping")
 
-class ModelWorker:
-    def __init__(self, address: str):
-        self.context = zmq.Context()
-        self.socket = self.context.socket(zmq.REP)
-        self.socket.bind(f"tcp://{address}")
-        self.kv_server = KVCacheServer()
-        logger.info(f"Worker started at {address}")
+    def _init_param_manager(self, model_path):
+        """初始化参数管理器"""
+        return {
+            'model_path': model_path,
+            'param_files': {},  # 参数文件映射
+            'loaded_params': set(),  # 已加载的参数
+            'param_usage': {},  # 参数使用统计
+            'vocab_usage': {},  # 词汇使用统计
+            'last_access': {},  # 最后访问时间
+        }
+    
+    def _load_param_on_demand(self, param_name):
+        """按需加载参数"""
+        if param_name not in self.param_manager['loaded_params']:
+            logger.info(f"Loading parameter {param_name} on demand")
+            param_path = os.path.join(self.param_manager['model_path'], f"{param_name}.bin")
+            
+            try:
+                # 加载参数
+                param_data = torch.load(param_path)
+                
+                # 获取目标设备
+                target_device = self._get_param_device(param_name)
+                
+                # 将参数加载到正确的设备
+                with torch.cuda.device(target_device if 'cuda' in target_device else 'cpu'):
+                    self.model.state_dict()[param_name].copy_(param_data)
+                
+                self.param_manager['loaded_params'].add(param_name)
+                self.param_manager['last_access'][param_name] = time.time()
+                
+                # 如果内存接近上限，卸载最少使用的参数
+                self._maybe_offload_params()
+                
+            except Exception as e:
+                logger.error(f"Error loading parameter {param_name}: {str(e)}")
+                raise
+    
+    def _maybe_offload_params(self):
+        """如果需要，卸载最少使用的参数"""
+        if torch.cuda.is_available():
+            # 检查 GPU 内存使用情况
+            for i in range(torch.cuda.device_count()):
+                memory_stats = torch.cuda.memory_stats(i)
+                allocated = memory_stats['allocated_bytes.all.current'] / 1024**3
+                
+                # 如果使用超过 80%，开始卸载
+                if allocated > 9.6:  # 12GB * 0.8
+                    self._offload_least_used_params(i)
+    
+    def _offload_least_used_params(self, gpu_id):
+        """卸载指定 GPU 上最少使用的参数"""
+        # 获取该 GPU 上的参数
+        gpu_params = [
+            p for p in self.param_manager['loaded_params']
+            if self._get_param_device(p) == f'cuda:{gpu_id}'
+        ]
+        
+        # 按最后访问时间排序
+        gpu_params.sort(key=lambda p: self.param_manager['last_access'][p])
+        
+        # 卸载 20% 最少使用的参数
+        num_to_offload = max(1, len(gpu_params) // 5)
+        for param_name in gpu_params[:num_to_offload]:
+            self._offload_param(param_name)
+    
+    def _offload_param(self, param_name):
+        """将参数卸载到 CPU 或磁盘"""
+        logger.info(f"Offloading parameter {param_name}")
+        param_data = self.model.state_dict()[param_name]
+        
+        # 保存到磁盘
+        torch.save(param_data, f"model_offload/{param_name}.bin")
+        
+        # 从 GPU 移除
+        self.model.state_dict()[param_name].data = torch.empty(1, device='meta')
+        self.param_manager['loaded_params'].remove(param_name)
+        torch.cuda.empty_cache()
 
     def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+        # 在生成前确保需要的参数已加载
+        self._ensure_required_params(input_data)
+        
         try:
-            with self.kv_server.lock:
+            with self.kv_cache.lock:
                 with torch.no_grad():
-                    outputs = self.kv_server.model.generate(
+                    outputs = self.model.generate(
                         input_ids=input_data['input_ids'],
                         attention_mask=input_data['attention_mask'],
                         max_new_tokens=input_data.get('max_new_tokens', 512),
@@ -198,8 +287,8 @@ class ModelWorker:
                         num_beams=1,
                         repetition_penalty=1.0,
                         length_penalty=1.0,
-                        pad_token_id=self.kv_server.tokenizer.pad_token_id,
-                        eos_token_id=self.kv_server.tokenizer.eos_token_id
+                        pad_token_id=self.tokenizer.pad_token_id,
+                        eos_token_id=self.tokenizer.eos_token_id
                     )
             
             return {
@@ -212,6 +301,14 @@ class ModelWorker:
                 'status': 'error',
                 'error': str(e)
             }
+
+class ModelWorker:
+    def __init__(self, address: str):
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.REP)
+        self.socket.bind(f"tcp://{address}")
+        self.kv_server = KVCacheServer()
+        logger.info(f"Worker started at {address}")
 
     def run(self):
         logger.info("Worker ready")
@@ -228,7 +325,7 @@ class ModelWorker:
                     self.socket.send_pyobj({'status': 'success'})
                 
                 elif command == 'generate':
-                    result = self.generate(message['data'])
+                    result = self.kv_server.generate(message['data'])
                     self.socket.send_pyobj(result)
                 
                 elif command == 'shutdown':

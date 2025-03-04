@@ -6670,6 +6670,89 @@ torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 896.00 MiB. GPU 0 
 
 _**Assistant**_
 
+这是因为在转换数据类型时，PyTorch 试图一次性将所有参数转换，导致内存峰值过高。让我们修改代码，分批处理参数转换：
+
+```python:ktransformers/worker.py
+def load_model(self, model_path: str, gguf_path: str):
+    # ... 前面的代码保持不变到 model 加载完成 ...
+
+    logger.info("Converting CPU layers to float32...")
+    # 获取需要转换的模块列表
+    cpu_modules = []
+    for name, module in self.model.named_modules():
+        if any(device == 'cpu' for layer, device in device_map.items() if layer in name):
+            cpu_modules.append((name, module))
+    
+    # 分批处理转换
+    batch_size = 4  # 每次处理4个模块
+    for i in range(0, len(cpu_modules), batch_size):
+        batch = cpu_modules[i:i + batch_size]
+        for name, module in batch:
+            logger.info(f"Converting {name} to float32")
+            try:
+                # 对于大型模块，进一步分批处理参数
+                for param_name, param in module.named_parameters():
+                    if param.device.type == 'cuda':
+                        # 如果参数在 GPU 上，先移到 CPU
+                        param.data = param.data.cpu()
+                    param.data = param.data.to(torch.float32)
+                
+                # 确保模块被正确分配到指定设备
+                target_device = next(
+                    device for layer, device in device_map.items() 
+                    if layer in name
+                )
+                if 'cuda' in target_device:
+                    gpu_id = int(target_device.split(':')[1])
+                    # 在目标 GPU 上分配内存
+                    with torch.cuda.device(gpu_id):
+                        module.to(target_device)
+                else:
+                    module.to('cpu')
+                
+            except Exception as e:
+                logger.error(f"Error converting {name}: {str(e)}")
+                raise
+        
+        # 清理未使用的内存
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    
+    logger.info("Model conversion completed")
+    self.model.eval()
+    
+    # 打印最终的内存使用情况
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            memory_stats = torch.cuda.memory_stats(i)
+            allocated = memory_stats['allocated_bytes.all.current'] / 1024**3
+            reserved = memory_stats['reserved_bytes.all.current'] / 1024**3
+            logger.info(f"GPU {i} memory usage:")
+            logger.info(f"  Allocated: {allocated:.2f} GB")
+            logger.info(f"  Reserved: {reserved:.2f} GB")
+    
+    logger.info("Model loaded successfully with custom device mapping")
+```
+
+主要改进：
+1. 分批处理模块转换
+2. 对大型模块分批处理参数
+3. 确保参数在正确的设备上
+4. 定期清理 GPU 缓存
+5. 添加详细的内存使用日志
+
+这样应该能更好地管理内存使用，避免单个 GPU 负载过高。如果还需要调整，请告诉我。
+
+---
+
+_**User**_
+
+咱们这样，动态加载需要的模型参数，只加载热门词汇的模型，剩下的用到了再加载
+
+---
+
+_**Assistant**_
+
 
 
 ---

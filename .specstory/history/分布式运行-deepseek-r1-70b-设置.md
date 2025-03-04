@@ -3448,6 +3448,170 @@ PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0,1 python -m kt
 
 ---
 
+_**User**_
+
+当我在客户端输入exit时，自动结束工作机器上的进程，避免我每次手动关闭
+
+---
+
+_**Assistant**_
+
+
+
+
+
+
+
+
+
+
+
+好的，让我们修改代码来实现优雅退出。需要修改两个文件：
+
+1. 首先在 local_chat.py 中添加退出命令：
+
+```python:ktransformers/local_chat.py
+def __init__(self, worker_address: str):
+    self.context = zmq.Context()
+    self.socket = self.context.socket(zmq.REQ)
+    self.socket.connect(f"tcp://{worker_address}")
+    logger.info(f"Connected to worker at {worker_address}")
+
+def shutdown(self):
+    """发送关闭命令给worker"""
+    try:
+        logger.info("Sending shutdown command to worker...")
+        message = {'command': 'shutdown'}
+        self.socket.send_pyobj(message)
+        response = self.socket.recv_pyobj()
+        if response['status'] == 'shutdown':
+            logger.info("Worker shutdown successfully")
+        self.socket.close()
+        self.context.term()
+    except Exception as e:
+        logger.error(f"Error during shutdown: {e}")
+
+def main():
+    # ... 其他代码保持不变 ...
+    
+    if args.worker_address:
+        # 分布式模式
+        logger.info("Running in distributed mode")
+        model = DistributedModel(args.worker_address)
+        model.load_model(args.model_path, args.gguf_path)
+        tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+        
+        try:
+            while True:
+                content = input("Chat: ")
+                if content.lower() in ['quit', 'exit']:
+                    logger.info("Shutting down...")
+                    model.shutdown()  # 发送关闭命令
+                    break
+                # ... 其他代码保持不变 ...
+        except KeyboardInterrupt:
+            logger.info("Received keyboard interrupt, shutting down...")
+            model.shutdown()
+        except Exception as e:
+            logger.error(f"Error: {str(e)}")
+            model.shutdown()
+```
+
+
+
+
+2. 在 worker.py 中完善关闭处理：
+
+```python:ktransformers/worker.py
+def run(self):
+    logger.info("Worker ready to receive requests")
+    try:
+        while True:
+            try:
+                message = self.socket.recv_pyobj()
+                command = message.get('command')
+                
+                if command == 'load_model':
+                    self.load_model(message['model_path'], message['gguf_path'])
+                    self.socket.send_pyobj({'status': 'success'})
+                
+                elif command == 'generate':
+                    result = self.generate(message['data'])
+                    self.socket.send_pyobj(result)
+                
+                elif command == 'shutdown':
+                    logger.info("Received shutdown command")
+                    self.socket.send_pyobj({'status': 'shutdown'})
+                    # 清理资源
+                    if hasattr(self, 'model'):
+                        del self.model
+                    if hasattr(self, 'tokenizer'):
+                        del self.tokenizer
+                    torch.cuda.empty_cache()
+                    logger.info("Resources cleaned up")
+                    break
+                
+            except Exception as e:
+                logger.error(f"Error processing message: {str(e)}")
+                self.socket.send_pyobj({'status': 'error', 'error': str(e)})
+    finally:
+        # 确保资源被清理
+        logger.info("Cleaning up worker resources...")
+        self.socket.close()
+        self.context.term()
+        logger.info("Worker shutdown complete")
+```
+
+
+
+
+现在当您在客户端输入 "exit" 或 "quit" 时：
+1. 客户端会发送关闭命令给 worker
+2. worker 会：
+   - 清理模型和 tokenizer
+   - 释放 GPU 内存
+   - 关闭 ZMQ 连接
+   - 优雅退出
+3. 客户端也会清理自己的资源并退出
+
+运行命令保持不变，但现在可以优雅地退出了：
+
+1. GPU 机器 (10.21.22.206):
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers CUDA_VISIBLE_DEVICES=0,1 python -m ktransformers.worker --worker_address "10.21.22.206:29500"
+```
+
+
+
+
+2. CPU 机器 (10.21.22.100):
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.local_chat \
+    --model_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/ \
+    --gguf_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/ \
+    --worker_address "10.21.22.206:29500" \
+    --max_new_tokens 50
+```
+
+
+
+
+当您想要退出时，只需在客户端输入 "exit" 或 "quit"，两边的程序都会正常关闭。
+
+---
+
+_**User**_
+
+ERROR:__main__:Error processing message: LlamaForCausalLM.__init__() got an unexpected keyword argument 'rope_scaling'
+
+---
+
+_**Assistant**_
+
+
+
+---
+
 
 
 ---

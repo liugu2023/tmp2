@@ -57,26 +57,11 @@ class ModelWorker:
             'cpu': "138GiB" # 剩余放在 CPU 内存
         }
         
-        # 添加优化配置
+        # 添加基本优化配置
         model_kwargs = {
-            # RoPE 优化
-            "rope_scaling": {
-                "type": "yarn",
-                "factor": 1.0,
-                "original_max_position_embeddings": 2048
-            },
-            
-            # 注意力机制优化
-            "attention_implementation": "flash_attention_2",
-            
-            # MoE 相关优化
-            "moe_expert_parallel": True,
-            "expert_parallel_size": 2,  # 使用两张 GPU
-            
             # 性能优化
             "use_cache": True,
             "low_cpu_mem_usage": True,
-            "preload_module_classes": ["MLP", "Attention"],
             
             # 设备配置
             "device_map": {
@@ -100,9 +85,8 @@ class ModelWorker:
         
         # 输出优化配置信息
         logger.info("Model optimization settings:")
-        logger.info("- Using YARN RoPE scaling")
-        logger.info("- Flash Attention 2 enabled")
-        logger.info("- MoE expert parallel enabled")
+        logger.info("- Using FP16 precision")
+        logger.info("- KV cache enabled")
         logger.info("- Device mapping:")
         for name, device in self.model.hf_device_map.items():
             logger.info(f"  {name}: {device}")

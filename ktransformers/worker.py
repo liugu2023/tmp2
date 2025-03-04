@@ -59,10 +59,6 @@ class ModelWorker:
         
         # 添加基本优化配置
         model_kwargs = {
-            # 性能优化
-            "use_cache": True,
-            "low_cpu_mem_usage": True,
-            
             # 设备配置
             "device_map": {
                 "embed_tokens": "cpu",
@@ -78,15 +74,12 @@ class ModelWorker:
             trust_remote_code=True,
             max_memory=max_memory,
             torch_dtype=torch.float16,
-            offload_folder=None,
-            offload_state_dict=False,
             **model_kwargs
         )
         
         # 输出优化配置信息
         logger.info("Model optimization settings:")
         logger.info("- Using FP16 precision")
-        logger.info("- KV cache enabled")
         logger.info("- Device mapping:")
         for name, device in self.model.hf_device_map.items():
             logger.info(f"  {name}: {device}")

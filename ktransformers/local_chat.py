@@ -35,11 +35,11 @@ def import_local_modules():
             prefill_and_generate, get_compute_capability, Config, flashinfer_enabled)
 
 class DistributedModel:
-    def __init__(self, worker_address: str):
+    def __init__(self, server_address: str):
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.REQ)
-        self.socket.connect(f"tcp://{worker_address}")
-        logger.info(f"Connected to worker at {worker_address}")
+        self.socket.connect(f"tcp://{server_address}")
+        logger.info(f"Connected to central server at {server_address}")
         
     def load_model(self, model_path: str, gguf_path: str):
         message = {
@@ -47,12 +47,12 @@ class DistributedModel:
             'model_path': model_path,
             'gguf_path': gguf_path
         }
-        logger.info("Requesting model load from worker...")
+        logger.info("Requesting model load from central server...")
         self.socket.send_pyobj(message)
         response = self.socket.recv_pyobj()
         if response['status'] != 'success':
             raise Exception(f"Failed to load model: {response.get('error')}")
-        logger.info("Model loaded successfully on worker")
+        logger.info("Model loaded successfully on all workers")
 
     def generate(self, input_ids, attention_mask, **kwargs):
         try:
@@ -127,15 +127,15 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_path', type=str, required=True)
     parser.add_argument('--gguf_path', type=str, required=True)
-    parser.add_argument('--worker_address', type=str, default=None,
-                      help='Address of worker for distributed mode (e.g., "10.21.22.206:29500")')
+    parser.add_argument('--server_address', type=str, default=None,
+                      help='Address of central server (e.g., "10.21.22.206:29400")')
     parser.add_argument('--max_new_tokens', type=int, default=300)
     args = parser.parse_args()
 
-    if args.worker_address:
+    if args.server_address:
         # 分布式模式
         logger.info("Running in distributed mode")
-        model = DistributedModel(args.worker_address)
+        model = DistributedModel(args.server_address)
         model.load_model(args.model_path, args.gguf_path)
         tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
         

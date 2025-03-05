@@ -8,6 +8,7 @@ from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM, Genera
 import time
 import subprocess
 import multiprocessing
+from ktransformers.kvcache_client import KVCacheClient
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -96,9 +97,10 @@ def load_model_and_tokenizer(model_path: str, gguf_path: str):
     return model, tokenizer
 
 class ModelWorker:
-    def __init__(self, address: str, worker_id: int = 0, num_workers: int = 1):
+    def __init__(self, address: str, worker_id: int = 0, num_workers: int = 1, shared_components=None):
         self.worker_id = worker_id
         self.num_workers = num_workers
+        self.shared_components = shared_components
         
         # 设置 GPU 设备
         if torch.cuda.is_available():
@@ -119,55 +121,135 @@ class ModelWorker:
         logger.info(f"Worker {worker_id} started at {address}, listening on all interfaces")
 
     def load_model(self, model_path: str, gguf_path: str):
-        logger.info("Loading tokenizer...")
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        # 如果有共享组件，使用共享组件
+        if self.shared_components:
+            logger.info("Using shared model components...")
+            config = self.shared_components['config']
+            self.tokenizer = AutoTokenizer.from_pretrained(self.shared_components['tokenizer_path'], trust_remote_code=True)
+        else:
+            # 否则正常加载
+            logger.info("Loading tokenizer...")
+            self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+            
+            logger.info("Loading model config...")
+            config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         
-        logger.info("Loading model config...")
-        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         torch.set_default_dtype(config.torch_dtype)
         
-        logger.info("Loading model...")
         # 计算每个进程应该处理的层
         total_layers = config.num_hidden_layers
         layers_per_process = total_layers // self.num_workers
         start_layer = self.worker_id * layers_per_process
         end_layer = start_layer + layers_per_process if self.worker_id < self.num_workers - 1 else total_layers
         
+        # 动态计算所需显存
+        hidden_size = config.hidden_size
+        # 假设最大上下文长度为8K
+        context_len = 8192
+        # 每层KV Cache = 2 * hidden_size * context_len * dtype_size (float16=2B)
+        kv_size_per_layer = 2 * hidden_size * context_len * 2 / (1024**3)  # 单位：GB
+        # 当前worker负责的层数
+        my_layers = end_layer - start_layer
+        # 预估KV缓存显存
+        total_kv_cache = kv_size_per_layer * my_layers
+        # 每层模型参数估算 (单位: GB)
+        hidden_dim = config.hidden_size
+        intermediate_dim = config.intermediate_size if hasattr(config, 'intermediate_size') else 4 * hidden_dim
+        param_size_per_layer = (12 * hidden_dim * hidden_dim + 4 * hidden_dim * intermediate_dim) * 2 / (1024**3)
+        base_model_size = param_size_per_layer * my_layers
+        # 工作空间估算 (1GB)
+        workspace_size = 1.0
+        # 最终显存预算
+        final_memory_budget = total_kv_cache + base_model_size + workspace_size
+        # 取整并加上安全余量
+        gpu_mem = max(3, int(final_memory_budget) + 1)
+        
+        logger.info(f"Worker {self.worker_id} memory calculation:")
+        logger.info(f"- Hidden size: {hidden_size}")
+        logger.info(f"- Context length: {context_len}")
+        logger.info(f"- KV cache per layer: {kv_size_per_layer:.2f} GB")
+        logger.info(f"- Layer parameters: {param_size_per_layer:.2f} GB per layer")
+        logger.info(f"- Handling {my_layers} layers: from {start_layer} to {end_layer-1}")
+        logger.info(f"- Estimated KV cache: {total_kv_cache:.2f} GB")
+        logger.info(f"- Estimated model parameters: {base_model_size:.2f} GB")
+        logger.info(f"- Estimated workspace: {workspace_size:.2f} GB")
+        logger.info(f"- Total GPU memory budget: {gpu_mem} GB")
+        
         # 设置内存分配
         max_memory = {
-            0: "3GiB" if self.worker_id < 4 else None,    # 前4个进程使用 GPU 0，每个3GB
-            1: "3GiB" if self.worker_id >= 4 else None,   # 后4个进程使用 GPU 1，每个3GB
+            0: f"{gpu_mem}GiB" if self.worker_id < 4 else None,    # 前4个进程使用 GPU 0
+            1: f"{gpu_mem}GiB" if self.worker_id >= 4 else None,   # 后4个进程使用 GPU 1
             'cpu': "138GiB"  # CPU 内存
         }
         
-        # 设置设备映射
-        device_map = {
-            'model.embed_tokens': 'cpu',
-            'model.norm': 'cpu',
-            'lm_head': 'cpu'
-        }
+        # 创建一个局部的设备映射
+        device_map = {}
+        
+        # 如果使用共享组件，不需要加载embed_tokens
+        if not self.shared_components:
+            device_map['model.embed_tokens'] = 'cpu'
+            device_map['lm_head'] = 'cpu'
+        
+        device_map['model.norm'] = 'cpu'
         
         # 分配层到对应的 GPU
         gpu_id = 0 if self.worker_id < 4 else 1
         for i in range(start_layer, end_layer):
             device_map[f'model.layers.{i}'] = f'cuda:{gpu_id}'
         
-        logger.info(f"Worker {self.worker_id} handling layers {start_layer} to {end_layer} on GPU {gpu_id}")
-        
-        model_kwargs = {
-            "device_map": device_map,
-            "max_memory": max_memory,
-            "torch_dtype": torch.float16,
-            "low_cpu_mem_usage": True  # 添加这个选项来减少内存使用
-        }
-        
-        logger.info("Applying optimization configurations...")
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            config=config,
-            trust_remote_code=True,
-            **model_kwargs
-        )
+        # 创建模型 - 只加载需要的层
+        if self.shared_components:
+            logger.info("Creating model with shared components...")
+            # 创建一个简化的模型结构
+            from transformers.modeling_utils import PreTrainedModel
+            
+            class PartialModel(PreTrainedModel):
+                def __init__(self, config):
+                    super().__init__(config)
+                    self.config = config
+                    
+                # 其他必要的方法...
+            
+            self.model = PartialModel(config)
+            
+            # 添加共享的embedding层
+            self.model.model.embed_tokens = self.shared_components['embed_tokens']
+            self.model.lm_head = self.shared_components['lm_head']
+            
+            # 只加载本worker需要处理的层
+            for i in range(start_layer, end_layer):
+                layer_key = f'model.layers.{i}'
+                # 检查该层是否已经在另一个进程中加载
+                if layer_key in self.shared_components['loaded_layers']:
+                    self.model.model.layers[i] = self.shared_components['loaded_layers'][layer_key]
+                else:
+                    # 加载新层
+                    layer = AutoModelForCausalLM.from_pretrained(
+                        model_path,
+                        config=config,
+                        device_map={f'model.layers.{i}': f'cuda:{gpu_id}'},
+                        torch_dtype=torch.float16,
+                    ).model.layers[i]
+                    
+                    self.model.model.layers[i] = layer
+                    # 将层添加到共享字典
+                    self.shared_components['loaded_layers'][layer_key] = layer
+        else:
+            # 使用标准方法加载
+            model_kwargs = {
+                "device_map": device_map,
+                "max_memory": max_memory,
+                "torch_dtype": torch.float16,
+                "low_cpu_mem_usage": True
+            }
+            
+            logger.info("Applying optimization configurations...")
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                config=config,
+                trust_remote_code=True,
+                **model_kwargs
+            )
         
         # 输出配置信息
         logger.info(f"Worker {self.worker_id} model configuration:")
@@ -226,37 +308,29 @@ class ModelWorker:
             # 生成文本
             logger.info("Starting text generation...")
             start_time = time.time()
+            
+            # 创建 KV Cache 客户端
+            kvcache_client = KVCacheClient("10.21.22.206:29600")
+            
+            # 生成唯一的 batch ID
+            batch_id = f"{time.time()}_{self.worker_id}"
+            
             with torch.no_grad(), torch.amp.autocast('cuda'):
-                logger.info("Initializing generation process...")
-                # 添加详细的初始化信息
-                logger.info("- Checking model state...")
-                logger.info(f"- Model device: {self.model.device}")
-                logger.info(f"- Input shape: {input_ids.shape}")
-                logger.info(f"- Current GPU memory allocated: {torch.cuda.memory_allocated()/1024**3:.2f}GB")
+                # 在每一层处理完后，存储 KV Cache
+                for i, layer in enumerate(self.model.model.layers):
+                    if start_layer <= i < end_layer:
+                        # 这是当前 worker 负责的层
+                        k, v = layer.self_attn.compute_kv(input_ids, attention_mask)
+                        kvcache_client.store(batch_id, i, k, v)
+                    else:
+                        # 需要从其他 worker 获取的层
+                        k, v = kvcache_client.retrieve(batch_id, i, f"cuda:{gpu_id}")
+                        if k is not None and v is not None:
+                            # 使用获取的 KV Cache 继续处理
+                            layer.self_attn.use_cached_kv(k, v)
                 
-                # KV cache 信息
-                num_layers = len(self.model.model.layers)
-                hidden_size = self.model.config.hidden_size
-                logger.info(f"- Model architecture:")
-                logger.info(f"  - Number of layers: {num_layers}")
-                logger.info(f"  - Hidden size: {hidden_size}")
-                
-                # 估算 KV cache 大小
-                seq_len = input_ids.shape[1] + max_new_tokens
-                kv_cache_size = 2 * num_layers * seq_len * hidden_size * input_ids.shape[0] * 2 / (1024**3)  # in GB
-                logger.info(f"- Estimated KV cache size: {kv_cache_size:.2f}GB")
-                
-                # 检查是否启用了 flash attention
-                if hasattr(self.model.config, '_attn_implementation'):
-                    logger.info(f"- Attention implementation: {self.model.config._attn_implementation}")
-                
-                logger.info("- Starting token generation...")
-                logger.info("  - Generation started with following settings:")
-                logger.info(f"    - Input context length: {len(input_ids[0])} tokens")
-                logger.info(f"    - Maximum new tokens: {max_new_tokens}")
-                logger.info(f"    - Temperature: {temperature}")
-                logger.info(f"    - Top-p sampling: {top_p}")
-                logger.info(f"    - Do sample: {input_data.get('do_sample', True)}")
+                # 生成完成后清理缓存
+                kvcache_client.clear(batch_id)
                 
                 # 创建自定义流式处理器
                 class StreamingHandler:

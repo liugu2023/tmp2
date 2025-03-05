@@ -40,8 +40,6 @@
       generate_device: "cuda"
       prefill_device: "cuda"
       absorb_for_prefill: True  # 启用长上下文优化
-      use_flash_attention: True  # 强制使用 flash attention
-      flash_attention_impl: "flash_attention_2"  # 指定使用 v2 版本
 
 # 优化模型主体
 - match:

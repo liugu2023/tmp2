@@ -28,24 +28,30 @@ class SharedModelComponents:
         # 只加载embedding层到CPU，不加载完整模型
         logger.info("Loading embedding layer...")
         
-        # 方法1：只加载嵌入层，避免加载其他层
-        from huggingface_hub import hf_hub_download
-        import json
-        import torch
+        # 修改：直接从预训练模型加载嵌入层
+        logger.info("Loading pretrained model components...")
+        temp_model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            config=self.config,
+            trust_remote_code=True,
+            device_map={'model.embed_tokens': 'cpu', 'lm_head': 'cpu'},
+            torch_dtype=torch.float16,
+            low_cpu_mem_usage=True
+        )
         
-        # 先获取模型配置，了解嵌入层的尺寸
-        embedding_dim = self.config.hidden_size
-        vocab_size = self.config.vocab_size
+        # 获取嵌入层和LM head
+        self.embed_tokens = temp_model.model.embed_tokens
+        self.lm_head = temp_model.lm_head
         
-        # 创建嵌入层
-        self.embed_tokens = torch.nn.Embedding(vocab_size, embedding_dim)
+        # 将它们移动到共享内存
         self.embed_tokens.share_memory()
-        
-        # 创建LM head层
-        self.lm_head = torch.nn.Linear(embedding_dim, vocab_size, bias=False)
         self.lm_head.share_memory()
         
-        logger.info(f"Created shared embedding layer with dim={embedding_dim}, vocab_size={vocab_size}")
+        # 清理临时模型
+        del temp_model
+        torch.cuda.empty_cache()
+        
+        logger.info(f"Created shared embedding layer with dim={self.config.hidden_size}, vocab_size={self.config.vocab_size}")
         logger.info("Shared model components loaded and ready")
         
         # 创建共享字典来存储已加载的层

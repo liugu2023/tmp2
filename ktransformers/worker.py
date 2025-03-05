@@ -9,8 +9,6 @@ import time
 import subprocess
 import multiprocessing
 from ktransformers.kvcache_client import KVCacheClient
-import torch.nn as nn
-from ktransformers.optimize import add_hook_to_module
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -280,19 +278,8 @@ class ModelWorker:
                         # 获取层并添加到我们的模型中
                         self.model.model.layers[i] = layer_model.model.layers[i]
                         
-                        # 使用可序列化的方式存储层信息
-                        layer = layer_model.model.layers[i]
-                        
-                        # 移除无法序列化的属性
-                        if hasattr(layer, '_forward_hooks'):
-                            del layer._forward_hooks
-                        if hasattr(layer, '_forward_pre_hooks'):
-                            del layer._forward_pre_hooks
-                        
-                        self.shared_components['loaded_layers'][layer_key] = {
-                            'state_dict': layer.state_dict(),
-                            'config': layer.config
-                        }
+                        # 将层添加到共享字典
+                        self.shared_components['loaded_layers'][layer_key] = layer_model.model.layers[i]
                         logger.info(f"Successfully loaded layer {i}")
                         
                         # 清除不需要的内容，释放内存
@@ -522,21 +509,6 @@ class ModelWorker:
             self.socket.close()
             self.context.term()
             logger.info("Worker shutdown complete")
-
-    def initialize_model(self, model_path, gguf_path):
-        # 使用延迟加载方式
-        if self.device_type == 'cpu':
-            self.model = self._load_cpu_model(model_path, gguf_path)
-        else:
-            self.model = self._load_gpu_model(model_path)
-        
-        # 重新应用可序列化的钩子
-        self._apply_compatible_hooks()
-
-    def _apply_compatible_hooks(self):
-        for name, module in self.model.named_modules():
-            if isinstance(module, nn.Linear):
-                add_hook_to_module(module)
 
 if __name__ == '__main__':
     main() 

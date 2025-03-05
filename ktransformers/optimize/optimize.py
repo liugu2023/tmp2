@@ -143,16 +143,3 @@ def optimize_and_load_gguf(module: nn.Module, rule_file: str, gguf_path: str, mo
 # 确保导出函数
 __all__ = ['optimize_and_load_gguf']
 
-class ForwardHookWrapper:
-    def __call__(self, *args, **kwargs):
-        module = args[0]
-        inputs = args[1]
-        # ...原有new_forward的实现内容...
-        return module.old_forward(*args, **kwargs)
-
-def add_hook_to_module(module):
-    if not hasattr(module, 'old_forward'):
-        module.old_forward = module.forward
-    hook = ForwardHookWrapper()
-    module.forward = hook.__call__
-

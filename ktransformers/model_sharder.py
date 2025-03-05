@@ -103,11 +103,8 @@ def start_worker(worker_id, num_workers, base_port, model_path, gguf_path, compo
     # 创建worker并传入共享组件
     worker = ModelWorker(address, worker_id, num_workers, shared_components=components)
     
-    # 在加载模型前设置共享内存策略
-    torch.multiprocessing.set_sharing_strategy('file_system')
-    
-    # 使用单独的初始化方法
-    worker.initialize_model(model_path, gguf_path)
+    # 加载模型（使用共享组件）
+    worker.load_model(model_path, gguf_path)
     
     # 运行worker
     worker.run()

@@ -200,21 +200,38 @@ class ModelWorker:
         # 创建模型 - 只加载需要的层
         if self.shared_components:
             logger.info("Creating model with shared components...")
-            # 创建一个简化的模型结构
-            from transformers.modeling_utils import PreTrainedModel
             
-            class PartialModel(PreTrainedModel):
+            # 创建一个空模型结构
+            class PartialModel(torch.nn.Module):
                 def __init__(self, config):
-                    super().__init__(config)
+                    super().__init__()
                     self.config = config
-                    
-                # 其他必要的方法...
+                    # 创建必要的属性结构
+                    self.model = torch.nn.Module()
+                    self.model.embed_tokens = None
+                    self.model.layers = torch.nn.ModuleList()
+                    self.model.norm = None
+                    self.lm_head = None
             
+            # 初始化模型
             self.model = PartialModel(config)
             
             # 添加共享的embedding层
             self.model.model.embed_tokens = self.shared_components['embed_tokens']
             self.model.lm_head = self.shared_components['lm_head']
+            
+            # 确保模型结构完整
+            for i in range(config.num_hidden_layers):
+                self.model.model.layers.append(None)  # 占位
+            
+            # 加载最终归一化层
+            self.model.model.norm = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                config=config,
+                trust_remote_code=True,
+                device_map={'model.norm': 'cpu'},
+                torch_dtype=torch.float16,
+            ).model.norm
             
             # 只加载本worker需要处理的层
             for i in range(start_layer, end_layer):
@@ -224,16 +241,21 @@ class ModelWorker:
                     self.model.model.layers[i] = self.shared_components['loaded_layers'][layer_key]
                 else:
                     # 加载新层
-                    layer = AutoModelForCausalLM.from_pretrained(
-                        model_path,
-                        config=config,
-                        device_map={f'model.layers.{i}': f'cuda:{gpu_id}'},
-                        torch_dtype=torch.float16,
-                    ).model.layers[i]
-                    
-                    self.model.model.layers[i] = layer
-                    # 将层添加到共享字典
-                    self.shared_components['loaded_layers'][layer_key] = layer
+                    try:
+                        gpu_id = 0 if self.worker_id < 4 else 1
+                        layer_model = AutoModelForCausalLM.from_pretrained(
+                            model_path,
+                            config=config,
+                            trust_remote_code=True,
+                            device_map={f'model.layers.{i}': f'cuda:{gpu_id}'},
+                            torch_dtype=torch.float16,
+                        )
+                        self.model.model.layers[i] = layer_model.model.layers[i]
+                        # 将层添加到共享字典
+                        self.shared_components['loaded_layers'][layer_key] = layer_model.model.layers[i]
+                    except Exception as e:
+                        logger.error(f"Error loading layer {i}: {str(e)}")
+                        raise
         else:
             # 使用标准方法加载
             model_kwargs = {

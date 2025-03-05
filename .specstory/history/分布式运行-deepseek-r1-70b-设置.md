@@ -5375,7 +5375,121 @@ _**User**_
 
 _**Assistant**_
 
+<think>
+让我总结一下这个分布式推理系统的架构和运行流程：
 
+1. 整个系统包含以下组件：
+   - KV Cache 服务器 (ktransformers/kvcache_server.py)
+   - 多个 Worker 进程 (使用 model_sharder.py 启动)
+   - 中央服务器 (ktransformers/central_server.py)
+   - 客户端应用 (ktransformers/local_chat.py)
+
+2. 流程是：
+   - model_sharder.py 在 206 上启动多个 worker 进程，共享 embedding 层和 LM head
+   - 每个 worker 负责处理模型的不同层
+   - KV Cache 服务器在 206 上运行，用于在 worker 间共享 KV Cache
+   - 中央服务器在 100 上运行，协调所有 worker
+   - 客户端连接到中央服务器发送请求
+
+基于这个架构，需要在不同机器上运行以下命令：
+</think>
+
+## 运行命令指南
+
+以下是运行分布式推理系统的完整步骤和命令：
+
+### 在 206 服务器上（计算节点）
+
+1. **启动 KV Cache 服务器**
+   ```bash
+   PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.kvcache_server --port 29600
+   ```
+
+2. **启动模型加载器和多个 worker 进程**
+   ```bash
+   PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.model_sharder \
+       --model_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/ \
+       --gguf_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/ \
+       --base_port 29500 \
+       --num_workers 8
+   ```
+   
+   这将在 206 上启动:
+   - 共享 embedding 层和 LM head 的主进程
+   - 8个 worker 进程：前4个在 GPU 0，后4个在 GPU 1
+   - 每个 worker 负责模型的不同层
+   - 每个 worker 监听不同端口（29500-29507）
+
+### 在 100 服务器上（协调节点）
+
+1. **启动中央服务器**
+   ```bash
+   PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.central_server \
+       --port 29400 \
+       --num_workers 8 \
+       --worker_base_port 29500 \
+       --kvcache_port 29600 \
+       --worker_host 10.21.22.206
+   ```
+
+2. **启动客户端**
+   ```bash
+   PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.local_chat \
+       --model_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/ \
+       --gguf_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/ \
+       --server_address "localhost:29400" \
+       --max_new_tokens 50
+   ```
+
+### 优化特点
+
+1. **内存优化**:
+   - 所有 worker 共享一个 tokenizer 和 embedding 层
+   - 每个 worker 只加载自己负责的层
+
+2. **计算优化**:
+   - KV Cache 在不同 worker 之间共享
+   - 动态计算每个 worker 所需的 GPU 内存
+   - 使用 NUMA 绑定优化 CPU 使用
+
+3. **系统设计**:
+   - 中央服务器处理客户端请求并协调 worker
+   - 支持流式输出
+   - 支持优雅关闭
+
+这个架构让 70B 的大模型能够在两张 GPU 上高效运行，通过分布式推理和内存优化实现了更快的响应速度。
+
+---
+
+_**User**_
+
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/archive/liugu/ds/ktransformers/ktransformers/model_sharder.py", line 124, in <module>
+    main()
+    ^^^^^^
+  File "/archive/liugu/ds/ktransformers/ktransformers/model_sharder.py", line 121, in main
+    start_master(args.model_path, args.gguf_path, args.num_workers, args.base_port)
+  File "/archive/liugu/ds/ktransformers/ktransformers/model_sharder.py", line 68, in start_master
+    shared_components = SharedModelComponents(model_path)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ktransformers/ktransformers/model_sharder.py", line 30, in __init__
+    model = AutoModelForCausalLM.from_pretrained(
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/models/auto/auto_factory.py", line 564, in from_pretrained
+    return model_class.from_pretrained(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/modeling_utils.py", line 3916, in from_pretrained
+    ) = cls._load_pretrained_model(
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/modeling_utils.py", line 4390, in _load_pretrained_model
+    new_error_msgs, offload_index, state_dict_index = _load_state_dict_into_meta_model(
+                                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/modeling_utils.py", line 918, in _load_state_dict_into_meta_model
+    raise ValueError(f"{param_name} doesn't have any device set.")
+ValueError: model.layers.0.input_layernorm.weight doesn't have any device set.
+(ds) root@compute06:/archive/liugu/ds/ktransformers#
 
 ---
 

@@ -56,18 +56,25 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--base_port', type=int, default=29500)
     parser.add_argument('--num_workers', type=int, default=8)
+    parser.add_argument('--worker_address', type=str, required=False)
+    parser.add_argument('--worker_id', type=int, default=0)
     args = parser.parse_args()
     
-    # 启动多个 worker 进程
-    for worker_id in range(args.num_workers):
-        start_worker_process(worker_id, args.base_port, args.num_workers)
-    
-    # 等待所有进程
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        logger.info("Shutting down all workers...")
+    if args.worker_address:
+        # 单个 worker 进程模式
+        worker = ModelWorker(args.worker_address, args.worker_id, args.num_workers)
+        worker.run()
+    else:
+        # 主进程模式，启动多个 worker
+        for worker_id in range(args.num_workers):
+            start_worker_process(worker_id, args.base_port, args.num_workers)
+        
+        # 等待所有进程
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            logger.info("Shutting down all workers...")
 
 def load_model_and_tokenizer(model_path: str, gguf_path: str):
     logger.info("Loading tokenizer...")

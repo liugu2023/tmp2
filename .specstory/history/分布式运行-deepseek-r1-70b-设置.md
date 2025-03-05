@@ -4166,7 +4166,81 @@ def load_model(self, model_path: str, gguf_path: str):
         'cpu': "138GiB"  # CPU 内存
     }
     
-    # 
+    # 设置设备映射
+    device_map = {
+        'model.embed_tokens': 'cpu',
+        'model.norm': 'cpu',
+        'lm_head': 'cpu'
+    }
+    
+    # 分配层到对应的 GPU
+    gpu_id = 0 if self.worker_id < 4 else 1
+    for i in range(start_layer, end_layer):
+        device_map[f'model.layers.{i}'] = f'cuda:{gpu_id}'
+    
+    logger.info(f"Worker {self.worker_id} handling layers {start_layer} to {end_layer} on GPU {gpu_id}")
+    
+    model_kwargs = {
+        "device_map": device_map,
+        "max_memory": max_memory,
+        "torch_dtype": torch.float16
+    }
+    
+    logger.info("Applying optimization configurations...")
+    self.model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        config=config,
+        trust_remote_code=True,
+        **model_kwargs
+    )
+    
+    # 输出配置信息
+    logger.info(f"Worker {self.worker_id} model configuration:")
+    logger.info(f"- Handling layers: {start_layer} to {end_layer}")
+    logger.info(f"- Using GPU: {gpu_id}")
+    logger.info("- Device mapping:")
+    for name, device in self.model.hf_device_map.items():
+        if name.startswith(f'model.layers.{start_layer}'):
+            logger.info(f"  {name}: {device}")
+    
+    self.model.eval()
+```
+
+主要改动：
+1. 计算每个进程负责的模型层
+2. 根据 worker_id 分配 GPU
+3. 设置精确的设备映射
+4. 每个进程只加载自己负责的层
+
+这样：
+- 前4个进程在 NUMA 节点0和GPU0上运行
+- 后4个进程在 NUMA 节点1和GPU1上运行
+- 每个进程处理模型的不同部分
+- 所有进程协同完成一个推理任务
+
+您需要修改启动命令来指定这是分布式推理：
+
+```bash
+# 在 GPU 机器上启动8个进程
+PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.worker \
+    --base_port 29500 \
+    --num_workers 8 \
+    --distributed_inference
+```
+
+这样应该能更好地利用硬件资源。如果需要调整任何参数，请告诉我。
+
+---
+
+_**User**_
+
+(ds) root@compute06:/archive/liugu/ds/ktransformers# # 在 GPU 机器上启动8个进程
+PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.worker \
+    --base_port 29500 \
+    --num_workers 8 \
+    --distributed_inference
+usage: worker.py [-h] [--base_port BASE_PORT] [--num_workers NUM_WORKERS]
+worker.py: error: unrecognized arguments: --distributed_inference
 
 ---
 

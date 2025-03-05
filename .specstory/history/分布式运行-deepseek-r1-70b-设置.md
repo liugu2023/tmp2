@@ -6121,6 +6121,192 @@ PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.model_sharder
 
 ---
 
+_**User**_
+
+
+
+---
+
+_**Assistant**_
+
+<think>
+根据错误日志，似乎我们的修复方案仍然存在问题。问题在于尝试单独加载每一层时，遇到了设备映射问题。
+
+这种情况下，最简单的解决方案可能是完全跳过共享模型组件的方法，让每个worker自己完全加载自己需要的模型部分。这样会消耗更多内存，但会避免复杂的共享内存问题。
+
+我们可以创建一个更简单的方法，或者提供一个新的选项，在要求低内存使用时使用当前的方法，而在要求稳定性时使用更简单的方法。
+</think>
+
+让我们改用一种更简单、更可靠的方法，
+
+---
+
+_**Assistant**_
+
+
+
+---
+
+_**User**_
+
+[W305 11:48:25.352752923 CudaIPCTypes.cpp:16] Producer process has been terminated before all shared CUDA tensors released. See Note [Sharing CUDA tensors]
+ERROR:ktransformers.worker:Error loading layer 40: Can't pickle local object 'add_hook_to_module.<locals>.new_forward'
+Process Process-6:
+ERROR:ktransformers.worker:Error loading layer 0: Can't pickle local object 'add_hook_to_module.<locals>.new_forward'
+Process Process-2:
+ERROR:ktransformers.worker:Error loading layer 60: Can't pickle local object 'add_hook_to_module.<locals>.new_forward'
+Process Process-8:
+Traceback (most recent call last):
+Traceback (most recent call last):
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/archive/liugu/ds/ktransformers/ktransformers/model_sharder.py", line 107, in start_worker
+    worker.load_model(model_path, gguf_path)
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 282, in load_model
+    self.shared_components['loaded_layers'][layer_key] = layer_model.model.layers[i]
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^
+  File "<string>", line 2, in __setitem__
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.11/multiprocessing/managers.py", line 821, in _callmethod
+    conn.send((self._id, methodname, args, kwds))
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/archive/liugu/ds/ktransformers/ktransformers/model_sharder.py", line 107, in start_worker
+    worker.load_model(model_path, gguf_path)
+  File "/usr/lib/python3.11/multiprocessing/connection.py", line 205, in send
+    self._send_bytes(_ForkingPickler.dumps(obj))
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 282, in load_model
+    self.shared_components['loaded_layers'][layer_key] = layer_model.model.layers[i]
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^
+  File "/usr/lib/python3.11/multiprocessing/reduction.py", line 51, in dumps
+    cls(buf, protocol).dump(obj)
+  File "<string>", line 2, in __setitem__
+  File "/usr/lib/python3.11/multiprocessing/managers.py", line 821, in _callmethod
+    conn.send((self._id, methodname, args, kwds))
+AttributeError: Can't pickle local object 'add_hook_to_module.<locals>.new_forward'
+  File "/usr/lib/python3.11/multiprocessing/connection.py", line 205, in send
+    self._send_bytes(_ForkingPickler.dumps(obj))
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/multiprocessing/reduction.py", line 51, in dumps
+    cls(buf, protocol).dump(obj)
+AttributeError: Can't pickle local object 'add_hook_to_module.<locals>.new_forward'
+Traceback (most recent call last):
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/archive/liugu/ds/ktransformers/ktransformers/model_sharder.py", line 107, in start_worker
+    worker.load_model(model_path, gguf_path)
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 282, in load_model
+    self.shared_components['loaded_layers'][layer_key] = layer_model.model.layers[i]
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^
+  File "<string>", line 2, in __setitem__
+  File "/usr/lib/python3.11/multiprocessing/managers.py", line 821, in _callmethod
+    conn.send((self._id, methodname, args, kwds))
+  File "/usr/lib/python3.11/multiprocessing/connection.py", line 205, in send
+    self._send_bytes(_ForkingPickler.dumps(obj))
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/multiprocessing/reduction.py", line 51, in dumps
+    cls(buf, protocol).dump(obj)
+AttributeError: Can't pickle local object 'add_hook_to_module.<locals>.new_forward'
+ERROR:ktransformers.worker:Error loading layer 70: Can't pickle local object 'add_hook_to_module.<locals>.new_forward'
+Process Process-9:
+ERROR:ktransformers.worker:Error loading layer 10: Can't pickle local object 'add_hook_to_module.<locals>.new_forward'
+Process Process-3:
+Traceback (most recent call last):
+Traceback (most recent call last):
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/archive/liugu/ds/ktransformers/ktransformers/model_sharder.py", line 107, in start_worker
+    worker.load_model(model_path, gguf_path)
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 282, in load_model
+    self.shared_components['loaded_layers'][layer_key] = layer_model.model.layers[i]
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^
+  File "<string>", line 2, in __setitem__
+  File "/usr/lib/python3.11/multiprocessing/managers.py", line 821, in _callmethod
+    conn.send((self._id, methodname, args, kwds))
+  File "/usr/lib/python3.11/multiprocessing/connection.py", line 205, in send
+    self._send_bytes(_ForkingPickler.dumps(obj))
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/multiprocessing/reduction.py", line 51, in dumps
+    cls(buf, protocol).dump(obj)
+AttributeError: Can't pickle local object 'add_hook_to_module.<locals>.new_forward'
+ERROR:ktransformers.worker:Error loading layer 30: Can't pickle local object 'add_hook_to_module.<locals>.new_forward'
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/archive/liugu/ds/ktransformers/ktransformers/model_sharder.py", line 107, in start_worker
+    worker.load_model(model_path, gguf_path)
+Process Process-5:
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 282, in load_model
+    self.shared_components['loaded_layers'][layer_key] = layer_model.model.layers[i]
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^
+  File "<string>", line 2, in __setitem__
+  File "/usr/lib/python3.11/multiprocessing/managers.py", line 821, in _callmethod
+    conn.send((self._id, methodname, args, kwds))
+  File "/usr/lib/python3.11/multiprocessing/connection.py", line 205, in send
+    self._send_bytes(_ForkingPickler.dumps(obj))
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/multiprocessing/reduction.py", line 51, in dumps
+    cls(buf, protocol).dump(obj)
+AttributeError: Can't pickle local object 'add_hook_to_module.<locals>.new_forward'
+Traceback (most recent call last):
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/archive/liugu/ds/ktransformers/ktransformers/model_sharder.py", line 107, in start_worker
+    worker.load_model(model_path, gguf_path)
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 282, in load_model
+    self.shared_components['loaded_layers'][layer_key] = layer_model.model.layers[i]
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^
+  File "<string>", line 2, in __setitem__
+  File "/usr/lib/python3.11/multiprocessing/managers.py", line 821, in _callmethod
+    conn.send((self._id, methodname, args, kwds))
+  File "/usr/lib/python3.11/multiprocessing/connection.py", line 205, in send
+    self._send_bytes(_ForkingPickler.dumps(obj))
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/multiprocessing/reduction.py", line 51, in dumps
+    cls(buf, protocol).dump(obj)
+AttributeError: Can't pickle local object 'add_hook_to_module.<locals>.new_forward'
+ERROR:ktransformers.worker:Error loading layer 50: Can't pickle local object 'add_hook_to_module.<locals>.new_forward'
+Process Process-7:
+Traceback (most recent call last):
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/archive/liugu/ds/ktransformers/ktransformers/model_sharder.py", line 107, in start_worker
+    worker.load_model(model_path, gguf_path)
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 282, in load_model
+    self.shared_components['loaded_layers'][layer_key] = layer_model.model.layers[i]
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^
+  File "<string>", line 2, in __setitem__
+  File "/usr/lib/python3.11/multiprocessing/managers.py", line 821, in _callmethod
+    conn.send((self._id, methodname, args, kwds))
+  File "/usr/lib/python3.11/multiprocessing/connection.py", line 205, in send
+    self._send_bytes(_ForkingPickler.dumps(obj))
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/multiprocessing/reduction.py", line 51, in dumps
+    cls(buf, protocol).dump(obj)
+AttributeError: Can't pickle local object 'add_hook_to_module.<locals>.new_forward'
+[W305 11:48:26.960148281 CudaIPCTypes.cpp:16] Producer process has been terminated before all shared CUDA tensors released. See Note [Sharing CUDA tensors]
+[W305 11:48:26.976990065 CudaIPCTypes.cpp:16] Producer process has been terminated before all shared CUDA tensors released. See Note [Sharing CUDA tensors]
+[W305 11:48:26.978879533 CudaIPCTypes.cpp:16] Producer process has been terminated before all shared CUDA tensors released. See Note [Sharing CUDA tensors]
+[W305 11:48:26.989312778 CudaIPCTypes.cpp:16] Producer process has been terminated before all shared CUDA tensors released. See Note [Sharing CUDA tensors]
+[W305 11:48:26.998216022 CudaIPCTypes.cpp:16] Producer process has been terminated before all shared CUDA tensors released. See Note [Sharing CUDA tensors]
+[W305 11:48:26.048630388 CudaIPCTypes.cpp:16] Producer process has been terminated before all shared CUDA tensors released. See Note [Sharing CUDA tensors]
+[W305 11:48:26.158101180 CudaIPCTypes.cpp:16] Producer process has been terminated before all shared CUDA tensors released. See Note [Sharing CUDA tensors]
+
+---
+
 
 
 ---

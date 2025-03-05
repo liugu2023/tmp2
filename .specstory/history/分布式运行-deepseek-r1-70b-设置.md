@@ -6318,6 +6318,96 @@ _**User**_
 
 _**Assistant**_
 
+好的，让我们创建一个完整的启动脚本：
+
+```bash:start_service.sh
+#!/bin/bash
+
+# 设置环境变量
+export PYTHONPATH=/archive/liugu/ds/ktransformers
+export MODEL_PATH=/archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B
+export GGUF_PATH=/archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF
+
+# 在206上运行的命令
+if [ "$(hostname)" = "compute06" ]; then
+    echo "Starting services on compute06 (206)..."
+    
+    # 启动 KV Cache 服务器
+    echo "Starting KV Cache Server..."
+    python -m ktransformers.kvcache_server --port 29600 &
+    sleep 2  # 等待KV Cache服务器启动
+    
+    # 启动模型分片服务
+    echo "Starting Model Sharder..."
+    python -m ktransformers.model_sharder \
+        --model_path $MODEL_PATH \
+        --gguf_path $GGUF_PATH \
+        --base_port 29500 \
+        --num_workers 8
+
+# 在100上运行的命令
+elif [ "$(hostname)" = "compute01" ]; then
+    echo "Starting services on compute01 (100)..."
+    
+    # 启动中央服务器
+    echo "Starting Central Server..."
+    python -m ktransformers.central_server \
+        --port 29400 \
+        --num_workers 8 \
+        --worker_base_port 29500 \
+        --kvcache_port 29600 \
+        --worker_host 10.21.22.206
+    
+else
+    echo "Unknown host. This script should be run on either compute06 or compute01."
+    exit 1
+fi
+```
+
+使用方法：
+
+1. 首先在206上运行：
+```bash
+# 在206上
+chmod +x start_service.sh
+./start_service.sh
+```
+
+2. 然后在100上运行：
+```bash
+# 在100上
+chmod +x start_service.sh
+./start_service.sh
+```
+
+3. 最后在100上启动客户端：
+```bash
+# 在100上运行客户端
+PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.local_chat \
+    --model_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/ \
+    --gguf_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/ \
+    --server_address "localhost:29400" \
+    --max_new_tokens 50
+```
+
+这个脚本会：
+1. 根据主机名自动判断在哪台机器上运行
+2. 在206上启动 KV Cache 服务器和模型分片服务
+3. 在100上启动中央服务器
+4. 自动设置所有必要的环境变量和参数
+
+建议把这三个命令分别放在不同的 tmux 会话中运行，这样可以方便地查看各个服务的日志。
+
+---
+
+_**User**_
+
+把100的主机名改为login
+
+---
+
+_**Assistant**_
+
 
 
 ---

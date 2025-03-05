@@ -22,9 +22,9 @@ if [ "$(hostname)" = "compute06" ]; then
         --base_port 29500 \
         --num_workers 8
 
-# 在100上运行的命令
-elif [ "$(hostname)" = "compute01" ]; then
-    echo "Starting services on compute01 (100)..."
+# 在login上运行的命令
+elif [ "$(hostname)" = "login" ]; then
+    echo "Starting services on login (100)..."
     
     # 启动中央服务器
     echo "Starting Central Server..."
@@ -36,6 +36,6 @@ elif [ "$(hostname)" = "compute01" ]; then
         --worker_host 10.21.22.206
     
 else
-    echo "Unknown host. This script should be run on either compute06 or compute01."
+    echo "Unknown host. This script should be run on either compute06 or login."
     exit 1
 fi 

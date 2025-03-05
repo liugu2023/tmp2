@@ -51,10 +51,10 @@ class KDeepseekV2Attention(BaseInjectedModule, DeepseekV2Attention):
                  chunck_size: int = 1000,
                  absorb_for_prefill: bool = False,
                  **kwargs):
-        BaseInjectedModule.__init__(self, key, gguf_loader, config, orig_module, prefill_device, generate_device, **kwargs)
+        BaseInjectedModule.__init__(self, key, gguf_loader, config, orig_module, prefill_device, generate_device)
         self.orig_module.__init__(orig_module.config,
             orig_module.layer_idx)
-        self.chunck_size = chunck_size # TODO, generate chunck_size automatically.
+        self.chunck_size = chunck_size
         self.mla_wrapper = None
         self.absorb_for_prefill = absorb_for_prefill
 
@@ -556,7 +556,6 @@ class KDeepseekV2Attention(BaseInjectedModule, DeepseekV2Attention):
                 self.attn_mask[:, :, :, cur_idx:min(cur_idx+self.chunck_size, past_key_value.max_cache_len)] = \
                     -1e+38 * torch.triu(torch.ones(self.chunck_size, self.chunck_size, device=hidden_states.device), diagonal=1)\
                         [:,:min(self.chunck_size, min(past_key_value.max_cache_len-cur_idx, self.chunck_size))]
-                self.attn_mask[:, :, :, cur_idx+self.chunck_size:] = -1e+38
                 self.attn_mask[:, :, :, :cur_idx] = 0
                 chunk_mask = torch.narrow(self.attn_mask, 2, 0, min(self.chunck_size, q_len-cur_idx))
 
@@ -637,7 +636,7 @@ class KLlamaAttention(BaseInjectedModule):
                  prefill_device: str = "cuda",
                  generate_device: str = "cuda",
                  **kwargs):
-        BaseInjectedModule.__init__(self, key, gguf_loader, config, orig_module, prefill_device, generate_device, **kwargs)
+        BaseInjectedModule.__init__(self, key, gguf_loader, config, orig_module, prefill_device, **kwargs)
         self.orig_module.__init__(orig_module.config,
             orig_module.layer_idx)
     def apply_rotary_pos_emb(self, q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
@@ -754,3 +753,4 @@ class KLlamaAttention(BaseInjectedModule):
             attn_weights = None
 
         return attn_output, attn_weights, past_key_value
+

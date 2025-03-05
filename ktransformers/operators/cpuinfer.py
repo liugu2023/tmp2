@@ -89,7 +89,7 @@ class CPUInferKVCache:
             kv_type,
             retrieval_type,
             layer_step,
-            token_step,
+            0,
             layer_offset,
             max_block_num,
             max_batch_size,
@@ -744,3 +744,4 @@ class CPUInfer:
 
 
         
+

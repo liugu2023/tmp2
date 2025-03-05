@@ -6149,161 +6149,176 @@ _**Assistant**_
 
 _**User**_
 
-[W305 11:48:25.352752923 CudaIPCTypes.cpp:16] Producer process has been terminated before all shared CUDA tensors released. See Note [Sharing CUDA tensors]
-ERROR:ktransformers.worker:Error loading layer 40: Can't pickle local object 'add_hook_to_module.<locals>.new_forward'
-Process Process-6:
-ERROR:ktransformers.worker:Error loading layer 0: Can't pickle local object 'add_hook_to_module.<locals>.new_forward'
-Process Process-2:
-ERROR:ktransformers.worker:Error loading layer 60: Can't pickle local object 'add_hook_to_module.<locals>.new_forward'
-Process Process-8:
 Traceback (most recent call last):
-Traceback (most recent call last):
-  File "/usr/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
-    self.run()
-  File "/usr/lib/python3.11/multiprocessing/process.py", line 108, in run
-    self._target(*self._args, **self._kwargs)
-  File "/archive/liugu/ds/ktransformers/ktransformers/model_sharder.py", line 107, in start_worker
-    worker.load_model(model_path, gguf_path)
-  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 282, in load_model
-    self.shared_components['loaded_layers'][layer_key] = layer_model.model.layers[i]
-    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^
-  File "<string>", line 2, in __setitem__
-  File "/usr/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
-    self.run()
-  File "/usr/lib/python3.11/multiprocessing/managers.py", line 821, in _callmethod
-    conn.send((self._id, methodname, args, kwds))
-  File "/usr/lib/python3.11/multiprocessing/process.py", line 108, in run
-    self._target(*self._args, **self._kwargs)
-  File "/archive/liugu/ds/ktransformers/ktransformers/model_sharder.py", line 107, in start_worker
-    worker.load_model(model_path, gguf_path)
-  File "/usr/lib/python3.11/multiprocessing/connection.py", line 205, in send
-    self._send_bytes(_ForkingPickler.dumps(obj))
-                     ^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 282, in load_model
-    self.shared_components['loaded_layers'][layer_key] = layer_model.model.layers[i]
-    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^
-  File "/usr/lib/python3.11/multiprocessing/reduction.py", line 51, in dumps
-    cls(buf, protocol).dump(obj)
-  File "<string>", line 2, in __setitem__
-  File "/usr/lib/python3.11/multiprocessing/managers.py", line 821, in _callmethod
-    conn.send((self._id, methodname, args, kwds))
-AttributeError: Can't pickle local object 'add_hook_to_module.<locals>.new_forward'
-  File "/usr/lib/python3.11/multiprocessing/connection.py", line 205, in send
-    self._send_bytes(_ForkingPickler.dumps(obj))
-                     ^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/lib/python3.11/multiprocessing/reduction.py", line 51, in dumps
-    cls(buf, protocol).dump(obj)
-AttributeError: Can't pickle local object 'add_hook_to_module.<locals>.new_forward'
-Traceback (most recent call last):
-  File "/usr/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
-    self.run()
-  File "/usr/lib/python3.11/multiprocessing/process.py", line 108, in run
-    self._target(*self._args, **self._kwargs)
-  File "/archive/liugu/ds/ktransformers/ktransformers/model_sharder.py", line 107, in start_worker
-    worker.load_model(model_path, gguf_path)
-  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 282, in load_model
-    self.shared_components['loaded_layers'][layer_key] = layer_model.model.layers[i]
-    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^
-  File "<string>", line 2, in __setitem__
-  File "/usr/lib/python3.11/multiprocessing/managers.py", line 821, in _callmethod
-    conn.send((self._id, methodname, args, kwds))
-  File "/usr/lib/python3.11/multiprocessing/connection.py", line 205, in send
-    self._send_bytes(_ForkingPickler.dumps(obj))
-                     ^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/lib/python3.11/multiprocessing/reduction.py", line 51, in dumps
-    cls(buf, protocol).dump(obj)
-AttributeError: Can't pickle local object 'add_hook_to_module.<locals>.new_forward'
-ERROR:ktransformers.worker:Error loading layer 70: Can't pickle local object 'add_hook_to_module.<locals>.new_forward'
-Process Process-9:
-ERROR:ktransformers.worker:Error loading layer 10: Can't pickle local object 'add_hook_to_module.<locals>.new_forward'
-Process Process-3:
-Traceback (most recent call last):
-Traceback (most recent call last):
-  File "/usr/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
-    self.run()
-  File "/usr/lib/python3.11/multiprocessing/process.py", line 108, in run
-    self._target(*self._args, **self._kwargs)
-  File "/archive/liugu/ds/ktransformers/ktransformers/model_sharder.py", line 107, in start_worker
-    worker.load_model(model_path, gguf_path)
-  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 282, in load_model
-    self.shared_components['loaded_layers'][layer_key] = layer_model.model.layers[i]
-    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^
-  File "<string>", line 2, in __setitem__
-  File "/usr/lib/python3.11/multiprocessing/managers.py", line 821, in _callmethod
-    conn.send((self._id, methodname, args, kwds))
-  File "/usr/lib/python3.11/multiprocessing/connection.py", line 205, in send
-    self._send_bytes(_ForkingPickler.dumps(obj))
-                     ^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/lib/python3.11/multiprocessing/reduction.py", line 51, in dumps
-    cls(buf, protocol).dump(obj)
-AttributeError: Can't pickle local object 'add_hook_to_module.<locals>.new_forward'
-ERROR:ktransformers.worker:Error loading layer 30: Can't pickle local object 'add_hook_to_module.<locals>.new_forward'
-  File "/usr/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
-    self.run()
-  File "/usr/lib/python3.11/multiprocessing/process.py", line 108, in run
-    self._target(*self._args, **self._kwargs)
-  File "/archive/liugu/ds/ktransformers/ktransformers/model_sharder.py", line 107, in start_worker
-    worker.load_model(model_path, gguf_path)
-Process Process-5:
-  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 282, in load_model
-    self.shared_components['loaded_layers'][layer_key] = layer_model.model.layers[i]
-    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^
-  File "<string>", line 2, in __setitem__
-  File "/usr/lib/python3.11/multiprocessing/managers.py", line 821, in _callmethod
-    conn.send((self._id, methodname, args, kwds))
-  File "/usr/lib/python3.11/multiprocessing/connection.py", line 205, in send
-    self._send_bytes(_ForkingPickler.dumps(obj))
-                     ^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/lib/python3.11/multiprocessing/reduction.py", line 51, in dumps
-    cls(buf, protocol).dump(obj)
-AttributeError: Can't pickle local object 'add_hook_to_module.<locals>.new_forward'
-Traceback (most recent call last):
-  File "/usr/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
-    self.run()
-  File "/usr/lib/python3.11/multiprocessing/process.py", line 108, in run
-    self._target(*self._args, **self._kwargs)
-  File "/archive/liugu/ds/ktransformers/ktransformers/model_sharder.py", line 107, in start_worker
-    worker.load_model(model_path, gguf_path)
-  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 282, in load_model
-    self.shared_components['loaded_layers'][layer_key] = layer_model.model.layers[i]
-    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^
-  File "<string>", line 2, in __setitem__
-  File "/usr/lib/python3.11/multiprocessing/managers.py", line 821, in _callmethod
-    conn.send((self._id, methodname, args, kwds))
-  File "/usr/lib/python3.11/multiprocessing/connection.py", line 205, in send
-    self._send_bytes(_ForkingPickler.dumps(obj))
-                     ^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/lib/python3.11/multiprocessing/reduction.py", line 51, in dumps
-    cls(buf, protocol).dump(obj)
-AttributeError: Can't pickle local object 'add_hook_to_module.<locals>.new_forward'
-ERROR:ktransformers.worker:Error loading layer 50: Can't pickle local object 'add_hook_to_module.<locals>.new_forward'
-Process Process-7:
-Traceback (most recent call last):
-  File "/usr/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
-    self.run()
-  File "/usr/lib/python3.11/multiprocessing/process.py", line 108, in run
-    self._target(*self._args, **self._kwargs)
-  File "/archive/liugu/ds/ktransformers/ktransformers/model_sharder.py", line 107, in start_worker
-    worker.load_model(model_path, gguf_path)
-  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 282, in load_model
-    self.shared_components['loaded_layers'][layer_key] = layer_model.model.layers[i]
-    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^
-  File "<string>", line 2, in __setitem__
-  File "/usr/lib/python3.11/multiprocessing/managers.py", line 821, in _callmethod
-    conn.send((self._id, methodname, args, kwds))
-  File "/usr/lib/python3.11/multiprocessing/connection.py", line 205, in send
-    self._send_bytes(_ForkingPickler.dumps(obj))
-                     ^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/lib/python3.11/multiprocessing/reduction.py", line 51, in dumps
-    cls(buf, protocol).dump(obj)
-AttributeError: Can't pickle local object 'add_hook_to_module.<locals>.new_forward'
-[W305 11:48:26.960148281 CudaIPCTypes.cpp:16] Producer process has been terminated before all shared CUDA tensors released. See Note [Sharing CUDA tensors]
-[W305 11:48:26.976990065 CudaIPCTypes.cpp:16] Producer process has been terminated before all shared CUDA tensors released. See Note [Sharing CUDA tensors]
-[W305 11:48:26.978879533 CudaIPCTypes.cpp:16] Producer process has been terminated before all shared CUDA tensors released. See Note [Sharing CUDA tensors]
-[W305 11:48:26.989312778 CudaIPCTypes.cpp:16] Producer process has been terminated before all shared CUDA tensors released. See Note [Sharing CUDA tensors]
-[W305 11:48:26.998216022 CudaIPCTypes.cpp:16] Producer process has been terminated before all shared CUDA tensors released. See Note [Sharing CUDA tensors]
-[W305 11:48:26.048630388 CudaIPCTypes.cpp:16] Producer process has been terminated before all shared CUDA tensors released. See Note [Sharing CUDA tensors]
-[W305 11:48:26.158101180 CudaIPCTypes.cpp:16] Producer process has been terminated before all shared CUDA tensors released. See Note [Sharing CUDA tensors]
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/archive/liugu/ds/ktransformers/ktransformers/model_sharder.py", line 130, in <module>
+    main()
+    ^^^^^^
+  File "/archive/liugu/ds/ktransformers/ktransformers/model_sharder.py", line 127, in main
+    start_master(args.model_path, args.gguf_path, args.num_workers, args.base_port)
+  File "/archive/liugu/ds/ktransformers/ktransformers/model_sharder.py", line 74, in start_master
+    shared_components = SharedModelComponents(model_path)
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ktransformers/ktransformers/model_sharder.py", line 33, in __init__
+    temp_model = AutoModelForCausalLM.from_pretrained(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/models/auto/auto_factory.py", line 564, in from_pretrained
+    return model_class.from_pretrained(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/modeling_utils.py", line 3916, in from_pretrained
+    ) = cls._load_pretrained_model(
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/modeling_utils.py", line 4390, in _load_pretrained_model
+    new_error_msgs, offload_index, state_dict_index = _load_state_dict_into_meta_model(
+                                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/modeling_utils.py", line 918, in _load_state_dict_into_meta_model
+    raise ValueError(f"{param_name} doesn't have any device set.")
+ValueError: model.layers.0.input_layernorm.weight doesn't have any device set.
+
+---
+
+_**Assistant**_
+
+让我们修改 model_sharder.py 中的 SharedModelComponents 类，避免使用 AutoModelForCausalLM 来加载模型。我们直接从模型权重文件中加载需要的参数：
+
+```python:ktransformers/model_sharder.py
+class SharedModelComponents:
+    """用于在多个进程间共享模型组件的类"""
+    def __init__(self, model_path: str):
+        logger.info("Loading shared model components...")
+        
+        # 确保使用spawn方法创建进程
+        mp.set_start_method('spawn', force=True)
+        
+        # 加载tokenizer (不需要放在共享内存中，每个进程可以快速加载)
+        self.tokenizer_path = model_path
+        
+        # 加载配置
+        logger.info("Loading model config...")
+        self.config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        
+        # 从safetensors或bin文件中加载embedding和lm_head权重
+        logger.info("Loading embedding and lm_head weights...")
+        import os
+        import safetensors.torch
+        import torch
+        
+        # 尝试从safetensors加载
+        embed_loaded = False
+        for filename in os.listdir(model_path):
+            if filename.endswith('.safetensors'):
+                try:
+                    weights = safetensors.torch.load_file(os.path.join(model_path, filename))
+                    if 'model.embed_tokens.weight' in weights:
+                        # 创建并加载embedding层
+                        self.embed_tokens = torch.nn.Embedding(
+                            self.config.vocab_size, 
+                            self.config.hidden_size
+                        )
+                        self.embed_tokens.weight.data.copy_(weights['model.embed_tokens.weight'])
+                        self.embed_tokens.share_memory()
+                        
+                        # 创建并加载lm_head层
+                        self.lm_head = torch.nn.Linear(
+                            self.config.hidden_size, 
+                            self.config.vocab_size, 
+                            bias=False
+                        )
+                        if 'lm_head.weight' in weights:
+                            self.lm_head.weight.data.copy_(weights['lm_head.weight'])
+                        else:
+                            # 如果没有单独的lm_head权重，使用tied weights
+                            self.lm_head.weight = self.embed_tokens.weight
+                        self.lm_head.share_memory()
+                        
+                        embed_loaded = True
+                        break
+                except Exception as e:
+                    logger.warning(f"Error loading from {filename}: {e}")
+                    continue
+        
+        # 如果从safetensors加载失败，尝试从bin文件加载
+        if not embed_loaded:
+            try:
+                state_dict = torch.load(os.path.join(model_path, 'pytorch_model.bin'))
+                if 'model.embed_tokens.weight' in state_dict:
+                    # 创建并加载embedding层
+                    self.embed_tokens = torch.nn.Embedding(
+                        self.config.vocab_size, 
+                        self.config.hidden_size
+                    )
+                    self.embed_tokens.weight.data.copy_(state_dict['model.embed_tokens.weight'])
+                    self.embed_tokens.share_memory()
+                    
+                    # 创建并加载lm_head层
+                    self.lm_head = torch.nn.Linear(
+                        self.config.hidden_size, 
+                        self.config.vocab_size, 
+                        bias=False
+                    )
+                    if 'lm_head.weight' in state_dict:
+                        self.lm_head.weight.data.copy_(state_dict['lm_head.weight'])
+                    else:
+                        # 如果没有单独的lm_head权重，使用tied weights
+                        self.lm_head.weight = self.embed_tokens.weight
+                    self.lm_head.share_memory()
+                    
+                    embed_loaded = True
+            except Exception as e:
+                logger.warning(f"Error loading from pytorch_model.bin: {e}")
+        
+        if not embed_loaded:
+            raise RuntimeError("Failed to load embedding weights from model files")
+        
+        logger.info(f"Created shared embedding layer with dim={self.config.hidden_size}, vocab_size={self.config.vocab_size}")
+        logger.info("Shared model components loaded and ready")
+        
+        # 创建共享字典来存储已加载的层
+        self.manager = mp.Manager()
+        self.loaded_layers = self.manager.dict()
+    
+    def get_components(self):
+        """获取所有共享组件"""
+        return {
+            'tokenizer_path': self.tokenizer_path,
+            'config': self.config,
+            'embed_tokens': self.embed_tokens,
+            'lm_head': self.lm_head,
+            'loaded_layers': self.loaded_layers
+        }
+```
+
+这个修改：
+
+1. 不再使用 AutoModelForCausalLM 来加载模型
+2. 直接从 safetensors 或 pytorch_model.bin 文件中加载 embedding 和 lm_head 的权重
+3. 手动创建并初始化 embedding 和 lm_head 层
+4. 支持权重绑定（weight tying）的情况
+
+使用相同的命令运行：
+
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.model_sharder \
+    --model_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/ \
+    --gguf_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/ \
+    --base_port 29500 \
+    --num_workers 8
+```
+
+这样应该能避免之前的设备映射错误。如果还有其他问题，请告诉我。
+
+---
+
+_**User**_
+
+给出完整运行命令，直接创建成.sh得了
+
+---
+
+_**Assistant**_
+
+
 
 ---
 

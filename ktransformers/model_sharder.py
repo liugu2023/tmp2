@@ -25,31 +25,77 @@ class SharedModelComponents:
         logger.info("Loading model config...")
         self.config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         
-        # 只加载embedding层到CPU，不加载完整模型
-        logger.info("Loading embedding layer...")
+        # 从safetensors或bin文件中加载embedding和lm_head权重
+        logger.info("Loading embedding and lm_head weights...")
+        import safetensors.torch
+        import torch
         
-        # 修改：直接从预训练模型加载嵌入层
-        logger.info("Loading pretrained model components...")
-        temp_model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            config=self.config,
-            trust_remote_code=True,
-            device_map={'model.embed_tokens': 'cpu', 'lm_head': 'cpu'},
-            torch_dtype=torch.float16,
-            low_cpu_mem_usage=True
-        )
+        # 尝试从safetensors加载
+        embed_loaded = False
+        for filename in os.listdir(model_path):
+            if filename.endswith('.safetensors'):
+                try:
+                    weights = safetensors.torch.load_file(os.path.join(model_path, filename))
+                    if 'model.embed_tokens.weight' in weights:
+                        # 创建并加载embedding层
+                        self.embed_tokens = torch.nn.Embedding(
+                            self.config.vocab_size, 
+                            self.config.hidden_size
+                        )
+                        self.embed_tokens.weight.data.copy_(weights['model.embed_tokens.weight'])
+                        self.embed_tokens.share_memory()
+                        
+                        # 创建并加载lm_head层
+                        self.lm_head = torch.nn.Linear(
+                            self.config.hidden_size, 
+                            self.config.vocab_size, 
+                            bias=False
+                        )
+                        if 'lm_head.weight' in weights:
+                            self.lm_head.weight.data.copy_(weights['lm_head.weight'])
+                        else:
+                            # 如果没有单独的lm_head权重，使用tied weights
+                            self.lm_head.weight = self.embed_tokens.weight
+                        self.lm_head.share_memory()
+                        
+                        embed_loaded = True
+                        break
+                except Exception as e:
+                    logger.warning(f"Error loading from {filename}: {e}")
+                    continue
         
-        # 获取嵌入层和LM head
-        self.embed_tokens = temp_model.model.embed_tokens
-        self.lm_head = temp_model.lm_head
+        # 如果从safetensors加载失败，尝试从bin文件加载
+        if not embed_loaded:
+            try:
+                state_dict = torch.load(os.path.join(model_path, 'pytorch_model.bin'))
+                if 'model.embed_tokens.weight' in state_dict:
+                    # 创建并加载embedding层
+                    self.embed_tokens = torch.nn.Embedding(
+                        self.config.vocab_size, 
+                        self.config.hidden_size
+                    )
+                    self.embed_tokens.weight.data.copy_(state_dict['model.embed_tokens.weight'])
+                    self.embed_tokens.share_memory()
+                    
+                    # 创建并加载lm_head层
+                    self.lm_head = torch.nn.Linear(
+                        self.config.hidden_size, 
+                        self.config.vocab_size, 
+                        bias=False
+                    )
+                    if 'lm_head.weight' in state_dict:
+                        self.lm_head.weight.data.copy_(state_dict['lm_head.weight'])
+                    else:
+                        # 如果没有单独的lm_head权重，使用tied weights
+                        self.lm_head.weight = self.embed_tokens.weight
+                    self.lm_head.share_memory()
+                    
+                    embed_loaded = True
+            except Exception as e:
+                logger.warning(f"Error loading from pytorch_model.bin: {e}")
         
-        # 将它们移动到共享内存
-        self.embed_tokens.share_memory()
-        self.lm_head.share_memory()
-        
-        # 清理临时模型
-        del temp_model
-        torch.cuda.empty_cache()
+        if not embed_loaded:
+            raise RuntimeError("Failed to load embedding weights from model files")
         
         logger.info(f"Created shared embedding layer with dim={self.config.hidden_size}, vocab_size={self.config.vocab_size}")
         logger.info("Shared model components loaded and ready")
@@ -57,7 +103,7 @@ class SharedModelComponents:
         # 创建共享字典来存储已加载的层
         self.manager = mp.Manager()
         self.loaded_layers = self.manager.dict()
-        
+    
     def get_components(self):
         """获取所有共享组件"""
         return {

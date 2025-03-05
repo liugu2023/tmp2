@@ -4244,6 +4244,118 @@ worker.py: error: unrecognized arguments: --distributed_inference
 
 ---
 
+_**Assistant**_
+
+抱歉，让我修正一下命令行参数的问题。我们需要修改 worker.py 中的 main 函数：
+
+```python:ktransformers/worker.py
+def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--base_port', type=int, default=29500)
+    parser.add_argument('--num_workers', type=int, default=8)
+    parser.add_argument('--worker_address', type=str, required=False)
+    parser.add_argument('--worker_id', type=int, default=0)
+    args = parser.parse_args()
+    
+    if args.worker_address:
+        # 单个 worker 进程模式
+        worker = ModelWorker(args.worker_address, args.worker_id, args.num_workers)
+        worker.run()
+    else:
+        # 主进程模式，启动多个 worker
+        for worker_id in range(args.num_workers):
+            start_worker_process(worker_id, args.base_port, args.num_workers)
+        
+        # 等待所有进程
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            logger.info("Shutting down all workers...")
+```
+
+现在运行命令应该是：
+
+```bash
+# 在 GPU 机器 (10.21.22.206) 上启动8个进程
+PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.worker \
+    --base_port 29500 \
+    --num_workers 8
+```
+
+这个命令会：
+1. 启动一个主进程
+2. 主进程会使用 numactl 启动8个 worker 进程
+3. 每个 worker 进程会处理模型的不同层
+4. 前4个进程在 NUMA 节点0和GPU0上运行
+5. 后4个进程在 NUMA 节点1和GPU1上运行
+
+如果还有其他问题，请告诉我。
+
+---
+
+_**User**_
+
+显存炸了孩子，小点吧
+
+---
+
+_**Assistant**_
+
+
+
+
+
+
+
+
+
+
+
+
+
+好的，让我们调整显存分配，每个 GPU 分配给4个进程，每个进程使用 3GB 显存：
+
+```python:ktransformers/worker.py
+def load_model(self, model_path: str, gguf_path: str):
+    # ... 其他代码保持不变 ...
+    
+    # 设置内存分配
+    max_memory = {
+        0: "3GiB" if self.worker_id < 4 else None,    # 前4个进程使用 GPU 0，每个3GB
+        1: "3GiB" if self.worker_id >= 4 else None,   # 后4个进程使用 GPU 1，每个3GB
+        'cpu': "138GiB"  # CPU 内存
+    }
+    
+    # 设置设备映射
+    device_map = {
+        'model.embed_tokens': 'cpu',
+        'model.norm': 'cpu',
+        'lm_head': 'cpu'
+    }
+    
+    # 分配层到对应的 GPU
+    gpu_id = 0 if self.worker_id < 4 else 1
+    for i in range(start_layer, end_layer):
+        device_map[f'model.layers.{i}'] = f'cuda:{gpu_id}'
+    
+    logger.info(f"Worker {self.worker_id} handling layers {start_layer} to {end_layer} on GPU {gpu_id}")
+    
+    model_kwargs = {
+        "device_map": device_map,
+        "max_memory": max_memory,
+        "torch_dtype": torch.float16,
+        "low_cpu_mem_usage": True  # 添加这个选项来减少内存使用
+    }
+```
+
+这样：
+- GPU 0: 4个进程 × 3GB = 12GB
+- GPU 1: 4个进程 × 3GB = 
+
+---
+
 
 
 ---

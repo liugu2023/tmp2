@@ -135,8 +135,8 @@ class ModelWorker:
         
         # 设置内存分配
         max_memory = {
-            0: "12GiB" if self.worker_id < 4 else None,    # 前4个进程使用 GPU 0
-            1: "12GiB" if self.worker_id >= 4 else None,   # 后4个进程使用 GPU 1
+            0: "3GiB" if self.worker_id < 4 else None,    # 前4个进程使用 GPU 0，每个3GB
+            1: "3GiB" if self.worker_id >= 4 else None,   # 后4个进程使用 GPU 1，每个3GB
             'cpu': "138GiB"  # CPU 内存
         }
         
@@ -157,7 +157,8 @@ class ModelWorker:
         model_kwargs = {
             "device_map": device_map,
             "max_memory": max_memory,
-            "torch_dtype": torch.float16
+            "torch_dtype": torch.float16,
+            "low_cpu_mem_usage": True  # 添加这个选项来减少内存使用
         }
         
         logger.info("Applying optimization configurations...")

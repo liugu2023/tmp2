@@ -99,10 +99,6 @@ class SharedModelComponents:
         
         logger.info(f"Created shared embedding layer with dim={self.config.hidden_size}, vocab_size={self.config.vocab_size}")
         logger.info("Shared model components loaded and ready")
-        
-        # 创建共享字典来存储已加载的层
-        self.manager = mp.Manager()
-        self.loaded_layers = self.manager.dict()
     
     def get_components(self):
         """获取所有共享组件"""
@@ -110,8 +106,7 @@ class SharedModelComponents:
             'tokenizer_path': self.tokenizer_path,
             'config': self.config,
             'embed_tokens': self.embed_tokens,
-            'lm_head': self.lm_head,
-            'loaded_layers': self.loaded_layers
+            'lm_head': self.lm_head
         }
 
 def start_master(model_path, gguf_path, num_workers, base_port):

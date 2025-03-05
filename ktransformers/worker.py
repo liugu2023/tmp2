@@ -182,142 +182,91 @@ class ModelWorker:
             'cpu': "138GiB"  # CPU 内存
         }
         
-        # 创建一个局部的设备映射
-        device_map = {}
+        # 创建一个空模型结构
+        class PartialModel(torch.nn.Module):
+            def __init__(self, config):
+                super().__init__()
+                self.config = config
+                # 创建必要的属性结构
+                self.model = torch.nn.Module()
+                self.model.embed_tokens = None
+                self.model.layers = torch.nn.ModuleList()
+                self.model.norm = None
+                self.lm_head = None
+                # 添加设备映射属性以避免错误
+                self.hf_device_map = {}
         
-        # 如果使用共享组件，不需要加载embed_tokens
-        if not self.shared_components:
-            device_map['model.embed_tokens'] = 'cpu'
-            device_map['lm_head'] = 'cpu'
+        # 初始化模型
+        self.model = PartialModel(config)
         
-        device_map['model.norm'] = 'cpu'
+        # 添加共享的embedding层
+        self.model.model.embed_tokens = self.shared_components['embed_tokens']
+        self.model.lm_head = self.shared_components['lm_head']
         
-        # 分配层到对应的 GPU
+        # 确保模型结构完整
+        for i in range(config.num_hidden_layers):
+            self.model.model.layers.append(None)  # 占位
+        
+        # 单独加载最终归一化层，而不是加载整个模型
+        logger.info("Loading normalization layer...")
+        try:
+            # 创建一个空的LayerNorm
+            self.model.model.norm = torch.nn.LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.model.model.norm.to('cpu')
+        except Exception as e:
+            logger.error(f"Error creating norm layer: {str(e)}")
+            raise
+        
+        # 只加载本worker需要处理的层，不再尝试共享
+        for i in range(start_layer, end_layer):
+            logger.info(f"Loading layer {i} to cuda:{gpu_id}...")
+            
+            try:
+                # 为所有层创建meta设备映射
+                temp_device_map = {'model.embed_tokens': 'meta', 'lm_head': 'meta', 'model.norm': 'meta'}
+                for j in range(config.num_hidden_layers):
+                    if j == i:
+                        # 当前加载的层用GPU
+                        temp_device_map[f'model.layers.{j}'] = f'cuda:{gpu_id}'
+                    else:
+                        # 其他所有层用meta设备
+                        temp_device_map[f'model.layers.{j}'] = 'meta'
+                
+                logger.info(f"Loading layer with device map: {temp_device_map}")
+                
+                # 加载模型的指定层
+                layer_model = AutoModelForCausalLM.from_pretrained(
+                    model_path,
+                    config=config,
+                    trust_remote_code=True,
+                    device_map=temp_device_map,
+                    torch_dtype=torch.float16,
+                    low_cpu_mem_usage=True
+                )
+                
+                # 获取层并添加到我们的模型中，不再添加到共享字典
+                self.model.model.layers[i] = layer_model.model.layers[i]
+                
+                # 清除不需要的内容，释放内存
+                del layer_model
+                torch.cuda.empty_cache()
+                
+            except Exception as e:
+                logger.error(f"Error loading layer {i}: {str(e)}")
+                raise
+        
+        # 设置设备映射以便以后使用
+        device_map = {
+            'model.embed_tokens': 'cpu',
+            'model.norm': 'cpu',
+            'lm_head': 'cpu'
+        }
+        
         gpu_id = 0 if self.worker_id < 4 else 1
         for i in range(start_layer, end_layer):
             device_map[f'model.layers.{i}'] = f'cuda:{gpu_id}'
         
-        # 创建模型 - 只加载需要的层
-        if self.shared_components:
-            logger.info("Creating model with shared components...")
-            
-            # 创建一个空模型结构
-            class PartialModel(torch.nn.Module):
-                def __init__(self, config):
-                    super().__init__()
-                    self.config = config
-                    # 创建必要的属性结构
-                    self.model = torch.nn.Module()
-                    self.model.embed_tokens = None
-                    self.model.layers = torch.nn.ModuleList()
-                    self.model.norm = None
-                    self.lm_head = None
-                    # 添加设备映射属性以避免错误
-                    self.hf_device_map = {}
-            
-            # 初始化模型
-            self.model = PartialModel(config)
-            
-            # 添加共享的embedding层
-            self.model.model.embed_tokens = self.shared_components['embed_tokens']
-            self.model.lm_head = self.shared_components['lm_head']
-            
-            # 确保模型结构完整
-            for i in range(config.num_hidden_layers):
-                self.model.model.layers.append(None)  # 占位
-            
-            # 单独加载最终归一化层，而不是加载整个模型
-            logger.info("Loading normalization layer...")
-            try:
-                # 创建一个空的LayerNorm
-                self.model.model.norm = torch.nn.LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
-                self.model.model.norm.to('cpu')
-            except Exception as e:
-                logger.error(f"Error creating norm layer: {str(e)}")
-                raise
-            
-            # 只加载本worker需要处理的层
-            for i in range(start_layer, end_layer):
-                layer_key = f'model.layers.{i}'
-                # 检查该层是否已经在另一个进程中加载
-                if layer_key in self.shared_components['loaded_layers']:
-                    self.model.model.layers[i] = self.shared_components['loaded_layers'][layer_key]
-                    logger.info(f"Using shared layer {i}")
-                else:
-                    # 加载新层
-                    try:
-                        gpu_id = 0 if self.worker_id < 4 else 1
-                        logger.info(f"Loading layer {i} to cuda:{gpu_id}...")
-                        
-                        # 构建设备映射
-                        temp_device_map = {
-                            'model.embed_tokens': 'meta',  # 避免加载嵌入层
-                            'lm_head': 'meta',             # 避免加载lm_head
-                            'model.norm': 'meta',          # 避免加载norm层
-                        }
-                        
-                        # 将其他层设置为meta或指定的GPU
-                        for j in range(config.num_hidden_layers):
-                            if j == i:
-                                temp_device_map[f'model.layers.{j}'] = f'cuda:{gpu_id}'
-                            else:
-                                temp_device_map[f'model.layers.{j}'] = 'meta'
-                        
-                        logger.info(f"Loading layer with device map: {temp_device_map}")
-                        
-                        # 加载模型的指定层
-                        layer_model = AutoModelForCausalLM.from_pretrained(
-                            model_path,
-                            config=config,
-                            trust_remote_code=True,
-                            device_map=temp_device_map,
-                            torch_dtype=torch.float16,
-                            low_cpu_mem_usage=True
-                        )
-                        
-                        # 获取层并添加到我们的模型中
-                        self.model.model.layers[i] = layer_model.model.layers[i]
-                        
-                        # 将层添加到共享字典
-                        self.shared_components['loaded_layers'][layer_key] = layer_model.model.layers[i]
-                        logger.info(f"Successfully loaded layer {i}")
-                        
-                        # 清除不需要的内容，释放内存
-                        del layer_model
-                        torch.cuda.empty_cache()
-                        
-                    except Exception as e:
-                        logger.error(f"Error loading layer {i}: {str(e)}")
-                        raise
-            
-            # 设置设备映射以便以后使用
-            device_map = {
-                'model.embed_tokens': 'cpu',
-                'model.norm': 'cpu',
-                'lm_head': 'cpu'
-            }
-            
-            gpu_id = 0 if self.worker_id < 4 else 1
-            for i in range(start_layer, end_layer):
-                device_map[f'model.layers.{i}'] = f'cuda:{gpu_id}'
-            
-            self.model.hf_device_map = device_map
-        else:
-            # 使用标准方法加载
-            model_kwargs = {
-                "device_map": device_map,
-                "max_memory": max_memory,
-                "torch_dtype": torch.float16,
-                "low_cpu_mem_usage": True
-            }
-            
-            logger.info("Applying optimization configurations...")
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model_path,
-                config=config,
-                trust_remote_code=True,
-                **model_kwargs
-            )
+        self.model.hf_device_map = device_map
         
         # 输出配置信息
         logger.info(f"Worker {self.worker_id} model configuration:")

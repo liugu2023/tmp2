@@ -6408,6 +6408,418 @@ _**User**_
 
 _**Assistant**_
 
+好的，让我修改脚本中的主机名：
+
+```bash:start_service.sh
+#!/bin/bash
+
+# 设置环境变量
+export PYTHONPATH=/archive/liugu/ds/ktransformers
+export MODEL_PATH=/archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B
+export GGUF_PATH=/archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF
+
+# 在206上运行的命令
+if [ "$(hostname)" = "compute06" ]; then
+    echo "Starting services on compute06 (206)..."
+    
+    # 启动 KV Cache 服务器
+    echo "Starting KV Cache Server..."
+    python -m ktransformers.kvcache_server --port 29600 &
+    sleep 2  # 等待KV Cache服务器启动
+    
+    # 启动模型分片服务
+    echo "Starting Model Sharder..."
+    python -m ktransformers.model_sharder \
+        --model_path $MODEL_PATH \
+        --gguf_path $GGUF_PATH \
+        --base_port 29500 \
+        --num_workers 8
+
+# 在login上运行的命令
+elif [ "$(hostname)" = "login" ]; then
+    echo "Starting services on login (100)..."
+    
+    # 启动中央服务器
+    echo "Starting Central Server..."
+    python -m ktransformers.central_server \
+        --port 29400 \
+        --num_workers 8 \
+        --worker_base_port 29500 \
+        --kvcache_port 29600 \
+        --worker_host 10.21.22.206
+    
+else
+    echo "Unknown host. This script should be run on either compute06 or login."
+    exit 1
+fi
+```
+
+使用方法保持不变：
+
+1. 在206上运行：
+```bash
+chmod +x start_service.sh
+./start_service.sh
+```
+
+2. 在login（100）上运行：
+```bash
+chmod +x start_service.sh
+./start_service.sh
+```
+
+3. 在login（100）上启动客户端：
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.local_chat \
+    --model_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/ \
+    --gguf_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/ \
+    --server_address "localhost:29400" \
+    --max_new_tokens 50
+```
+
+---
+
+_**User**_
+
+ds) root@compute06:/archive/liugu/ds/ktransformers# ./start_service.sh
+Starting services on compute06 (206)...
+Starting KV Cache Server...
+Starting Model Sharder...
+INFO:__main__:KV Cache Server started on port 29600
+INFO:__main__:Loading shared model components...
+INFO:__main__:Loading model config...
+INFO:__main__:Loading embedding and lm_head weights...
+INFO:__main__:Created shared embedding layer with dim=8192, vocab_size=128256
+INFO:__main__:Shared model components loaded and ready
+INFO:__main__:Started 8 worker processes
+INFO:ktransformers.worker:Worker 3 using GPU 1
+INFO:ktransformers.worker:Worker 5 using GPU 1
+INFO:ktransformers.worker:Worker 3 started at 10.21.22.206:29503, listening on all interfaces
+INFO:ktransformers.worker:Using shared model components...
+INFO:ktransformers.worker:Worker 5 started at 10.21.22.206:29505, listening on all interfaces
+INFO:ktransformers.worker:Using shared model components...
+INFO:ktransformers.worker:Worker 6 using GPU 0
+INFO:ktransformers.worker:Worker 6 started at 10.21.22.206:29506, listening on all interfaces
+INFO:ktransformers.worker:Using shared model components...
+INFO:ktransformers.worker:Worker 1 using GPU 1
+INFO:ktransformers.worker:Worker 1 started at 10.21.22.206:29501, listening on all interfaces
+INFO:ktransformers.worker:Using shared model components...
+INFO:ktransformers.worker:Worker 4 using GPU 0
+INFO:ktransformers.worker:Worker 4 started at 10.21.22.206:29504, listening on all interfaces
+INFO:ktransformers.worker:Using shared model components...
+INFO:ktransformers.worker:Worker 0 using GPU 0
+INFO:ktransformers.worker:Worker 2 using GPU 0
+INFO:ktransformers.worker:Worker 0 started at 10.21.22.206:29500, listening on all interfaces
+INFO:ktransformers.worker:Using shared model components...
+INFO:ktransformers.worker:Worker 2 started at 10.21.22.206:29502, listening on all interfaces
+INFO:ktransformers.worker:Using shared model components...
+INFO:ktransformers.worker:Worker 7 using GPU 1
+INFO:ktransformers.worker:Worker 7 started at 10.21.22.206:29507, listening on all interfaces
+INFO:ktransformers.worker:Using shared model components...
+INFO:ktransformers.worker:Worker 4 memory calculation:
+INFO:ktransformers.worker:- Hidden size: 8192
+INFO:ktransformers.worker:- Context length: 8192
+INFO:ktransformers.worker:- KV cache per layer: 0.25 GB
+INFO:ktransformers.worker:- Layer parameters: 3.25 GB per layer
+INFO:ktransformers.worker:- Handling 10 layers: from 40 to 49
+INFO:ktransformers.worker:- Estimated KV cache: 2.50 GB
+INFO:ktransformers.worker:- Estimated model parameters: 32.50 GB
+INFO:ktransformers.worker:- Estimated workspace: 1.00 GB
+INFO:ktransformers.worker:- Total GPU memory budget: 37 GB
+INFO:ktransformers.worker:Creating model with shared components...
+INFO:ktransformers.worker:Loading normalization layer...
+INFO:ktransformers.worker:Loading layer 40 to cuda:1...
+INFO:ktransformers.worker:Loading layer with device map: {'model.embed_tokens': 'meta', 'lm_head': 'meta', 'model.norm': 'meta', 'model.layers.0': 'meta', 'model.layers.1': 'meta', 'model.layers.2': 'meta', 'model.layers.3': 'meta', 'model.layers.4': 'meta', 'model.layers.5': 'meta', 'model.layers.6': 'meta', 'model.layers.7': 'meta', 'model.layers.8': 'meta', 'model.layers.9': 'meta', 'model.layers.10': 'meta', 'model.layers.11': 'meta', 'model.layers.12': 'meta', 'model.layers.13': 'meta', 'model.layers.14': 'meta', 'model.layers.15': 'meta', 'model.layers.16': 'meta', 'model.layers.17': 'meta', 'model.layers.18': 'meta', 'model.layers.19': 'meta', 'model.layers.20': 'meta', 'model.layers.21': 'meta', 'model.layers.22': 'meta', 'model.layers.23': 'meta', 'model.layers.24': 'meta', 'model.layers.25': 'meta', 'model.layers.26': 'meta', 'model.layers.27': 'meta', 'model.layers.28': 'meta', 'model.layers.29': 'meta', 'model.layers.30': 'meta', 'model.layers.31': 'meta', 'model.layers.32': 'meta', 'model.layers.33': 'meta', 'model.layers.34': 'meta', 'model.layers.35': 'meta', 'model.layers.36': 'meta', 'model.layers.37': 'meta', 'model.layers.38': 'meta', 'model.layers.39': 'meta', 'model.layers.40': 'cuda:1', 'model.layers.41': 'meta', 'model.layers.42': 'meta', 'model.layers.43': 'meta', 'model.layers.44': 'meta', 'model.layers.45': 'meta', 'model.layers.46': 'meta', 'model.layers.47': 'meta', 'model.layers.48': 'meta', 'model.layers.49': 'meta', 'model.layers.50': 'meta', 'model.layers.51': 'meta', 'model.layers.52': 'meta', 'model.layers.53': 'meta', 'model.layers.54': 'meta', 'model.layers.55': 'meta', 'model.layers.56': 'meta', 'model.layers.57': 'meta', 'model.layers.58': 'meta', 'model.layers.59': 'meta', 'model.layers.60': 'meta', 'model.layers.61': 'meta', 'model.layers.62': 'meta', 'model.layers.63': 'meta', 'model.layers.64': 'meta', 'model.layers.65': 'meta', 'model.layers.66': 'meta', 'model.layers.67': 'meta', 'model.layers.68': 'meta', 'model.layers.69': 'meta', 'model.layers.70': 'meta', 'model.layers.71': 'meta', 'model.layers.72': 'meta', 'model.layers.73': 'meta', 'model.layers.74': 'meta', 'model.layers.75': 'meta', 'model.layers.76': 'meta', 'model.layers.77': 'meta', 'model.layers.78': 'meta', 'model.layers.79': 'meta'}
+INFO:ktransformers.worker:Worker 0 memory calculation:
+INFO:ktransformers.worker:Worker 6 memory calculation:
+INFO:ktransformers.worker:- Hidden size: 8192
+INFO:ktransformers.worker:- Hidden size: 8192
+INFO:ktransformers.worker:- Context length: 8192
+INFO:ktransformers.worker:- Context length: 8192
+INFO:ktransformers.worker:- KV cache per layer: 0.25 GB
+INFO:ktransformers.worker:- KV cache per layer: 0.25 GB
+INFO:ktransformers.worker:- Layer parameters: 3.25 GB per layer
+INFO:ktransformers.worker:- Layer parameters: 3.25 GB per layer
+INFO:ktransformers.worker:- Handling 10 layers: from 0 to 9
+INFO:ktransformers.worker:- Handling 10 layers: from 60 to 69
+INFO:ktransformers.worker:- Estimated KV cache: 2.50 GB
+INFO:ktransformers.worker:- Estimated KV cache: 2.50 GB
+INFO:ktransformers.worker:- Estimated model parameters: 32.50 GB
+INFO:ktransformers.worker:- Estimated model parameters: 32.50 GB
+INFO:ktransformers.worker:- Estimated workspace: 1.00 GB
+INFO:ktransformers.worker:- Estimated workspace: 1.00 GB
+INFO:ktransformers.worker:- Total GPU memory budget: 37 GB
+INFO:ktransformers.worker:- Total GPU memory budget: 37 GB
+INFO:ktransformers.worker:Creating model with shared components...
+INFO:ktransformers.worker:Creating model with shared components...
+INFO:ktransformers.worker:Loading normalization layer...
+INFO:ktransformers.worker:Loading normalization layer...
+INFO:ktransformers.worker:Worker 3 memory calculation:
+INFO:ktransformers.worker:- Hidden size: 8192
+INFO:ktransformers.worker:- Context length: 8192
+INFO:ktransformers.worker:- KV cache per layer: 0.25 GB
+INFO:ktransformers.worker:- Layer parameters: 3.25 GB per layer
+INFO:ktransformers.worker:- Handling 10 layers: from 30 to 39
+INFO:ktransformers.worker:- Estimated KV cache: 2.50 GB
+INFO:ktransformers.worker:- Estimated model parameters: 32.50 GB
+INFO:ktransformers.worker:- Estimated workspace: 1.00 GB
+INFO:ktransformers.worker:- Total GPU memory budget: 37 GB
+INFO:ktransformers.worker:Creating model with shared components...
+INFO:ktransformers.worker:Loading normalization layer...
+INFO:ktransformers.worker:Loading layer 0 to cuda:0...
+INFO:ktransformers.worker:Loading layer with device map: {'model.embed_tokens': 'meta', 'lm_head': 'meta', 'model.norm': 'meta', 'model.layers.0': 'cuda:0', 'model.layers.1': 'meta', 'model.layers.2': 'meta', 'model.layers.3': 'meta', 'model.layers.4': 'meta', 'model.layers.5': 'meta', 'model.layers.6': 'meta', 'model.layers.7': 'meta', 'model.layers.8': 'meta', 'model.layers.9': 'meta', 'model.layers.10': 'meta', 'model.layers.11': 'meta', 'model.layers.12': 'meta', 'model.layers.13': 'meta', 'model.layers.14': 'meta', 'model.layers.15': 'meta', 'model.layers.16': 'meta', 'model.layers.17': 'meta', 'model.layers.18': 'meta', 'model.layers.19': 'meta', 'model.layers.20': 'meta', 'model.layers.21': 'meta', 'model.layers.22': 'meta', 'model.layers.23': 'meta', 'model.layers.24': 'meta', 'model.layers.25': 'meta', 'model.layers.26': 'meta', 'model.layers.27': 'meta', 'model.layers.28': 'meta', 'model.layers.29': 'meta', 'model.layers.30': 'meta', 'model.layers.31': 'meta', 'model.layers.32': 'meta', 'model.layers.33': 'meta', 'model.layers.34': 'meta', 'model.layers.35': 'meta', 'model.layers.36': 'meta', 'model.layers.37': 'meta', 'model.layers.38': 'meta', 'model.layers.39': 'meta', 'model.layers.40': 'meta', 'model.layers.41': 'meta', 'model.layers.42': 'meta', 'model.layers.43': 'meta', 'model.layers.44': 'meta', 'model.layers.45': 'meta', 'model.layers.46': 'meta', 'model.layers.47': 'meta', 'model.layers.48': 'meta', 'model.layers.49': 'meta', 'model.layers.50': 'meta', 'model.layers.51': 'meta', 'model.layers.52': 'meta', 'model.layers.53': 'meta', 'model.layers.54': 'meta', 'model.layers.55': 'meta', 'model.layers.56': 'meta', 'model.layers.57': 'meta', 'model.layers.58': 'meta', 'model.layers.59': 'meta', 'model.layers.60': 'meta', 'model.layers.61': 'meta', 'model.layers.62': 'meta', 'model.layers.63': 'meta', 'model.layers.64': 'meta', 'model.layers.65': 'meta', 'model.layers.66': 'meta', 'model.layers.67': 'meta', 'model.layers.68': 'meta', 'model.layers.69': 'meta', 'model.layers.70': 'meta', 'model.layers.71': 'meta', 'model.layers.72': 'meta', 'model.layers.73': 'meta', 'model.layers.74': 'meta', 'model.layers.75': 'meta', 'model.layers.76': 'meta', 'model.layers.77': 'meta', 'model.layers.78': 'meta', 'model.layers.79': 'meta'}
+INFO:ktransformers.worker:Loading layer 60 to cuda:1...
+INFO:ktransformers.worker:Loading layer with device map: {'model.embed_tokens': 'meta', 'lm_head': 'meta', 'model.norm': 'meta', 'model.layers.0': 'meta', 'model.layers.1': 'meta', 'model.layers.2': 'meta', 'model.layers.3': 'meta', 'model.layers.4': 'meta', 'model.layers.5': 'meta', 'model.layers.6': 'meta', 'model.layers.7': 'meta', 'model.layers.8': 'meta', 'model.layers.9': 'meta', 'model.layers.10': 'meta', 'model.layers.11': 'meta', 'model.layers.12': 'meta', 'model.layers.13': 'meta', 'model.layers.14': 'meta', 'model.layers.15': 'meta', 'model.layers.16': 'meta', 'model.layers.17': 'meta', 'model.layers.18': 'meta', 'model.layers.19': 'meta', 'model.layers.20': 'meta', 'model.layers.21': 'meta', 'model.layers.22': 'meta', 'model.layers.23': 'meta', 'model.layers.24': 'meta', 'model.layers.25': 'meta', 'model.layers.26': 'meta', 'model.layers.27': 'meta', 'model.layers.28': 'meta', 'model.layers.29': 'meta', 'model.layers.30': 'meta', 'model.layers.31': 'meta', 'model.layers.32': 'meta', 'model.layers.33': 'meta', 'model.layers.34': 'meta', 'model.layers.35': 'meta', 'model.layers.36': 'meta', 'model.layers.37': 'meta', 'model.layers.38': 'meta', 'model.layers.39': 'meta', 'model.layers.40': 'meta', 'model.layers.41': 'meta', 'model.layers.42': 'meta', 'model.layers.43': 'meta', 'model.layers.44': 'meta', 'model.layers.45': 'meta', 'model.layers.46': 'meta', 'model.layers.47': 'meta', 'model.layers.48': 'meta', 'model.layers.49': 'meta', 'model.layers.50': 'meta', 'model.layers.51': 'meta', 'model.layers.52': 'meta', 'model.layers.53': 'meta', 'model.layers.54': 'meta', 'model.layers.55': 'meta', 'model.layers.56': 'meta', 'model.layers.57': 'meta', 'model.layers.58': 'meta', 'model.layers.59': 'meta', 'model.layers.60': 'cuda:1', 'model.layers.61': 'meta', 'model.layers.62': 'meta', 'model.layers.63': 'meta', 'model.layers.64': 'meta', 'model.layers.65': 'meta', 'model.layers.66': 'meta', 'model.layers.67': 'meta', 'model.layers.68': 'meta', 'model.layers.69': 'meta', 'model.layers.70': 'meta', 'model.layers.71': 'meta', 'model.layers.72': 'meta', 'model.layers.73': 'meta', 'model.layers.74': 'meta', 'model.layers.75': 'meta', 'model.layers.76': 'meta', 'model.layers.77': 'meta', 'model.layers.78': 'meta', 'model.layers.79': 'meta'}
+INFO:ktransformers.worker:Loading layer 30 to cuda:0...
+INFO:ktransformers.worker:Loading layer with device map: {'model.embed_tokens': 'meta', 'lm_head': 'meta', 'model.norm': 'meta', 'model.layers.0': 'meta', 'model.layers.1': 'meta', 'model.layers.2': 'meta', 'model.layers.3': 'meta', 'model.layers.4': 'meta', 'model.layers.5': 'meta', 'model.layers.6': 'meta', 'model.layers.7': 'meta', 'model.layers.8': 'meta', 'model.layers.9': 'meta', 'model.layers.10': 'meta', 'model.layers.11': 'meta', 'model.layers.12': 'meta', 'model.layers.13': 'meta', 'model.layers.14': 'meta', 'model.layers.15': 'meta', 'model.layers.16': 'meta', 'model.layers.17': 'meta', 'model.layers.18': 'meta', 'model.layers.19': 'meta', 'model.layers.20': 'meta', 'model.layers.21': 'meta', 'model.layers.22': 'meta', 'model.layers.23': 'meta', 'model.layers.24': 'meta', 'model.layers.25': 'meta', 'model.layers.26': 'meta', 'model.layers.27': 'meta', 'model.layers.28': 'meta', 'model.layers.29': 'meta', 'model.layers.30': 'cuda:0', 'model.layers.31': 'meta', 'model.layers.32': 'meta', 'model.layers.33': 'meta', 'model.layers.34': 'meta', 'model.layers.35': 'meta', 'model.layers.36': 'meta', 'model.layers.37': 'meta', 'model.layers.38': 'meta', 'model.layers.39': 'meta', 'model.layers.40': 'meta', 'model.layers.41': 'meta', 'model.layers.42': 'meta', 'model.layers.43': 'meta', 'model.layers.44': 'meta', 'model.layers.45': 'meta', 'model.layers.46': 'meta', 'model.layers.47': 'meta', 'model.layers.48': 'meta', 'model.layers.49': 'meta', 'model.layers.50': 'meta', 'model.layers.51': 'meta', 'model.layers.52': 'meta', 'model.layers.53': 'meta', 'model.layers.54': 'meta', 'model.layers.55': 'meta', 'model.layers.56': 'meta', 'model.layers.57': 'meta', 'model.layers.58': 'meta', 'model.layers.59': 'meta', 'model.layers.60': 'meta', 'model.layers.61': 'meta', 'model.layers.62': 'meta', 'model.layers.63': 'meta', 'model.layers.64': 'meta', 'model.layers.65': 'meta', 'model.layers.66': 'meta', 'model.layers.67': 'meta', 'model.layers.68': 'meta', 'model.layers.69': 'meta', 'model.layers.70': 'meta', 'model.layers.71': 'meta', 'model.layers.72': 'meta', 'model.layers.73': 'meta', 'model.layers.74': 'meta', 'model.layers.75': 'meta', 'model.layers.76': 'meta', 'model.layers.77': 'meta', 'model.layers.78': 'meta', 'model.layers.79': 'meta'}
+INFO:ktransformers.worker:Worker 2 memory calculation:
+INFO:ktransformers.worker:- Hidden size: 8192
+INFO:ktransformers.worker:- Context length: 8192
+INFO:ktransformers.worker:- KV cache per layer: 0.25 GB
+INFO:ktransformers.worker:- Layer parameters: 3.25 GB per layer
+INFO:ktransformers.worker:- Handling 10 layers: from 20 to 29
+INFO:ktransformers.worker:- Estimated KV cache: 2.50 GB
+INFO:ktransformers.worker:- Estimated model parameters: 32.50 GB
+INFO:ktransformers.worker:- Estimated workspace: 1.00 GB
+INFO:ktransformers.worker:- Total GPU memory budget: 37 GB
+INFO:ktransformers.worker:Creating model with shared components...
+INFO:ktransformers.worker:Worker 5 memory calculation:
+INFO:ktransformers.worker:- Hidden size: 8192
+INFO:ktransformers.worker:- Context length: 8192
+INFO:ktransformers.worker:- KV cache per layer: 0.25 GB
+INFO:ktransformers.worker:- Layer parameters: 3.25 GB per layer
+INFO:ktransformers.worker:- Handling 10 layers: from 50 to 59
+INFO:ktransformers.worker:- Estimated KV cache: 2.50 GB
+INFO:ktransformers.worker:- Estimated model parameters: 32.50 GB
+INFO:ktransformers.worker:- Estimated workspace: 1.00 GB
+INFO:ktransformers.worker:- Total GPU memory budget: 37 GB
+INFO:ktransformers.worker:Creating model with shared components...
+INFO:ktransformers.worker:Loading normalization layer...
+INFO:ktransformers.worker:Loading normalization layer...
+INFO:ktransformers.worker:Loading layer 20 to cuda:0...
+INFO:ktransformers.worker:Loading layer with device map: {'model.embed_tokens': 'meta', 'lm_head': 'meta', 'model.norm': 'meta', 'model.layers.0': 'meta', 'model.layers.1': 'meta', 'model.layers.2': 'meta', 'model.layers.3': 'meta', 'model.layers.4': 'meta', 'model.layers.5': 'meta', 'model.layers.6': 'meta', 'model.layers.7': 'meta', 'model.layers.8': 'meta', 'model.layers.9': 'meta', 'model.layers.10': 'meta', 'model.layers.11': 'meta', 'model.layers.12': 'meta', 'model.layers.13': 'meta', 'model.layers.14': 'meta', 'model.layers.15': 'meta', 'model.layers.16': 'meta', 'model.layers.17': 'meta', 'model.layers.18': 'meta', 'model.layers.19': 'meta', 'model.layers.20': 'cuda:0', 'model.layers.21': 'meta', 'model.layers.22': 'meta', 'model.layers.23': 'meta', 'model.layers.24': 'meta', 'model.layers.25': 'meta', 'model.layers.26': 'meta', 'model.layers.27': 'meta', 'model.layers.28': 'meta', 'model.layers.29': 'meta', 'model.layers.30': 'meta', 'model.layers.31': 'meta', 'model.layers.32': 'meta', 'model.layers.33': 'meta', 'model.layers.34': 'meta', 'model.layers.35': 'meta', 'model.layers.36': 'meta', 'model.layers.37': 'meta', 'model.layers.38': 'meta', 'model.layers.39': 'meta', 'model.layers.40': 'meta', 'model.layers.41': 'meta', 'model.layers.42': 'meta', 'model.layers.43': 'meta', 'model.layers.44': 'meta', 'model.layers.45': 'meta', 'model.layers.46': 'meta', 'model.layers.47': 'meta', 'model.layers.48': 'meta', 'model.layers.49': 'meta', 'model.layers.50': 'meta', 'model.layers.51': 'meta', 'model.layers.52': 'meta', 'model.layers.53': 'meta', 'model.layers.54': 'meta', 'model.layers.55': 'meta', 'model.layers.56': 'meta', 'model.layers.57': 'meta', 'model.layers.58': 'meta', 'model.layers.59': 'meta', 'model.layers.60': 'meta', 'model.layers.61': 'meta', 'model.layers.62': 'meta', 'model.layers.63': 'meta', 'model.layers.64': 'meta', 'model.layers.65': 'meta', 'model.layers.66': 'meta', 'model.layers.67': 'meta', 'model.layers.68': 'meta', 'model.layers.69': 'meta', 'model.layers.70': 'meta', 'model.layers.71': 'meta', 'model.layers.72': 'meta', 'model.layers.73': 'meta', 'model.layers.74': 'meta', 'model.layers.75': 'meta', 'model.layers.76': 'meta', 'model.layers.77': 'meta', 'model.layers.78': 'meta', 'model.layers.79': 'meta'}
+INFO:ktransformers.worker:Loading layer 50 to cuda:1...
+INFO:ktransformers.worker:Loading layer with device map: {'model.embed_tokens': 'meta', 'lm_head': 'meta', 'model.norm': 'meta', 'model.layers.0': 'meta', 'model.layers.1': 'meta', 'model.layers.2': 'meta', 'model.layers.3': 'meta', 'model.layers.4': 'meta', 'model.layers.5': 'meta', 'model.layers.6': 'meta', 'model.layers.7': 'meta', 'model.layers.8': 'meta', 'model.layers.9': 'meta', 'model.layers.10': 'meta', 'model.layers.11': 'meta', 'model.layers.12': 'meta', 'model.layers.13': 'meta', 'model.layers.14': 'meta', 'model.layers.15': 'meta', 'model.layers.16': 'meta', 'model.layers.17': 'meta', 'model.layers.18': 'meta', 'model.layers.19': 'meta', 'model.layers.20': 'meta', 'model.layers.21': 'meta', 'model.layers.22': 'meta', 'model.layers.23': 'meta', 'model.layers.24': 'meta', 'model.layers.25': 'meta', 'model.layers.26': 'meta', 'model.layers.27': 'meta', 'model.layers.28': 'meta', 'model.layers.29': 'meta', 'model.layers.30': 'meta', 'model.layers.31': 'meta', 'model.layers.32': 'meta', 'model.layers.33': 'meta', 'model.layers.34': 'meta', 'model.layers.35': 'meta', 'model.layers.36': 'meta', 'model.layers.37': 'meta', 'model.layers.38': 'meta', 'model.layers.39': 'meta', 'model.layers.40': 'meta', 'model.layers.41': 'meta', 'model.layers.42': 'meta', 'model.layers.43': 'meta', 'model.layers.44': 'meta', 'model.layers.45': 'meta', 'model.layers.46': 'meta', 'model.layers.47': 'meta', 'model.layers.48': 'meta', 'model.layers.49': 'meta', 'model.layers.50': 'cuda:1', 'model.layers.51': 'meta', 'model.layers.52': 'meta', 'model.layers.53': 'meta', 'model.layers.54': 'meta', 'model.layers.55': 'meta', 'model.layers.56': 'meta', 'model.layers.57': 'meta', 'model.layers.58': 'meta', 'model.layers.59': 'meta', 'model.layers.60': 'meta', 'model.layers.61': 'meta', 'model.layers.62': 'meta', 'model.layers.63': 'meta', 'model.layers.64': 'meta', 'model.layers.65': 'meta', 'model.layers.66': 'meta', 'model.layers.67': 'meta', 'model.layers.68': 'meta', 'model.layers.69': 'meta', 'model.layers.70': 'meta', 'model.layers.71': 'meta', 'model.layers.72': 'meta', 'model.layers.73': 'meta', 'model.layers.74': 'meta', 'model.layers.75': 'meta', 'model.layers.76': 'meta', 'model.layers.77': 'meta', 'model.layers.78': 'meta', 'model.layers.79': 'meta'}
+INFO:ktransformers.worker:Worker 1 memory calculation:
+INFO:ktransformers.worker:- Hidden size: 8192
+INFO:ktransformers.worker:- Context length: 8192
+INFO:ktransformers.worker:- KV cache per layer: 0.25 GB
+INFO:ktransformers.worker:- Layer parameters: 3.25 GB per layer
+INFO:ktransformers.worker:- Handling 10 layers: from 10 to 19
+INFO:ktransformers.worker:- Estimated KV cache: 2.50 GB
+INFO:ktransformers.worker:- Estimated model parameters: 32.50 GB
+INFO:ktransformers.worker:- Estimated workspace: 1.00 GB
+INFO:ktransformers.worker:- Total GPU memory budget: 37 GB
+INFO:ktransformers.worker:Creating model with shared components...
+INFO:ktransformers.worker:Loading normalization layer...
+INFO:ktransformers.worker:Loading layer 10 to cuda:0...
+INFO:ktransformers.worker:Loading layer with device map: {'model.embed_tokens': 'meta', 'lm_head': 'meta', 'model.norm': 'meta', 'model.layers.0': 'meta', 'model.layers.1': 'meta', 'model.layers.2': 'meta', 'model.layers.3': 'meta', 'model.layers.4': 'meta', 'model.layers.5': 'meta', 'model.layers.6': 'meta', 'model.layers.7': 'meta', 'model.layers.8': 'meta', 'model.layers.9': 'meta', 'model.layers.10': 'cuda:0', 'model.layers.11': 'meta', 'model.layers.12': 'meta', 'model.layers.13': 'meta', 'model.layers.14': 'meta', 'model.layers.15': 'meta', 'model.layers.16': 'meta', 'model.layers.17': 'meta', 'model.layers.18': 'meta', 'model.layers.19': 'meta', 'model.layers.20': 'meta', 'model.layers.21': 'meta', 'model.layers.22': 'meta', 'model.layers.23': 'meta', 'model.layers.24': 'meta', 'model.layers.25': 'meta', 'model.layers.26': 'meta', 'model.layers.27': 'meta', 'model.layers.28': 'meta', 'model.layers.29': 'meta', 'model.layers.30': 'meta', 'model.layers.31': 'meta', 'model.layers.32': 'meta', 'model.layers.33': 'meta', 'model.layers.34': 'meta', 'model.layers.35': 'meta', 'model.layers.36': 'meta', 'model.layers.37': 'meta', 'model.layers.38': 'meta', 'model.layers.39': 'meta', 'model.layers.40': 'meta', 'model.layers.41': 'meta', 'model.layers.42': 'meta', 'model.layers.43': 'meta', 'model.layers.44': 'meta', 'model.layers.45': 'meta', 'model.layers.46': 'meta', 'model.layers.47': 'meta', 'model.layers.48': 'meta', 'model.layers.49': 'meta', 'model.layers.50': 'meta', 'model.layers.51': 'meta', 'model.layers.52': 'meta', 'model.layers.53': 'meta', 'model.layers.54': 'meta', 'model.layers.55': 'meta', 'model.layers.56': 'meta', 'model.layers.57': 'meta', 'model.layers.58': 'meta', 'model.layers.59': 'meta', 'model.layers.60': 'meta', 'model.layers.61': 'meta', 'model.layers.62': 'meta', 'model.layers.63': 'meta', 'model.layers.64': 'meta', 'model.layers.65': 'meta', 'model.layers.66': 'meta', 'model.layers.67': 'meta', 'model.layers.68': 'meta', 'model.layers.69': 'meta', 'model.layers.70': 'meta', 'model.layers.71': 'meta', 'model.layers.72': 'meta', 'model.layers.73': 'meta', 'model.layers.74': 'meta', 'model.layers.75': 'meta', 'model.layers.76': 'meta', 'model.layers.77': 'meta', 'model.layers.78': 'meta', 'model.layers.79': 'meta'}
+INFO:ktransformers.worker:Worker 7 memory calculation:
+INFO:ktransformers.worker:- Hidden size: 8192
+INFO:ktransformers.worker:- Context length: 8192
+INFO:ktransformers.worker:- KV cache per layer: 0.25 GB
+INFO:ktransformers.worker:- Layer parameters: 3.25 GB per layer
+INFO:ktransformers.worker:- Handling 10 layers: from 70 to 79
+INFO:ktransformers.worker:- Estimated KV cache: 2.50 GB
+INFO:ktransformers.worker:- Estimated model parameters: 32.50 GB
+INFO:ktransformers.worker:- Estimated workspace: 1.00 GB
+INFO:ktransformers.worker:- Total GPU memory budget: 37 GB
+INFO:ktransformers.worker:Creating model with shared components...
+INFO:ktransformers.worker:Loading normalization layer...
+INFO:ktransformers.worker:Loading layer 70 to cuda:1...
+INFO:ktransformers.worker:Loading layer with device map: {'model.embed_tokens': 'meta', 'lm_head': 'meta', 'model.norm': 'meta', 'model.layers.0': 'meta', 'model.layers.1': 'meta', 'model.layers.2': 'meta', 'model.layers.3': 'meta', 'model.layers.4': 'meta', 'model.layers.5': 'meta', 'model.layers.6': 'meta', 'model.layers.7': 'meta', 'model.layers.8': 'meta', 'model.layers.9': 'meta', 'model.layers.10': 'meta', 'model.layers.11': 'meta', 'model.layers.12': 'meta', 'model.layers.13': 'meta', 'model.layers.14': 'meta', 'model.layers.15': 'meta', 'model.layers.16': 'meta', 'model.layers.17': 'meta', 'model.layers.18': 'meta', 'model.layers.19': 'meta', 'model.layers.20': 'meta', 'model.layers.21': 'meta', 'model.layers.22': 'meta', 'model.layers.23': 'meta', 'model.layers.24': 'meta', 'model.layers.25': 'meta', 'model.layers.26': 'meta', 'model.layers.27': 'meta', 'model.layers.28': 'meta', 'model.layers.29': 'meta', 'model.layers.30': 'meta', 'model.layers.31': 'meta', 'model.layers.32': 'meta', 'model.layers.33': 'meta', 'model.layers.34': 'meta', 'model.layers.35': 'meta', 'model.layers.36': 'meta', 'model.layers.37': 'meta', 'model.layers.38': 'meta', 'model.layers.39': 'meta', 'model.layers.40': 'meta', 'model.layers.41': 'meta', 'model.layers.42': 'meta', 'model.layers.43': 'meta', 'model.layers.44': 'meta', 'model.layers.45': 'meta', 'model.layers.46': 'meta', 'model.layers.47': 'meta', 'model.layers.48': 'meta', 'model.layers.49': 'meta', 'model.layers.50': 'meta', 'model.layers.51': 'meta', 'model.layers.52': 'meta', 'model.layers.53': 'meta', 'model.layers.54': 'meta', 'model.layers.55': 'meta', 'model.layers.56': 'meta', 'model.layers.57': 'meta', 'model.layers.58': 'meta', 'model.layers.59': 'meta', 'model.layers.60': 'meta', 'model.layers.61': 'meta', 'model.layers.62': 'meta', 'model.layers.63': 'meta', 'model.layers.64': 'meta', 'model.layers.65': 'meta', 'model.layers.66': 'meta', 'model.layers.67': 'meta', 'model.layers.68': 'meta', 'model.layers.69': 'meta', 'model.layers.70': 'cuda:1', 'model.layers.71': 'meta', 'model.layers.72': 'meta', 'model.layers.73': 'meta', 'model.layers.74': 'meta', 'model.layers.75': 'meta', 'model.layers.76': 'meta', 'model.layers.77': 'meta', 'model.layers.78': 'meta', 'model.layers.79': 'meta'}
+Loading checkpoint shards: 100%|██████████████████████████████████████| 17/17 [07:38<00:00, 26.95s/it]
+Loading checkpoint shards: 100%|██████████████████████████████████████| 17/17 [07:38<00:00, 26.96s/it]
+ERROR:ktransformers.worker:Error loading layer 20: Can't pickle local object 'add_hook_to_module.<locals>.new_forward'
+Process Process-4:
+Traceback (most recent call last):
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/archive/liugu/ds/ktransformers/ktransformers/model_sharder.py", line 159, in start_worker
+    worker.load_model(model_path, gguf_path)
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 282, in load_model
+    self.shared_components['loaded_layers'][layer_key] = layer_model.model.layers[i]
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^
+  File "<string>", line 2, in __setitem__
+  File "/usr/lib/python3.11/multiprocessing/managers.py", line 821, in _callmethod
+    conn.send((self._id, methodname, args, kwds))
+  File "/usr/lib/python3.11/multiprocessing/connection.py", line 205, in send
+    self._send_bytes(_ForkingPickler.dumps(obj))
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/multiprocessing/reduction.py", line 51, in dumps
+    cls(buf, protocol).dump(obj)
+AttributeError: Can't pickle local object 'add_hook_to_module.<locals>.new_forward'
+Loading checkpoint shards: 100%|██████████████████████████████████████| 17/17 [07:38<00:00, 26.99s/it]
+ERROR:ktransformers.worker:Error loading layer 40: Can't pickle local object 'add_hook_to_module.<locals>.new_forward'
+Process Process-6:
+Traceback (most recent call last):
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/archive/liugu/ds/ktransformers/ktransformers/model_sharder.py", line 159, in start_worker
+    worker.load_model(model_path, gguf_path)
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 282, in load_model
+    self.shared_components['loaded_layers'][layer_key] = layer_model.model.layers[i]
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^
+  File "<string>", line 2, in __setitem__
+  File "/usr/lib/python3.11/multiprocessing/managers.py", line 821, in _callmethod
+    conn.send((self._id, methodname, args, kwds))
+  File "/usr/lib/python3.11/multiprocessing/connection.py", line 205, in send
+    self._send_bytes(_ForkingPickler.dumps(obj))
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/multiprocessing/reduction.py", line 51, in dumps
+    cls(buf, protocol).dump(obj)
+AttributeError: Can't pickle local object 'add_hook_to_module.<locals>.new_forward'
+Loading checkpoint shards: 100%|██████████████████████████████████████| 17/17 [07:38<00:00, 27.00s/it]
+Loading checkpoint shards: 100%|██████████████████████████████████████| 17/17 [07:39<00:00, 27.00s/it]
+Loading checkpoint shards: 100%|██████████████████████████████████████| 17/17 [07:39<00:00, 27.00s/it]
+ERROR:ktransformers.worker:Error loading layer 10: Can't pickle local object 'add_hook_to_module.<locals>.new_forward'
+Process Process-3:
+Traceback (most recent call last):
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/archive/liugu/ds/ktransformers/ktransformers/model_sharder.py", line 159, in start_worker
+    worker.load_model(model_path, gguf_path)
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 282, in load_model
+    self.shared_components['loaded_layers'][layer_key] = layer_model.model.layers[i]
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^
+  File "<string>", line 2, in __setitem__
+  File "/usr/lib/python3.11/multiprocessing/managers.py", line 821, in _callmethod
+    conn.send((self._id, methodname, args, kwds))
+  File "/usr/lib/python3.11/multiprocessing/connection.py", line 205, in send
+    self._send_bytes(_ForkingPickler.dumps(obj))
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/multiprocessing/reduction.py", line 51, in dumps
+    cls(buf, protocol).dump(obj)
+AttributeError: Can't pickle local object 'add_hook_to_module.<locals>.new_forward'
+Loading checkpoint shards: 100%|██████████████████████████████████████| 17/17 [07:39<00:00, 27.01s/it]
+Loading checkpoint shards: 100%|██████████████████████████████████████| 17/17 [07:39<00:00, 27.01s/it]
+[W305 18:13:57.516235094 CudaIPCTypes.cpp:16] Producer process has been terminated before all shared CUDA tensors released. See Note [Sharing CUDA tensors]
+ERROR:ktransformers.worker:Error loading layer 30: Can't pickle local object 'add_hook_to_module.<locals>.new_forward'
+Process Process-5:
+Traceback (most recent call last):
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/archive/liugu/ds/ktransformers/ktransformers/model_sharder.py", line 159, in start_worker
+    worker.load_model(model_path, gguf_path)
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 282, in load_model
+    self.shared_components['loaded_layers'][layer_key] = layer_model.model.layers[i]
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^
+  File "<string>", line 2, in __setitem__
+  File "/usr/lib/python3.11/multiprocessing/managers.py", line 821, in _callmethod
+    conn.send((self._id, methodname, args, kwds))
+  File "/usr/lib/python3.11/multiprocessing/connection.py", line 205, in send
+    self._send_bytes(_ForkingPickler.dumps(obj))
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/multiprocessing/reduction.py", line 51, in dumps
+    cls(buf, protocol).dump(obj)
+AttributeError: Can't pickle local object 'add_hook_to_module.<locals>.new_forward'
+[W305 18:13:57.598355658 CudaIPCTypes.cpp:16] Producer process has been terminated before all shared CUDA tensors released. See Note [Sharing CUDA tensors]
+ERROR:ktransformers.worker:Error loading layer 60: Can't pickle local object 'add_hook_to_module.<locals>.new_forward'
+Process Process-8:
+Traceback (most recent call last):
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/archive/liugu/ds/ktransformers/ktransformers/model_sharder.py", line 159, in start_worker
+    worker.load_model(model_path, gguf_path)
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 282, in load_model
+    self.shared_components['loaded_layers'][layer_key] = layer_model.model.layers[i]
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^
+  File "<string>", line 2, in __setitem__
+  File "/usr/lib/python3.11/multiprocessing/managers.py", line 821, in _callmethod
+    conn.send((self._id, methodname, args, kwds))
+  File "/usr/lib/python3.11/multiprocessing/connection.py", line 205, in send
+    self._send_bytes(_ForkingPickler.dumps(obj))
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/multiprocessing/reduction.py", line 51, in dumps
+    cls(buf, protocol).dump(obj)
+AttributeError: Can't pickle local object 'add_hook_to_module.<locals>.new_forward'
+ERROR:ktransformers.worker:Error loading layer 70: Can't pickle local object 'add_hook_to_module.<locals>.new_forward'
+Process Process-9:
+Traceback (most recent call last):
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/archive/liugu/ds/ktransformers/ktransformers/model_sharder.py", line 159, in start_worker
+    worker.load_model(model_path, gguf_path)
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 282, in load_model
+    self.shared_components['loaded_layers'][layer_key] = layer_model.model.layers[i]
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^
+  File "<string>", line 2, in __setitem__
+  File "/usr/lib/python3.11/multiprocessing/managers.py", line 821, in _callmethod
+    conn.send((self._id, methodname, args, kwds))
+  File "/usr/lib/python3.11/multiprocessing/connection.py", line 205, in send
+    self._send_bytes(_ForkingPickler.dumps(obj))
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/multiprocessing/reduction.py", line 51, in dumps
+    cls(buf, protocol).dump(obj)
+AttributeError: Can't pickle local object 'add_hook_to_module.<locals>.new_forward'
+ERROR:ktransformers.worker:Error loading layer 0: Can't pickle local object 'add_hook_to_module.<locals>.new_forward'
+Process Process-2:
+Traceback (most recent call last):
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/archive/liugu/ds/ktransformers/ktransformers/model_sharder.py", line 159, in start_worker
+    worker.load_model(model_path, gguf_path)
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 282, in load_model
+    self.shared_components['loaded_layers'][layer_key] = layer_model.model.layers[i]
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^
+  File "<string>", line 2, in __setitem__
+  File "/usr/lib/python3.11/multiprocessing/managers.py", line 821, in _callmethod
+    conn.send((self._id, methodname, args, kwds))
+  File "/usr/lib/python3.11/multiprocessing/connection.py", line 205, in send
+    self._send_bytes(_ForkingPickler.dumps(obj))
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/multiprocessing/reduction.py", line 51, in dumps
+    cls(buf, protocol).dump(obj)
+AttributeError: Can't pickle local object 'add_hook_to_module.<locals>.new_forward'
+ERROR:ktransformers.worker:Error loading layer 50: Can't pickle local object 'add_hook_to_module.<locals>.new_forward'
+Process Process-7:
+Traceback (most recent call last):
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/archive/liugu/ds/ktransformers/ktransformers/model_sharder.py", line 159, in start_worker
+    worker.load_model(model_path, gguf_path)
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 282, in load_model
+    self.shared_components['loaded_layers'][layer_key] = layer_model.model.layers[i]
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^
+  File "<string>", line 2, in __setitem__
+  File "/usr/lib/python3.11/multiprocessing/managers.py", line 821, in _callmethod
+    conn.send((self._id, methodname, args, kwds))
+  File "/usr/lib/python3.11/multiprocessing/connection.py", line 205, in send
+    self._send_bytes(_ForkingPickler.dumps(obj))
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/multiprocessing/reduction.py", line 51, in dumps
+    cls(buf, protocol).dump(obj)
+AttributeError: Can't pickle local object 'add_hook_to_module.<locals>.new_forward'
+[W305 18:13:57.876151570 CudaIPCTypes.cpp:16] Producer process has been terminated before all shared CUDA tensors released. See Note [Sharing CUDA tensors]
+[W305 18:13:58.052750928 CudaIPCTypes.cpp:16] Producer process has been terminated before all shared CUDA tensors released. See Note [Sharing CUDA tensors]
+[W305 18:13:58.119240017 CudaIPCTypes.cpp:16] Producer process has been terminated before all shared CUDA tensors released. See Note [Sharing CUDA tensors]
+[W305 18:13:58.176523856 CudaIPCTypes.cpp:16] Producer process has been terminated before all shared CUDA tensors released. See Note [Sharing CUDA tensors]
+[W305 18:13:58.183220244 CudaIPCTypes.cpp:16] Producer process has been terminated before all shared CUDA tensors released. See Note [Sharing CUDA tensors]
+[W305 18:13:58.260230965 CudaIPCTypes.cpp:16] Producer process has been terminated before all shared CUDA tensors released. See Note [Sharing CUDA tensors]
+(ds) root@compute06:/archive/liugu/ds/ktransformers# source ./.env.new
+
+
+
+---
+
+_**Assistant**_
+
 
 
 ---

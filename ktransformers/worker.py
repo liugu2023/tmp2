@@ -48,19 +48,10 @@ class ModelWorker:
         logger.info("Loading model config...")
         config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         
-        # 更新配置
-        config.attn_implementation = "flash_attention_2"  # 新的 Flash Attention 2 配置
+        # 强制启用 Flash Attention 2
+        config._attn_implementation = "flash_attention_2"  # 直接设置底层实现
+        config.attn_implementation = "flash_attention_2"   # 设置高层接口
         torch.set_default_dtype(config.torch_dtype)
-        
-        # 初始化分布式环境
-        if not torch.distributed.is_initialized():
-            logger.info("Initializing distributed environment...")
-            torch.distributed.init_process_group(
-                backend='nccl',
-                init_method='tcp://localhost:29501',
-                world_size=1,
-                rank=0
-            )
         
         logger.info("Loading model...")
         # 设置双 GPU 的内存分配和并行配置
@@ -75,6 +66,8 @@ class ModelWorker:
             "device_map": "auto",  # 让 transformers 自动处理设备分配
             "max_memory": max_memory,
             "low_cpu_mem_usage": True,
+            "torch_dtype": torch.float16,
+            "use_flash_attention": True,  # 强制使用 flash attention
         }
         
         # 设置并行环境
@@ -87,7 +80,6 @@ class ModelWorker:
             model_path,
             config=config,
             trust_remote_code=True,
-            torch_dtype=torch.float16,
             **model_kwargs
         )
         

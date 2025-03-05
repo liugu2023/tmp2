@@ -1,3 +1,4 @@
+import os
 import torch
 import zmq
 import pickle
@@ -5,9 +6,68 @@ from typing import Dict, Any
 import logging
 from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM, GenerationConfig, TextStreamer
 import time
+import subprocess
+import multiprocessing
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+def get_numa_nodes():
+    """获取 NUMA 节点信息"""
+    try:
+        output = subprocess.check_output(['numactl', '--hardware']).decode()
+        nodes = []
+        for line in output.split('\n'):
+            if line.startswith('node ') and 'cpus:' in line:
+                node_id = int(line.split()[1])
+                nodes.append(node_id)
+        return nodes
+    except Exception as e:
+        logger.error(f"Error getting NUMA nodes: {e}")
+        return [0]  # 默认返回节点0
+
+def start_worker_process(worker_id: int, base_port: int, num_workers: int):
+    """启动单个 worker 进程"""
+    # 计算 NUMA 节点
+    numa_nodes = get_numa_nodes()
+    node_id = 0 if worker_id < 4 else 1  # 前4个进程在节点0，后4个在节点1
+    
+    # 计算端口
+    port = base_port + worker_id
+    
+    # 使用 numactl 启动进程
+    cmd = [
+        'numactl',
+        f'--cpunodebind={node_id}',
+        f'--membind={node_id}',
+        'python',
+        '-m',
+        'ktransformers.worker',
+        f'--worker_address=10.21.22.206:{port}',
+        f'--worker_id={worker_id}',
+        f'--num_workers={num_workers}'
+    ]
+    
+    logger.info(f"Starting worker {worker_id} on NUMA node {node_id} with port {port}")
+    subprocess.Popen(cmd)
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--base_port', type=int, default=29500)
+    parser.add_argument('--num_workers', type=int, default=8)
+    args = parser.parse_args()
+    
+    # 启动多个 worker 进程
+    for worker_id in range(args.num_workers):
+        start_worker_process(worker_id, args.base_port, args.num_workers)
+    
+    # 等待所有进程
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        logger.info("Shutting down all workers...")
 
 def load_model_and_tokenizer(model_path: str, gguf_path: str):
     logger.info("Loading tokenizer...")
@@ -29,7 +89,17 @@ def load_model_and_tokenizer(model_path: str, gguf_path: str):
     return model, tokenizer
 
 class ModelWorker:
-    def __init__(self, address: str):
+    def __init__(self, address: str, worker_id: int = 0, num_workers: int = 1):
+        self.worker_id = worker_id
+        self.num_workers = num_workers
+        
+        # 设置 GPU 设备
+        if torch.cuda.is_available():
+            # 根据 worker_id 分配 GPU
+            gpu_id = worker_id % torch.cuda.device_count()
+            torch.cuda.set_device(gpu_id)
+            logger.info(f"Worker {worker_id} using GPU {gpu_id}")
+        
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.REP)
         host, port = address.split(':')
@@ -39,7 +109,7 @@ class ModelWorker:
         
         self.model = None
         self.tokenizer = None
-        logger.info(f"Worker started at {address}, listening on all interfaces")
+        logger.info(f"Worker {worker_id} started at {address}, listening on all interfaces")
 
     def load_model(self, model_path: str, gguf_path: str):
         logger.info("Loading tokenizer...")
@@ -50,17 +120,37 @@ class ModelWorker:
         torch.set_default_dtype(config.torch_dtype)
         
         logger.info("Loading model...")
-        # 设置双 GPU 的内存分配
+        # 计算每个进程应该处理的层
+        total_layers = config.num_hidden_layers
+        layers_per_process = total_layers // self.num_workers
+        start_layer = self.worker_id * layers_per_process
+        end_layer = start_layer + layers_per_process if self.worker_id < self.num_workers - 1 else total_layers
+        
+        # 设置内存分配
         max_memory = {
-            0: "12GiB",    # 第一张 GPU 使用 12GB
-            1: "12GiB",    # 第二张 GPU 使用 12GB
-            'cpu': "138GiB" # 剩余放在 CPU 内存
+            0: "12GiB" if self.worker_id < 4 else None,    # 前4个进程使用 GPU 0
+            1: "12GiB" if self.worker_id >= 4 else None,   # 后4个进程使用 GPU 1
+            'cpu': "138GiB"  # CPU 内存
         }
         
-        # 简化设备映射，让 transformers 自动处理
+        # 设置设备映射
+        device_map = {
+            'model.embed_tokens': 'cpu',
+            'model.norm': 'cpu',
+            'lm_head': 'cpu'
+        }
+        
+        # 分配层到对应的 GPU
+        gpu_id = 0 if self.worker_id < 4 else 1
+        for i in range(start_layer, end_layer):
+            device_map[f'model.layers.{i}'] = f'cuda:{gpu_id}'
+        
+        logger.info(f"Worker {self.worker_id} handling layers {start_layer} to {end_layer} on GPU {gpu_id}")
+        
         model_kwargs = {
-            "device_map": "auto",  # 让 transformers 自动处理设备分配
-            "max_memory": max_memory
+            "device_map": device_map,
+            "max_memory": max_memory,
+            "torch_dtype": torch.float16
         }
         
         logger.info("Applying optimization configurations...")
@@ -68,16 +158,17 @@ class ModelWorker:
             model_path,
             config=config,
             trust_remote_code=True,
-            torch_dtype=torch.float16,
             **model_kwargs
         )
         
-        # 输出优化配置信息
-        logger.info("Model optimization settings:")
-        logger.info("- Using FP16 precision")
+        # 输出配置信息
+        logger.info(f"Worker {self.worker_id} model configuration:")
+        logger.info(f"- Handling layers: {start_layer} to {end_layer}")
+        logger.info(f"- Using GPU: {gpu_id}")
         logger.info("- Device mapping:")
         for name, device in self.model.hf_device_map.items():
-            logger.info(f"  {name}: {device}")
+            if name.startswith(f'model.layers.{start_layer}'):
+                logger.info(f"  {name}: {device}")
         
         self.model.eval()
         
@@ -268,15 +359,6 @@ class ModelWorker:
             self.socket.close()
             self.context.term()
             logger.info("Worker shutdown complete")
-
-def main():
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--worker_address', type=str, required=True)
-    args = parser.parse_args()
-    
-    worker = ModelWorker(args.worker_address)
-    worker.run()
 
 if __name__ == '__main__':
     main() 

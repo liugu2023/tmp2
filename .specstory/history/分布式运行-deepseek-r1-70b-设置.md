@@ -3961,332 +3961,171 @@ def load_model(self, model_path: str, gguf_path: str):
 
 _**User**_
 
-为什么加载模型的时候可以多核，推理模型的时候只能单核呢
+我安装了numa，改一下，使用八个进程，前四个进程绑一个节点，后四个一个节点
 
 ---
 
 _**Assistant**_
 
-这是因为我们没有启用模型的并行推理。让我们修改代码来启用多核推理：
+
+
+
+
+
+
+
+
+
+
+让我们修改 worker.py 来支持 NUMA 绑定和多进程：
 
 ```python:ktransformers/worker.py
-def load_model(self, model_path: str, gguf_path: str):
-    # ... 前面的代码保持不变 ...
-    
-    # 设置双 GPU 的内存分配和并行配置
-    max_memory = {
-        0: "12GiB",    # 第一张 GPU 使用 12GB
-        1: "12GiB",    # 第二张 GPU 使用 12GB
-        'cpu': "138GiB" # 剩余放在 CPU 内存
-    }
-    
-    # 添加并行配置
-    model_kwargs = {
-        "device_map": "auto",  # 让 transformers 自动处理设备分配
-        "max_memory": max_memory,
-        # 启用模型并行
-        "use_flash_attention_2": True,  # 使用 Flash Attention 2
-        "parallel_mode": "tensor",  # 使用张量并行
-        "low_cpu_mem_usage": True,
-    }
-    
-    # 设置并行环境
-    torch.set_num_threads(8)  # 设置 CPU 线程数
-    if torch.cuda.is_available():
-        torch.cuda.set_device('cuda:0')  # 设置主 GPU
-    
-    logger.info("Applying optimization configurations...")
-    self.model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        config=config,
-        trust_remote_code=True,
-        torch_dtype=torch.float16,
-        **model_kwargs
-    )
-    
-    # 启用模型并行配置
-    if hasattr(self.model, "enable_model_parallel"):
-        self.model.enable_model_parallel()
-    
-    # 输出优化配置信息
-    logger.info("Model optimization settings:")
-    logger.info("- Using FP16 precision")
-    logger.info("- Flash Attention 2 enabled")
-    logger.info("- Tensor parallel enabled")
-    logger.info("- CPU threads: 8")
-    logger.info("- Device mapping:")
-    for name, device in self.model.hf_device_map.items():
-        logger.info(f"  {name}: {device}")
-    
-    self.model.eval()
-```
+import os
+import torch
+import zmq
+import pickle
+from typing import Dict, Any
+import logging
+from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM, GenerationConfig, TextStreamer
+import time
+import subprocess
+import multiprocessing
 
-在 generate 方法中也添加并行处理：
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-```python:ktransformers/worker.py
-def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+def get_numa_nodes():
+    """获取 NUMA 节点信息"""
     try:
-        # ... 其他代码保持不变 ...
-        
-        # 生成文本
-        logger.info("Starting text generation...")
-        start_time = time.time()
-        with torch.no_grad(), torch.amp.autocast('cuda'):
-            # 启用并行生成
-            torch.set_grad_enabled(False)
-            torch.set_num_threads(8)  # 设置 CPU 线程数
-            
-            # 使用多 GPU 生成
-            outputs = self.model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                do_sample=input_data.get('do_sample', True),
-                streamer=streamer,
-                use_cache=True,  # 启用 KV 缓存
-                num_beams=1,  # 单束搜索，但启用并行
-                synced_gpus=True  # 启用 GPU 同步
-            )
-            
-        # ... 其他代码保持不变 ...
-```
+        output = subprocess.check_output(['numactl', '--hardware']).decode()
+        nodes = []
+        for line in output.split('\n'):
+            if line.startswith('node ') and 'cpus:' in line:
+                node_id = int(line.split()[1])
+                nodes.append(node_id)
+        return nodes
+    except Exception as e:
+        logger.error(f"Error getting NUMA nodes: {e}")
+        return [0]  # 默认返回节点0
 
-主要改动：
-1. 启用 Flash Attention 2
-2. 启用张量并行
-3. 设置 CPU 线程数
-4. 启用模型并行
-5. 启用 GPU 同步
-6. 优化生成参数
-
-这样应该能充分利用多核和多 GPU 进行推理。如果需要调整并行参数，请告诉我。
-
----
-
-_**User**_
-
-The model was loaded with use_flash_attention_2=True, which is deprecated and may be removed in a future release. Please use `attn_implementation="flash_attention_2"` instead.
-ERROR:__main__:Error processing message: LlamaForCausalLM.__init__() got an unexpected keyword argument 'parallel_mode'
-
-
----
-
-_**Assistant**_
-
-
-
-
-
-
-
-
-
-
-
-
-
-让我们修正这些参数问题。根据错误信息，我们需要更新配置：
-
-```python:ktransformers/worker.py
-def load_model(self, model_path: str, gguf_path: str):
-    logger.info("Loading tokenizer...")
-    self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+def start_worker_process(worker_id: int, base_port: int, num_workers: int):
+    """启动单个 worker 进程"""
+    # 计算 NUMA 节点
+    numa_nodes = get_numa_nodes()
+    node_id = 0 if worker_id < 4 else 1  # 前4个进程在节点0，后4个在节点1
     
-    logger.info("Loading model config...")
-    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    # 计算端口
+    port = base_port + worker_id
     
-    # 更新配置
-    config.attn_implementation = "flash_attention_2"  # 新的 Flash Attention 2 配置
-    torch.set_default_dtype(config.torch_dtype)
+    # 使用 numactl 启动进程
+    cmd = [
+        'numactl',
+        f'--cpunodebind={node_id}',
+        f'--membind={node_id}',
+        'python',
+        '-m',
+        'ktransformers.worker',
+        f'--worker_address=10.21.22.206:{port}',
+        f'--worker_id={worker_id}',
+        f'--num_workers={num_workers}'
+    ]
     
-    logger.info("Loading model...")
-    # 设置双 GPU 的内存分配和并行配置
-    max_memory = {
-        0: "12GiB",    # 第一张 GPU 使用 12GB
-        1: "12GiB",    # 第二张 GPU 使用 12GB
-        'cpu': "138GiB" # 剩余放在 CPU 内存
-    }
+    logger.info(f"Starting worker {worker_id} on NUMA node {node_id} with port {port}")
+    subprocess.Popen(cmd)
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--base_port', type=int, default=29500)
+    parser.add_argument('--num_workers', type=int, default=8)
+    args = parser.parse_args()
     
-    # 添加并行配置
-    model_kwargs = {
-        "device_map": "auto",  # 让 transformers 自动处理设备分配
-        "max_memory": max_memory,
-        "low_cpu_mem_usage": True,
-    }
+    # 启动多个 worker 进程
+    for worker_id in range(args.num_workers):
+        start_worker_process(worker_id, args.base_port, args.num_workers)
     
-    # 设置并行环境
-    torch.set_num_threads(8)  # 设置 CPU 线程数
-    if torch.cuda.is_available():
-        torch.cuda.set_device('cuda:0')  # 设置主 GPU
-    
-    logger.info("Applying optimization configurations...")
-    self.model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        config=config,
-        trust_remote_code=True,
-        torch_dtype=torch.float16,
-        **model_kwargs
-    )
-    
-    # 输出优化配置信息
-    logger.info("Model optimization settings:")
-    logger.info("- Using FP16 precision")
-    logger.info("- Flash Attention 2 enabled")
-    logger.info("- CPU threads: 8")
-    logger.info("- Device mapping:")
-    for name, device in self.model.hf_device_map.items():
-        logger.info(f"  {name}: {device}")
-    
-    self.model.eval()
-```
-
-
-
-
-
-主要改动：
-1. 移除了 `use_flash_attention_2` 参数，改用 `config.attn_implementation`
-2. 移除了不支持的 `parallel_mode` 参数
-3. 保留了基本的优化配置：
-   - Flash Attention 2
-   - 自动设备映射
-   - CPU 线程设置
-   - FP16 精度
-
-这样应该能正常工作了。并行处理主要通过：
-1. Flash Attention 2 优化
-2. 自动设备映射
-3. CPU 多线程
-4. yaml 规则文件中的优化
-
-如果还有其他错误，请告诉我。
-
----
-
-_**User**_
-
-INFO:__main__:Creating chat messages...
-INFO:__main__:Tokenizing input...
-INFO:__main__:Starting generation...
-INFO:__main__:Preparing generation request...
-INFO:__main__:Starting generation...
-ERROR:__main__:Error in generate: Generation failed: name 'streamer' is not defined
-ERROR:__main__:Error: Generation failed: name 'streamer' is not defined
-INFO:__main__:Sending shutdown command to worker...
-INFO:__main__:Worker shutdown successfully
-
----
-
-_**Assistant**_
-
-
-
-
-
-
-
-
-
-
-
-
-
-啊，是的，我们在 generate 方法中忘记创建 streamer 了。让我们修复这个问题：
-
-```python:ktransformers/worker.py
-def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+    # 等待所有进程
     try:
-        logger.info("Received generation request")
-        logger.info(f"Input sequence length: {len(input_data['input_ids'])}")
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        logger.info("Shutting down all workers...")
+
+class ModelWorker:
+    def __init__(self, address: str, worker_id: int = 0, num_workers: int = 1):
+        self.worker_id = worker_id
+        self.num_workers = num_workers
         
-        # 创建输入张量
-        logger.info("Moving input tensors to GPU...")
-        input_ids = torch.tensor(input_data['input_ids'], device='cuda')
-        attention_mask = torch.tensor(input_data['attention_mask'], device='cuda')
+        # 设置 GPU 设备
+        if torch.cuda.is_available():
+            # 根据 worker_id 分配 GPU
+            gpu_id = worker_id % torch.cuda.device_count()
+            torch.cuda.set_device(gpu_id)
+            logger.info(f"Worker {worker_id} using GPU {gpu_id}")
         
-        # 生成参数日志
-        max_new_tokens = input_data.get('max_new_tokens', 512)
-        temperature = input_data.get('temperature', 0.6)
-        top_p = input_data.get('top_p', 0.9)
-        logger.info(f"Generation parameters: max_new_tokens={max_new_tokens}, "
-                   f"temperature={temperature}, "
-                   f"top_p={top_p}")
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.REP)
+        host, port = address.split(':')
+        self.socket.bind(f"tcp://0.0.0.0:{port}")
+        self.socket.setsockopt(zmq.RCVHWM, 0)
+        self.socket.setsockopt(zmq.SNDHWM, 0)
         
-        # 创建自定义流式处理器
-        class StreamingHandler:
-            def __init__(self, socket, tokenizer):
-                self.socket = socket
-                self.tokenizer = tokenizer
-                self.current_text = ""
-                self.last_send_time = time.time()
-                
-            def __call__(self, text_chunk: str, stream_end: bool = False):
-                current_time = time.time()
-                self.current_text += text_chunk
-                
-                # 每0.5秒或结束时发送一次
-                if stream_end or (current_time - self.last_send_time) > 0.5:
-                    self.socket.send_pyobj({
-                        'status': 'streaming',
-                        'text': self.current_text,
-                        'finished': stream_end
-                    })
-                    # 等待客户端确认
-                    self.socket.recv_pyobj()
-                    self.last_send_time = current_time
-        
-        # 创建流式处理器
-        streamer = self.CustomStreamer(
-            self.tokenizer,
-            on_text_chunk=StreamingHandler(self.socket, self.tokenizer),
-            skip_prompt=True,
-            skip_special_tokens=True
-        )
-        
-        # 生成文本
-        logger.info("Starting text generation...")
-        start_time = time.time()
-        with torch.no_grad(), torch.amp.autocast('cuda'):
-            # 启用并行生成
-            torch.set_grad_enabled(False)
-            torch.set_num_threads(8)  # 设置 CPU 线程数
-            
-            # 使用多 GPU 生成
-            outputs = self.model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                do_sample=input_data.get('do_sample', True),
-                streamer=streamer,
-                use_cache=True,  # 启用 KV 缓存
-                num_beams=1,  # 单束搜索，但启用并行
-                synced_gpus=True  # 启用 GPU 同步
-            )
-        
+        self.model = None
+        self.tokenizer = None
+        logger.info(f"Worker {worker_id} started at {address}, listening on all interfaces")
+
+    def load_model(self, model_path: str, gguf_path: str):
         # ... 其余代码保持不变 ...
 ```
 
 
 
 
+现在运行命令变为：
+
+```bash
+# 在 GPU 机器 (10.21.22.206) 上启动多进程 workers
+PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.worker --base_port 29500 --num_workers 8
+```
+
+
+
+
+在客户端上，您可以连接到任意一个 worker：
+
+```bash
+# 连接到第一个 worker
+PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.local_chat \
+    --model_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/ \
+    --gguf_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/ \
+    --worker_address "10.21.22.206:29500" \
+    --max_new_tokens 50
+
+# 或连接到其他 worker（端口从 29500 到 29507）
+PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.local_chat \
+    --model_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/ \
+    --gguf_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/ \
+    --worker_address "10.21.22.206:29501" \
+    --max_new_tokens 50
+```
+
+
+
 
 主要改动：
-1. 添加了 StreamingHandler 类的定义
-2. 在生成前创建了 streamer 实例
-3. 保持了其他优化配置
+1. 添加了 NUMA 节点检测和绑定
+2. 支持多进程启动
+3. 每个进程绑定到特定的 NUMA 节点
+4. 根据 worker_id 分配 GPU
+5. 使用不同的端口号
 
-现在应该能正常工作了。如果还有其他问题，请告诉我。
+这样应该能更好地利用系统资源。如果需要调整任何参数，请告诉我。
 
 ---
 
 _**User**_
 
-ERROR:__main__:Error in generate: Generation failed: Default process group has not been initialized, please make sure to call init_process_group.
-ERROR:__main__:Error: Generation failed: Default process group has not been initialized, please make sure to call init_process_group.
+nonono，这八个进程都要处理同一个推理的，不是处理八个推理
 
 ---
 
@@ -4302,9 +4141,7 @@ _**Assistant**_
 
 
 
-
-
-需要初始化进程组来支持多 GPU。让我们修改 worker.py：
+啊，明白了！您是想要这8个进程协同处理同一个推理任务，每个进程负责模型的不同部分。让我们修改代码：
 
 ```python:ktransformers/worker.py
 def load_model(self, model_path: str, gguf_path: str):
@@ -4313,108 +4150,23 @@ def load_model(self, model_path: str, gguf_path: str):
     
     logger.info("Loading model config...")
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-    
-    # 更新配置
-    config.attn_implementation = "flash_attention_2"  # 新的 Flash Attention 2 配置
     torch.set_default_dtype(config.torch_dtype)
     
-    # 初始化分布式环境
-    if not torch.distributed.is_initialized():
-        logger.info("Initializing distributed environment...")
-        torch.distributed.init_process_group(
-            backend='nccl',
-            init_method='tcp://localhost:29501',
-            world_size=1,
-            rank=0
-        )
-    
     logger.info("Loading model...")
-    # 设置双 GPU 的内存分配和并行配置
+    # 计算每个进程应该处理的层
+    total_layers = config.num_hidden_layers
+    layers_per_process = total_layers // self.num_workers
+    start_layer = self.worker_id * layers_per_process
+    end_layer = start_layer + layers_per_process if self.worker_id < self.num_workers - 1 else total_layers
+    
+    # 设置内存分配
     max_memory = {
-        0: "12GiB",    # 第一张 GPU 使用 12GB
-        1: "12GiB",    # 第二张 GPU 使用 12GB
-        'cpu': "138GiB" # 剩余放在 CPU 内存
+        0: "12GiB" if self.worker_id < 4 else None,    # 前4个进程使用 GPU 0
+        1: "12GiB" if self.worker_id >= 4 else None,   # 后4个进程使用 GPU 1
+        'cpu': "138GiB"  # CPU 内存
     }
     
-    # 添加并行配置
-    model_kwargs = {
-        "device_map": "auto",  # 让 transformers 自动处理设备分配
-        "max_memory": max_memory,
-        "low_cpu_mem_usage": True,
-    }
-    
-    # 设置并行环境
-    torch.set_num_threads(8)  # 设置 CPU 线程数
-    if torch.cuda.is_available():
-        torch.cuda.set_device('cuda:0')  # 设置主 GPU
-    
-    logger.info("Applying optimization configurations...")
-    self.model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        config=config,
-        trust_remote_code=True,
-        torch_dtype=torch.float16,
-        **model_kwargs
-    )
-```
-
-
-
-
-
-同时在 generate 方法中修改：
-
-```python:ktransformers/worker.py
-def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
-    try:
-        # ... 其他代码保持不变 ...
-        
-        # 生成文本
-        logger.info("Starting text generation...")
-        start_time = time.time()
-        with torch.no_grad(), torch.amp.autocast('cuda'):
-            # 启用并行生成
-            torch.set_grad_enabled(False)
-            torch.set_num_threads(8)  # 设置 CPU 线程数
-            
-            # 使用多 GPU 生成
-            outputs = self.model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                do_sample=input_data.get('do_sample', True),
-                streamer=streamer,
-                use_cache=True,  # 启用 KV 缓存
-                num_beams=1,  # 单束搜索
-                synced_gpus=False  # 禁用 GPU 同步，因为我们已经手动设置了
-            )
-```
-
-
-
-
-
-主要改动：
-1. 添加了分布式环境初始化
-2. 使用 NCCL 后端（专为 NVIDIA GPU 优化）
-3. 设置了本地进程组
-4. 调整了生成参数
-
-这样应该能正确处理多 GPU 了。如果还有其他问题，请告诉我。
-
----
-
-_**User**_
-
-强制使用flash-attn
-
----
-
-_**Assistant**_
-
-
+    # 
 
 ---
 

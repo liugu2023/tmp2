@@ -102,12 +102,16 @@ class ModelWorker:
         self.num_workers = num_workers
         self.shared_components = shared_components
         
-        # 设置 GPU 设备
+        # 设置 GPU 设备和设备类型
         if torch.cuda.is_available():
             # 根据 worker_id 分配 GPU
             gpu_id = worker_id % torch.cuda.device_count()
             torch.cuda.set_device(gpu_id)
+            self.device_type = "gpu"  # 添加设备类型属性
             logger.info(f"Worker {worker_id} using GPU {gpu_id}")
+        else:
+            self.device_type = "cpu"  # CPU设备类型
+            logger.info(f"Worker {worker_id} using CPU")
         
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.REP)

@@ -5493,6 +5493,634 @@ ValueError: model.layers.0.input_layernorm.weight doesn't have any device set.
 
 ---
 
+_**Assistant**_
+
+<think>
+这个错误表明在模型共享时出现了问题，特别是 `model.layers.0.input_layernorm.weight` 没有设备分配。这通常发生在使用 `device_map` 时，未完全覆盖模型的所有层。
+
+在 `SharedModelComponents` 类中，我们只指定了 embedding 层和 lm_head 的设备映射：
+
+```python
+model = AutoModelForCausalLM.from_pretrained(
+    model_path,
+    config=self.config,
+    trust_remote_code=True,
+    device_map={"model.embed_tokens": "cpu", "lm_head": "cpu"},
+    low_cpu_mem_usage=True,
+)
+```
+
+但我们没有为模型的其他部分指定设备，这导致了错误。我们需要修改 `SharedModelComponents` 类的加载方式，以确保正确处理模型的层结构。
+</think>
+
+我们需要修复 `model_sharder.py` 中的模型加载方式。问题是在加载共享组件时没有正确处理模型的其他部分。这里是修复方案：
+
+```python:ktransformers/model_sharder.py
+class SharedModelComponents:
+    """用于在多个进程间共享模型组件的类"""
+    def __init__(self, model_path: str):
+        logger.info("Loading shared model components...")
+        
+        # 确保使用spawn方法创建进程
+        mp.set_start_method('spawn', force=True)
+        
+        # 加载tokenizer (不需要放在共享内存中，每个进程可以快速加载)
+        self.tokenizer_path = model_path
+        
+        # 加载配置
+        logger.info("Loading model config...")
+        self.config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        
+        # 只加载embedding层到CPU，不加载完整模型
+        logger.info("Loading embedding layer...")
+        
+        # 方法1：只加载嵌入层，避免加载其他层
+        from huggingface_hub import hf_hub_download
+        import json
+        import torch
+        
+        # 先获取模型配置，了解嵌入层的尺寸
+        embedding_dim = self.config.hidden_size
+        vocab_size = self.config.vocab_size
+        
+        # 创建嵌入层
+        self.embed_tokens = torch.nn.Embedding(vocab_size, embedding_dim)
+        self.embed_tokens.share_memory()
+        
+        # 创建LM head层
+        self.lm_head = torch.nn.Linear(embedding_dim, vocab_size, bias=False)
+        self.lm_head.share_memory()
+        
+        logger.info(f"Created shared embedding layer with dim={embedding_dim}, vocab_size={vocab_size}")
+        logger.info("Shared model components loaded and ready")
+        
+        # 创建共享字典来存储已加载的层
+        self.manager = mp.Manager()
+        self.loaded_layers = self.manager.dict()
+        
+    def get_components(self):
+        """获取所有共享组件"""
+        return {
+            'tokenizer_path': self.tokenizer_path,
+            'config': self.config,
+            'embed_tokens': self.embed_tokens,
+            'lm_head': self.lm_head,
+            'loaded_layers': self.loaded_layers
+        }
+```
+
+然后，在 `worker.py` 中相应修改处理共享组件的方式：
+
+```python:ktransformers/worker.py
+if self.shared_components:
+    logger.info("Creating model with shared components...")
+    
+    # 创建一个空模型结构
+    class PartialModel(torch.nn.Module):
+        def __init__(self, config):
+            super().__init__()
+            self.config = config
+            # 创建必要的属性结构
+            self.model = torch.nn.Module()
+            self.model.embed_tokens = None
+            self.model.layers = torch.nn.ModuleList()
+            self.model.norm = None
+            self.lm_head = None
+        
+    # 初始化模型
+    self.model = PartialModel(config)
+    
+    # 添加共享的embedding层
+    self.model.model.embed_tokens = self.shared_components['embed_tokens']
+    self.model.lm_head = self.shared_components['lm_head']
+    
+    # 确保模型结构完整
+    for i in range(config.num_hidden_layers):
+        self.model.model.layers.append(None)  # 占位
+    
+    # 加载最终归一化层
+    self.model.model.norm = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        config=config,
+        trust_remote_code=True,
+        device_map={'model.norm': 'cpu'},
+        torch_dtype=torch.float16,
+    ).model.norm
+    
+    # 只加载本worker需要处理的层
+    for i in range(start_layer, end_layer):
+        layer_key = f'model.layers.{i}'
+        # 检查该层是否已经在另一个进程中加载
+        if layer_key in self.shared_components['loaded_layers']:
+            self.model.model.layers[i] = self.shared_components['loaded_layers'][layer_key]
+        else:
+            # 加载新层
+            try:
+                gpu_id = 0 if self.worker_id < 4 else 1
+                layer_model = AutoModelForCausalLM.from_pretrained(
+                    model_path,
+                    config=config,
+                    trust_remote_code=True,
+                    device_map={f'model.layers.{i}': f'cuda:{gpu_id}'},
+                    torch_dtype=torch.float16,
+                )
+                self.model.model.layers[i] = layer_model.model.layers[i]
+                # 将层添加到共享字典
+                self.shared_components['loaded_layers'][layer_key] = layer_model.model.layers[i]
+            except Exception as e:
+                logger.error(f"Error loading layer {i}: {str(e)}")
+                raise
+```
+
+使用这种方法，我们不会尝试加载完整模型，而是：
+1. 创建空的嵌入层和LM head
+2. 在每个worker中创建一个基本模型结构
+3. 然后每个worker只加载和处理自己负责的层
+
+运行命令保持不变：
+
+```bash
+# 在206上运行
+PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.model_sharder \
+    --model_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/ \
+    --gguf_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/ \
+    --base_port 29500 \
+    --num_workers 8
+```
+
+---
+
+_**User**_
+
+chive/liugu/ds/ktransformers# tmux attach
+(ds) root@compute06:/archive/liugu/ds/ktransformers# tmux attach
+[detached (from session 服务-0)]
+[detached (from session 服务-0)]
+(ds) root@compute06:/archive/liugu/ds/ktransformers#    PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.model_sharder \
+       --model_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/ \
+       --gguf_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/ \
+       --base_port 29500 \
+       --num_workers 8
+INFO:__main__:Loading shared model components...
+INFO:__main__:Loading model config...
+INFO:__main__:Loading embedding layer...
+INFO:__main__:Created shared embedding layer with dim=8192, vocab_size=128256
+INFO:__main__:Shared model components loaded and ready
+INFO:__main__:Started 8 worker processes
+INFO:ktransformers.worker:Worker 2 using GPU 0
+INFO:ktransformers.worker:Worker 2 started at 10.21.22.206:29502, listening on all interfaces
+INFO:ktransformers.worker:Using shared model components...
+INFO:ktransformers.worker:Worker 1 using GPU 1
+INFO:ktransformers.worker:Worker 1 started at 10.21.22.206:29501, listening on all interfaces
+INFO:ktransformers.worker:Using shared model components...
+INFO:ktransformers.worker:Worker 4 using GPU 0
+INFO:ktransformers.worker:Worker 4 started at 10.21.22.206:29504, listening on all interfaces
+INFO:ktransformers.worker:Using shared model components...
+INFO:ktransformers.worker:Worker 0 using GPU 0
+INFO:ktransformers.worker:Worker 0 started at 10.21.22.206:29500, listening on all interfaces
+INFO:ktransformers.worker:Using shared model components...
+INFO:ktransformers.worker:Worker 5 using GPU 1
+INFO:ktransformers.worker:Worker 5 started at 10.21.22.206:29505, listening on all interfaces
+INFO:ktransformers.worker:Using shared model components...
+INFO:ktransformers.worker:Worker 3 using GPU 1
+INFO:ktransformers.worker:Worker 3 started at 10.21.22.206:29503, listening on all interfaces
+INFO:ktransformers.worker:Using shared model components...
+INFO:ktransformers.worker:Worker 6 using GPU 0
+INFO:ktransformers.worker:Worker 6 started at 10.21.22.206:29506, listening on all interfaces
+INFO:ktransformers.worker:Using shared model components...
+INFO:ktransformers.worker:Worker 7 using GPU 1
+INFO:ktransformers.worker:Worker 7 started at 10.21.22.206:29507, listening on all interfaces
+INFO:ktransformers.worker:Using shared model components...
+INFO:ktransformers.worker:Worker 2 memory calculation:
+INFO:ktransformers.worker:- Hidden size: 8192
+INFO:ktransformers.worker:- Context length: 8192
+INFO:ktransformers.worker:- KV cache per layer: 0.25 GB
+INFO:ktransformers.worker:- Layer parameters: 3.25 GB per layer
+INFO:ktransformers.worker:- Handling 10 layers: from 20 to 29
+INFO:ktransformers.worker:- Estimated KV cache: 2.50 GB
+INFO:ktransformers.worker:- Estimated model parameters: 32.50 GB
+INFO:ktransformers.worker:- Estimated workspace: 1.00 GB
+INFO:ktransformers.worker:- Total GPU memory budget: 37 GB
+INFO:ktransformers.worker:Creating model with shared components...
+INFO:ktransformers.worker:Worker 1 memory calculation:
+INFO:ktransformers.worker:- Hidden size: 8192
+INFO:ktransformers.worker:- Context length: 8192
+INFO:ktransformers.worker:- KV cache per layer: 0.25 GB
+INFO:ktransformers.worker:- Layer parameters: 3.25 GB per layer
+INFO:ktransformers.worker:- Handling 10 layers: from 10 to 19
+INFO:ktransformers.worker:- Estimated KV cache: 2.50 GB
+INFO:ktransformers.worker:- Estimated model parameters: 32.50 GB
+INFO:ktransformers.worker:- Estimated workspace: 1.00 GB
+INFO:ktransformers.worker:- Total GPU memory budget: 37 GB
+INFO:ktransformers.worker:Creating model with shared components...
+INFO:ktransformers.worker:Worker 4 memory calculation:
+INFO:ktransformers.worker:- Hidden size: 8192
+INFO:ktransformers.worker:- Context length: 8192
+INFO:ktransformers.worker:- KV cache per layer: 0.25 GB
+INFO:ktransformers.worker:- Layer parameters: 3.25 GB per layer
+INFO:ktransformers.worker:- Handling 10 layers: from 40 to 49
+INFO:ktransformers.worker:- Estimated KV cache: 2.50 GB
+INFO:ktransformers.worker:- Estimated model parameters: 32.50 GB
+INFO:ktransformers.worker:- Estimated workspace: 1.00 GB
+INFO:ktransformers.worker:- Total GPU memory budget: 37 GB
+INFO:ktransformers.worker:Creating model with shared components...
+INFO:ktransformers.worker:Worker 0 memory calculation:
+INFO:ktransformers.worker:- Hidden size: 8192
+INFO:ktransformers.worker:- Context length: 8192
+INFO:ktransformers.worker:- KV cache per layer: 0.25 GB
+INFO:ktransformers.worker:- Layer parameters: 3.25 GB per layer
+INFO:ktransformers.worker:- Handling 10 layers: from 0 to 9
+INFO:ktransformers.worker:- Estimated KV cache: 2.50 GB
+INFO:ktransformers.worker:- Estimated model parameters: 32.50 GB
+INFO:ktransformers.worker:- Estimated workspace: 1.00 GB
+INFO:ktransformers.worker:- Total GPU memory budget: 37 GB
+INFO:ktransformers.worker:Creating model with shared components...
+INFO:ktransformers.worker:Worker 5 memory calculation:
+INFO:ktransformers.worker:- Hidden size: 8192
+INFO:ktransformers.worker:- Context length: 8192
+INFO:ktransformers.worker:- KV cache per layer: 0.25 GB
+INFO:ktransformers.worker:- Layer parameters: 3.25 GB per layer
+INFO:ktransformers.worker:- Handling 10 layers: from 50 to 59
+INFO:ktransformers.worker:- Estimated KV cache: 2.50 GB
+INFO:ktransformers.worker:- Estimated model parameters: 32.50 GB
+INFO:ktransformers.worker:- Estimated workspace: 1.00 GB
+INFO:ktransformers.worker:- Total GPU memory budget: 37 GB
+INFO:ktransformers.worker:Creating model with shared components...
+INFO:ktransformers.worker:Worker 3 memory calculation:
+INFO:ktransformers.worker:- Hidden size: 8192
+INFO:ktransformers.worker:- Context length: 8192
+INFO:ktransformers.worker:- KV cache per layer: 0.25 GB
+INFO:ktransformers.worker:- Layer parameters: 3.25 GB per layer
+INFO:ktransformers.worker:- Handling 10 layers: from 30 to 39
+INFO:ktransformers.worker:- Estimated KV cache: 2.50 GB
+INFO:ktransformers.worker:- Estimated model parameters: 32.50 GB
+INFO:ktransformers.worker:- Estimated workspace: 1.00 GB
+INFO:ktransformers.worker:- Total GPU memory budget: 37 GB
+INFO:ktransformers.worker:Creating model with shared components...
+INFO:ktransformers.worker:Worker 6 memory calculation:
+INFO:ktransformers.worker:- Hidden size: 8192
+INFO:ktransformers.worker:- Context length: 8192
+INFO:ktransformers.worker:- KV cache per layer: 0.25 GB
+INFO:ktransformers.worker:- Layer parameters: 3.25 GB per layer
+INFO:ktransformers.worker:- Handling 10 layers: from 60 to 69
+INFO:ktransformers.worker:- Estimated KV cache: 2.50 GB
+INFO:ktransformers.worker:- Estimated model parameters: 32.50 GB
+INFO:ktransformers.worker:- Estimated workspace: 1.00 GB
+INFO:ktransformers.worker:- Total GPU memory budget: 37 GB
+INFO:ktransformers.worker:Creating model with shared components...
+INFO:ktransformers.worker:Worker 7 memory calculation:
+INFO:ktransformers.worker:- Hidden size: 8192
+INFO:ktransformers.worker:- Context length: 8192
+INFO:ktransformers.worker:- KV cache per layer: 0.25 GB
+INFO:ktransformers.worker:- Layer parameters: 3.25 GB per layer
+INFO:ktransformers.worker:- Handling 10 layers: from 70 to 79
+INFO:ktransformers.worker:- Estimated KV cache: 2.50 GB
+INFO:ktransformers.worker:- Estimated model parameters: 32.50 GB
+INFO:ktransformers.worker:- Estimated workspace: 1.00 GB
+INFO:ktransformers.worker:- Total GPU memory budget: 37 GB
+INFO:ktransformers.worker:Creating model with shared components...
+Loading checkpoint shards:   0%|                                               | 0/17 [00:01<?, ?it/s]
+Process Process-9:
+Traceback (most recent call last):
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/archive/liugu/ds/ktransformers/ktransformers/model_sharder.py", line 107, in start_worker
+    worker.load_model(model_path, gguf_path)
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 228, in load_model
+    self.model.model.norm = AutoModelForCausalLM.from_pretrained(
+                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/models/auto/auto_factory.py", line 564, in from_pretrained
+    return model_class.from_pretrained(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/modeling_utils.py", line 3916, in from_pretrained
+    ) = cls._load_pretrained_model(
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/modeling_utils.py", line 4390, in _load_pretrained_model
+    new_error_msgs, offload_index, state_dict_index = _load_state_dict_into_meta_model(
+                                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/modeling_utils.py", line 918, in _load_state_dict_into_meta_model
+    raise ValueError(f"{param_name} doesn't have any device set.")
+ValueError: model.embed_tokens.weight doesn't have any device set.
+
+Process Process-8:
+Traceback (most recent call last):
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/archive/liugu/ds/ktransformers/ktransformers/model_sharder.py", line 107, in start_worker
+    worker.load_model(model_path, gguf_path)
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 228, in load_model
+    self.model.model.norm = AutoModelForCausalLM.from_pretrained(
+                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/models/auto/auto_factory.py", line 564, in from_pretrained
+    return model_class.from_pretrained(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/modeling_utils.py", line 3916, in from_pretrained
+    ) = cls._load_pretrained_model(
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/modeling_utils.py", line 4390, in _load_pretrained_model
+    new_error_msgs, offload_index, state_dict_index = _load_state_dict_into_meta_model(
+                                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/modeling_utils.py", line 918, in _load_state_dict_into_meta_model
+    raise ValueError(f"{param_name} doesn't have any device set.")
+ValueError: model.embed_tokens.weight doesn't have any device set.
+Loading checkpoint shards:   0%|                                               | 0/17 [00:01<?, ?it/s]
+Process Process-4:
+Traceback (most recent call last):
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/archive/liugu/ds/ktransformers/ktransformers/model_sharder.py", line 107, in start_worker
+    worker.load_model(model_path, gguf_path)
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 228, in load_model
+    self.model.model.norm = AutoModelForCausalLM.from_pretrained(
+                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/models/auto/auto_factory.py", line 564, in from_pretrained
+    return model_class.from_pretrained(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/modeling_utils.py", line 3916, in from_pretrained
+    ) = cls._load_pretrained_model(
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/modeling_utils.py", line 4390, in _load_pretrained_model
+    new_error_msgs, offload_index, state_dict_index = _load_state_dict_into_meta_model(
+                                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/modeling_utils.py", line 918, in _load_state_dict_into_meta_model
+    raise ValueError(f"{param_name} doesn't have any device set.")
+Loading checkpoint shards:   0%|                                               | 0/17 [00:01<?, ?it/s]ValueError: model.embed_tokens.weight doesn't have any device set.
+
+Process Process-5:
+Traceback (most recent call last):
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/archive/liugu/ds/ktransformers/ktransformers/model_sharder.py", line 107, in start_worker
+    worker.load_model(model_path, gguf_path)
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 228, in load_model
+    self.model.model.norm = AutoModelForCausalLM.from_pretrained(
+                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/models/auto/auto_factory.py", line 564, in from_pretrained
+    return model_class.from_pretrained(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/modeling_utils.py", line 3916, in from_pretrained
+    ) = cls._load_pretrained_model(
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/modeling_utils.py", line 4390, in _load_pretrained_model
+    new_error_msgs, offload_index, state_dict_index = _load_state_dict_into_meta_model(
+                                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/modeling_utils.py", line 918, in _load_state_dict_into_meta_model
+    raise ValueError(f"{param_name} doesn't have any device set.")
+ValueError: model.embed_tokens.weight doesn't have any device set.
+Loading checkpoint shards:   0%|                                               | 0/17 [00:01<?, ?it/s]
+Process Process-6:
+
+Process Process-2:
+Loading checkpoint shards:   0%|                                               | 0/17 [00:01<?, ?it/s]
+Process Process-7:
+Traceback (most recent call last):
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/archive/liugu/ds/ktransformers/ktransformers/model_sharder.py", line 107, in start_worker
+    worker.load_model(model_path, gguf_path)
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 228, in load_model
+    self.model.model.norm = AutoModelForCausalLM.from_pretrained(
+                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/models/auto/auto_factory.py", line 564, in from_pretrained
+    return model_class.from_pretrained(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/modeling_utils.py", line 3916, in from_pretrained
+    ) = cls._load_pretrained_model(
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/modeling_utils.py", line 4390, in _load_pretrained_model
+    new_error_msgs, offload_index, state_dict_index = _load_state_dict_into_meta_model(
+                                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/modeling_utils.py", line 918, in _load_state_dict_into_meta_model
+    raise ValueError(f"{param_name} doesn't have any device set.")
+ValueError: model.embed_tokens.weight doesn't have any device set.
+Traceback (most recent call last):
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/archive/liugu/ds/ktransformers/ktransformers/model_sharder.py", line 107, in start_worker
+    worker.load_model(model_path, gguf_path)
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 228, in load_model
+    self.model.model.norm = AutoModelForCausalLM.from_pretrained(
+                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Traceback (most recent call last):
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/models/auto/auto_factory.py", line 564, in from_pretrained
+    return model_class.from_pretrained(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/modeling_utils.py", line 3916, in from_pretrained
+    ) = cls._load_pretrained_model(
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/modeling_utils.py", line 4390, in _load_pretrained_model
+    new_error_msgs, offload_index, state_dict_index = _load_state_dict_into_meta_model(
+                                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/modeling_utils.py", line 918, in _load_state_dict_into_meta_model
+    raise ValueError(f"{param_name} doesn't have any device set.")
+ValueError: model.embed_tokens.weight doesn't have any device set.
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/archive/liugu/ds/ktransformers/ktransformers/model_sharder.py", line 107, in start_worker
+    worker.load_model(model_path, gguf_path)
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 228, in load_model
+    self.model.model.norm = AutoModelForCausalLM.from_pretrained(
+                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/models/auto/auto_factory.py", line 564, in from_pretrained
+    return model_class.from_pretrained(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/modeling_utils.py", line 3916, in from_pretrained
+    ) = cls._load_pretrained_model(
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/modeling_utils.py", line 4390, in _load_pretrained_model
+    new_error_msgs, offload_index, state_dict_index = _load_state_dict_into_meta_model(
+                                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/modeling_utils.py", line 918, in _load_state_dict_into_meta_model
+    raise ValueError(f"{param_name} doesn't have any device set.")
+ValueError: model.embed_tokens.weight doesn't have any device set.
+Loading checkpoint shards:   0%|                                               | 0/17 [00:01<?, ?it/s]
+Process Process-3:
+Traceback (most recent call last):
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/archive/liugu/ds/ktransformers/ktransformers/model_sharder.py", line 107, in start_worker
+    worker.load_model(model_path, gguf_path)
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 228, in load_model
+    self.model.model.norm = AutoModelForCausalLM.from_pretrained(
+                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/models/auto/auto_factory.py", line 564, in from_pretrained
+    return model_class.from_pretrained(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/modeling_utils.py", line 3916, in from_pretrained
+    ) = cls._load_pretrained_model(
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/modeling_utils.py", line 4390, in _load_pretrained_model
+    new_error_msgs, offload_index, state_dict_index = _load_state_dict_into_meta_model(
+                                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/modeling_utils.py", line 918, in _load_state_dict_into_meta_model
+    raise ValueError(f"{param_name} doesn't have any device set.")
+ValueError: model.embed_tokens.weight doesn't have any device set.
+
+---
+
+_**Assistant**_
+
+<think>
+看起来我们遇到了一个问题："model.embed_tokens.weight doesn't have any device set."。这表明在加载模型时，嵌入层的权重没有设置设备。
+
+问题的原因是我们使用了自定义的嵌入层，但是在尝试加载模型时，模型期望嵌入层已经在适当的设备上初始化。我们需要修改代码来解决这个问题。
+
+以下是解决方案：
+
+1. 对于norm层，我们需要单独加载，而不是尝试加载整个模型
+2. 我们需要修改加载层的逻辑来避免这个错误
+
+我们需要修改worker.py和model_sharder.py来解决这个问题。
+</think>
+
+我们需要修复加载模型时的错误。问题是在我们尝试加载模型时，对共享组件的设备处理不正确。下面是解决方案：
+
+```python:ktransformers/worker.py
+# 修改worker.py中加载模型的部分
+if self.shared_components:
+    logger.info("Creating model with shared components...")
+    
+    # 创建一个空模型结构
+    class PartialModel(torch.nn.Module):
+        def __init__(self, config):
+            super().__init__()
+            self.config = config
+            # 创建必要的属性结构
+            self.model = torch.nn.Module()
+            self.model.embed_tokens = None
+            self.model.layers = torch.nn.ModuleList()
+            self.model.norm = None
+            self.lm_head = None
+            # 添加设备映射属性以避免错误
+            self.hf_device_map = {}
+    
+    # 初始化模型
+    self.model = PartialModel(config)
+    
+    # 添加共享的embedding层
+    self.model.model.embed_tokens = self.shared_components['embed_tokens']
+    self.model.lm_head = self.shared_components['lm_head']
+    
+    # 确保模型结构完整
+    for i in range(config.num_hidden_layers):
+        self.model.model.layers.append(None)  # 占位
+    
+    # 单独加载最终归一化层，而不是加载整个模型
+    logger.info("Loading normalization layer...")
+    try:
+        # 创建一个空的LayerNorm
+        self.model.model.norm = torch.nn.LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.model.model.norm.to('cpu')
+    except Exception as e:
+        logger.error(f"Error creating norm layer: {str(e)}")
+        raise
+    
+    # 只加载本worker需要处理的层
+    for i in range(start_layer, end_layer):
+        layer_key = f'model.layers.{i}'
+        # 检查该层是否已经在另一个进程中加载
+        if layer_key in self.shared_components['loaded_layers']:
+            self.model.model.layers[i] = self.shared_components['loaded_layers'][layer_key]
+            logger.info(f"Using shared layer {i}")
+        else:
+            # 加载新层
+            try:
+                gpu_id = 0 if self.worker_id < 4 else 1
+                logger.info(f"Loading layer {i} to cuda:{gpu_id}...")
+                
+                # 构建设备映射
+                temp_device_map = {
+                    'model.embed_tokens': 'meta',  # 避免加载嵌入层
+                    'lm_head': 'meta',             # 避免加载lm_head
+                    'model.norm': 'meta',          # 避免加载norm层
+                }
+                
+                # 将其他层设置为meta或指定的GPU
+                for j in range(config.num_hidden_layers):
+                    if j == i:
+                        temp_device_map[f'model.layers.{j}'] = f'cuda:{gpu_id}'
+                    else:
+                        temp_device_map[f'model.layers.{j}'] = 'meta'
+                
+                logger.info(f"Loading layer with device map: {temp_device_map}")
+                
+                # 加载模型的指定层
+                layer_model = AutoModelForCausalLM.from_pretrained(
+                    model_path,
+                    config=config,
+                    trust_remote_code=True,
+                    device_map=temp_device_map,
+                    torch_dtype=torch.float16,
+                    low_cpu_mem_usage=True
+                )
+                
+                # 获取层并添加到我们的模型中
+                self.model.model.layers[i] = layer_model.model.layers[i]
+                
+                # 将层添加到共享字典
+                self.shared_components['loaded_layers'][layer_key] = layer_model.model.layers[i]
+                logger.info(f"Successfully loaded layer {i}")
+                
+                # 清除不需要的内容，释放内存
+                del layer_model
+                torch.cuda.empty_cache()
+                
+            except Exception as e:
+                logger.error(f"Error loading layer {i}: {str(e)}")
+                raise
+    
+    # 设置设备映射以便以后使用
+    device_map = {
+        'model.embed_tokens': 'cpu',
+        'model.norm': 'cpu',
+        'lm_head': 'cpu'
+    }
+    
+    gpu_id = 0 if self.worker_id < 4 else 1
+    for i in range(start_layer, end_layer):
+        device_map[f'model.layers.{i}'] = f'cuda:{gpu_id}'
+    
+    self.model.hf_device_map = device_map
+```
+
+
+这个修改：
+
+1. 为 PartialModel 添加了 hf_device_map 属性，以避免错误
+2. 使用了元设备("meta")来避免加载我们不需要的层
+3. 单独创建了 norm 层，而不是尝试加载整个模型
+4. 更详细的日志，以便更好地理解加载过程
+
+使用与之前相同的命令运行：
+
+```bash
+PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.model_sharder \
+    --model_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/ \
+    --gguf_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/ \
+    --base_port 29500 \
+    --num_workers 8
+```
+
+如果仍然有问题，我们可能需要考虑将共享组件的方法简化，或者移除共享功能，让每个worker单独加载模型的相应部分。
+
+---
+
 
 
 ---

@@ -9,6 +9,8 @@ import time
 import subprocess
 import multiprocessing
 from ktransformers.kvcache_client import KVCacheClient
+import torch.nn as nn
+from ktransformers.optimize import add_hook_to_module
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -102,16 +104,12 @@ class ModelWorker:
         self.num_workers = num_workers
         self.shared_components = shared_components
         
-        # 设置 GPU 设备和设备类型
+        # 设置 GPU 设备
         if torch.cuda.is_available():
             # 根据 worker_id 分配 GPU
             gpu_id = worker_id % torch.cuda.device_count()
             torch.cuda.set_device(gpu_id)
-            self.device_type = "gpu"  # 添加设备类型属性
             logger.info(f"Worker {worker_id} using GPU {gpu_id}")
-        else:
-            self.device_type = "cpu"  # CPU设备类型
-            logger.info(f"Worker {worker_id} using CPU")
         
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.REP)
@@ -125,33 +123,240 @@ class ModelWorker:
         logger.info(f"Worker {worker_id} started at {address}, listening on all interfaces")
 
     def load_model(self, model_path: str, gguf_path: str):
+        # 如果有共享组件，使用共享组件
+        if self.shared_components:
+            logger.info("Using shared model components...")
+            config = self.shared_components['config']
+            self.tokenizer = AutoTokenizer.from_pretrained(self.shared_components['tokenizer_path'], trust_remote_code=True)
+        else:
+            # 否则正常加载
+            logger.info("Loading tokenizer...")
+            self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+            
+            logger.info("Loading model config...")
+            config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        
+        torch.set_default_dtype(config.torch_dtype)
+        
+        # 计算每个进程应该处理的层
+        total_layers = config.num_hidden_layers
+        layers_per_process = total_layers // self.num_workers
+        start_layer = self.worker_id * layers_per_process
+        end_layer = start_layer + layers_per_process if self.worker_id < self.num_workers - 1 else total_layers
+        
+        # 动态计算所需显存
+        hidden_size = config.hidden_size
+        # 假设最大上下文长度为8K
+        context_len = 8192
+        # 每层KV Cache = 2 * hidden_size * context_len * dtype_size (float16=2B)
+        kv_size_per_layer = 2 * hidden_size * context_len * 2 / (1024**3)  # 单位：GB
+        # 当前worker负责的层数
+        my_layers = end_layer - start_layer
+        # 预估KV缓存显存
+        total_kv_cache = kv_size_per_layer * my_layers
+        # 每层模型参数估算 (单位: GB)
+        hidden_dim = config.hidden_size
+        intermediate_dim = config.intermediate_size if hasattr(config, 'intermediate_size') else 4 * hidden_dim
+        param_size_per_layer = (12 * hidden_dim * hidden_dim + 4 * hidden_dim * intermediate_dim) * 2 / (1024**3)
+        base_model_size = param_size_per_layer * my_layers
+        # 工作空间估算 (1GB)
+        workspace_size = 1.0
+        # 最终显存预算
+        final_memory_budget = total_kv_cache + base_model_size + workspace_size
+        # 取整并加上安全余量
+        gpu_mem = max(3, int(final_memory_budget) + 1)
+        
+        logger.info(f"Worker {self.worker_id} memory calculation:")
+        logger.info(f"- Hidden size: {hidden_size}")
+        logger.info(f"- Context length: {context_len}")
+        logger.info(f"- KV cache per layer: {kv_size_per_layer:.2f} GB")
+        logger.info(f"- Layer parameters: {param_size_per_layer:.2f} GB per layer")
+        logger.info(f"- Handling {my_layers} layers: from {start_layer} to {end_layer-1}")
+        logger.info(f"- Estimated KV cache: {total_kv_cache:.2f} GB")
+        logger.info(f"- Estimated model parameters: {base_model_size:.2f} GB")
+        logger.info(f"- Estimated workspace: {workspace_size:.2f} GB")
+        logger.info(f"- Total GPU memory budget: {gpu_mem} GB")
+        
+        # 设置内存分配
+        max_memory = {
+            0: f"{gpu_mem}GiB" if self.worker_id < 4 else None,    # 前4个进程使用 GPU 0
+            1: f"{gpu_mem}GiB" if self.worker_id >= 4 else None,   # 后4个进程使用 GPU 1
+            'cpu': "138GiB"  # CPU 内存
+        }
+        
+        # 创建一个局部的设备映射
+        device_map = {}
+        
+        # 如果使用共享组件，不需要加载embed_tokens
+        if not self.shared_components:
+            device_map['model.embed_tokens'] = 'cpu'
+            device_map['lm_head'] = 'cpu'
+        
+        device_map['model.norm'] = 'cpu'
+        
+        # 分配层到对应的 GPU
+        gpu_id = 0 if self.worker_id < 4 else 1
+        for i in range(start_layer, end_layer):
+            device_map[f'model.layers.{i}'] = f'cuda:{gpu_id}'
+        
+        # 创建模型 - 只加载需要的层
+        if self.shared_components:
+            logger.info("Creating model with shared components...")
+            
+            # 创建一个空模型结构
+            class PartialModel(torch.nn.Module):
+                def __init__(self, config):
+                    super().__init__()
+                    self.config = config
+                    # 创建必要的属性结构
+                    self.model = torch.nn.Module()
+                    self.model.embed_tokens = None
+                    self.model.layers = torch.nn.ModuleList()
+                    self.model.norm = None
+                    self.lm_head = None
+                    # 添加设备映射属性以避免错误
+                    self.hf_device_map = {}
+            
+            # 初始化模型
+            self.model = PartialModel(config)
+            
+            # 添加共享的embedding层
+            self.model.model.embed_tokens = self.shared_components['embed_tokens']
+            self.model.lm_head = self.shared_components['lm_head']
+            
+            # 确保模型结构完整
+            for i in range(config.num_hidden_layers):
+                self.model.model.layers.append(None)  # 占位
+            
+            # 单独加载最终归一化层，而不是加载整个模型
+            logger.info("Loading normalization layer...")
+            try:
+                # 创建一个空的LayerNorm
+                self.model.model.norm = torch.nn.LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
+                self.model.model.norm.to('cpu')
+            except Exception as e:
+                logger.error(f"Error creating norm layer: {str(e)}")
+                raise
+            
+            # 只加载本worker需要处理的层
+            for i in range(start_layer, end_layer):
+                layer_key = f'model.layers.{i}'
+                # 检查该层是否已经在另一个进程中加载
+                if layer_key in self.shared_components['loaded_layers']:
+                    self.model.model.layers[i] = self.shared_components['loaded_layers'][layer_key]
+                    logger.info(f"Using shared layer {i}")
+                else:
+                    # 加载新层
+                    try:
+                        gpu_id = 0 if self.worker_id < 4 else 1
+                        logger.info(f"Loading layer {i} to cuda:{gpu_id}...")
+                        
+                        # 构建设备映射
+                        temp_device_map = {
+                            'model.embed_tokens': 'meta',  # 避免加载嵌入层
+                            'lm_head': 'meta',             # 避免加载lm_head
+                            'model.norm': 'meta',          # 避免加载norm层
+                        }
+                        
+                        # 将其他层设置为meta或指定的GPU
+                        for j in range(config.num_hidden_layers):
+                            if j == i:
+                                temp_device_map[f'model.layers.{j}'] = f'cuda:{gpu_id}'
+                            else:
+                                temp_device_map[f'model.layers.{j}'] = 'meta'
+                        
+                        logger.info(f"Loading layer with device map: {temp_device_map}")
+                        
+                        # 加载模型的指定层
+                        layer_model = AutoModelForCausalLM.from_pretrained(
+                            model_path,
+                            config=config,
+                            trust_remote_code=True,
+                            device_map=temp_device_map,
+                            torch_dtype=torch.float16,
+                            low_cpu_mem_usage=True
+                        )
+                        
+                        # 获取层并添加到我们的模型中
+                        self.model.model.layers[i] = layer_model.model.layers[i]
+                        
+                        # 使用可序列化的方式存储层信息
+                        layer = layer_model.model.layers[i]
+                        
+                        # 移除无法序列化的属性
+                        if hasattr(layer, '_forward_hooks'):
+                            del layer._forward_hooks
+                        if hasattr(layer, '_forward_pre_hooks'):
+                            del layer._forward_pre_hooks
+                        
+                        self.shared_components['loaded_layers'][layer_key] = {
+                            'state_dict': layer.state_dict(),
+                            'config': layer.config
+                        }
+                        logger.info(f"Successfully loaded layer {i}")
+                        
+                        # 清除不需要的内容，释放内存
+                        del layer_model
+                        torch.cuda.empty_cache()
+                        
+                    except Exception as e:
+                        logger.error(f"Error loading layer {i}: {str(e)}")
+                        raise
+            
+            # 设置设备映射以便以后使用
+            device_map = {
+                'model.embed_tokens': 'cpu',
+                'model.norm': 'cpu',
+                'lm_head': 'cpu'
+            }
+            
+            gpu_id = 0 if self.worker_id < 4 else 1
+            for i in range(start_layer, end_layer):
+                device_map[f'model.layers.{i}'] = f'cuda:{gpu_id}'
+            
+            self.model.hf_device_map = device_map
+        else:
+            # 使用标准方法加载
+            model_kwargs = {
+                "device_map": device_map,
+                "max_memory": max_memory,
+                "torch_dtype": torch.float16,
+                "low_cpu_mem_usage": True
+            }
+            
+            logger.info("Applying optimization configurations...")
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                config=config,
+                trust_remote_code=True,
+                **model_kwargs
+            )
+        
+        # 输出配置信息
+        logger.info(f"Worker {self.worker_id} model configuration:")
+        logger.info(f"- Handling layers: {start_layer} to {end_layer}")
+        logger.info(f"- Using GPU: {gpu_id}")
+        logger.info("- Device mapping:")
+        for name, device in self.model.hf_device_map.items():
+            if name.startswith(f'model.layers.{start_layer}'):
+                logger.info(f"  {name}: {device}")
+        
+        self.model.eval()
+        
+        # 设置生成配置
         try:
-            # 修改模型加载方式，避免使用hook
-            if self.device_type == "gpu":
-                # 使用device_map来自动处理模型分配
-                self.model = AutoModelForCausalLM.from_pretrained(
-                    model_path,
-                    device_map="auto",
-                    torch_dtype=torch.float16,
-                    use_safetensors=True,  # 使用safetensors格式
-                    low_cpu_mem_usage=True
-                )
-            else:
-                # CPU模型使用GGUF
-                self.model = AutoModelForCausalLM.from_pretrained(
-                    gguf_path,
-                    model_type="llama",
-                    local_files_only=True
-                )
-            
-            # 移除自定义hook
-            # self.shared_components['loaded_layers'][layer_key] = layer_model.model.layers[i]
-            # 改为直接存储整个模型
-            self.shared_components['model'] = self.model
-            
+            self.model.generation_config = GenerationConfig.from_pretrained(model_path)
         except Exception as e:
-            logger.error(f"Error loading model: {str(e)}")
-            raise
+            logger.warning(f"Generation config can't auto create, making default. Message: {e}")
+            self.model.generation_config = GenerationConfig(
+                temperature=0.6,
+                top_p=0.9,
+                do_sample=True
+            )
+        if self.model.generation_config.pad_token_id is None:
+            self.model.generation_config.pad_token_id = self.model.generation_config.eos_token_id
+            
+        logger.info("Model loaded successfully")
 
     # 修改 CustomStreamer 类定义
     class CustomStreamer(TextStreamer):
@@ -317,6 +522,21 @@ class ModelWorker:
             self.socket.close()
             self.context.term()
             logger.info("Worker shutdown complete")
+
+    def initialize_model(self, model_path, gguf_path):
+        # 使用延迟加载方式
+        if self.device_type == 'cpu':
+            self.model = self._load_cpu_model(model_path, gguf_path)
+        else:
+            self.model = self._load_gpu_model(model_path)
+        
+        # 重新应用可序列化的钩子
+        self._apply_compatible_hooks()
+
+    def _apply_compatible_hooks(self):
+        for name, module in self.model.named_modules():
+            if isinstance(module, nn.Linear):
+                add_hook_to_module(module)
 
 if __name__ == '__main__':
     main() 

@@ -15,6 +15,7 @@ import locale
 import torch
 from transformers import AutoTokenizer
 import time
+from typing import Dict
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -44,27 +45,52 @@ class DistributedModel:
         
     def load_model(self, model_path: str, gguf_path: str = None) -> bool:
         """加载模型"""
-        if self.distributed:
-            # 向中央服务器发送加载请求
-            logger.info("Requesting model load from central server...")
-            self.socket.send_pyobj({
-                'command': 'load_model',
-                'model_path': model_path,
-                'gguf_path': gguf_path
-            })
+        print(f"正在加载模型: {model_path}")
+        if gguf_path:
+            print(f"使用GGUF模型: {gguf_path}")
+        
+        response = self._send_command('load_model', {
+            'model_path': model_path,
+            'gguf_path': gguf_path
+        })
+        
+        # 检查response是否是字典
+        if isinstance(response, bool):
+            success = response
+            error = "未知错误" if not success else None
+        else:
+            success = response.get('status') == 'success'
+            error = response.get('error')
+        
+        if not success:
+            print(f"模型加载失败: {error}")
+            return False
+        
+        print("模型加载成功!")
+        return True
+
+    def _send_command(self, command: str, data: Dict = None) -> Dict:
+        """发送命令到服务器并接收响应"""
+        if data is None:
+            data = {}
+        
+        message = {
+            'command': command,
+            'data': data
+        }
+        
+        try:
+            self.socket.send_pyobj(message)
             response = self.socket.recv_pyobj()
             
-            if response['status'] != 'success':
-                # 注意这里要处理error可能为None的情况
-                error_msg = response.get('error')
-                raise Exception(f"Failed to load model: {error_msg or 'Unknown error'}")
+            # 确保返回字典
+            if not isinstance(response, dict):
+                return {'status': 'success' if response else 'error', 'value': response}
             
-            logger.info("Model loaded successfully")
-            return True
-        else:
-            # 本地加载模型
-            self.model, self.tokenizer = load_model_and_tokenizer(model_path, gguf_path)
-            return True
+            return response
+        except Exception as e:
+            print(f"通信错误: {str(e)}")
+            return {'status': 'error', 'error': str(e)}
 
     def generate(self, input_ids, attention_mask, **kwargs):
         try:

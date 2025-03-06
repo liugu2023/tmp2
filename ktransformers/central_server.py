@@ -41,45 +41,55 @@ class CentralServer:
         # 活跃的批处理任务
         self.active_batches = {}
         
-    def load_model_on_workers(self, model_path: str, gguf_path: str):
-        """在所有worker上加载模型"""
-        logger.info(f"Loading model on all workers: {model_path}")
+    def load_model_on_workers(self, model_path: str, gguf_path: str) -> Dict[str, Any]:
+        """加载模型到所有worker上"""
+        logger.info(f"加载模型: {model_path}, GGUF: {gguf_path}")
         
-        # 首先通知KVCache服务器加载模型
-        try:
-            logger.info("通知KVCache服务器加载模型...")
-            self.kvcache_socket.send_pyobj({
-                'command': 'load_model',
-                'model_path': model_path,
-                'gguf_path': gguf_path
-            })
-            response = self.kvcache_socket.recv_pyobj()
-            if response['status'] != 'success':
-                logger.error(f"KVCache服务器加载模型失败: {response.get('error')}")
-                return False
-        except Exception as e:
-            logger.error(f"与KVCache服务器通信出错: {str(e)}")
-            return False
+        # 首先加载到KV缓存服务器
+        logger.info("发送模型加载命令到KV缓存服务器...")
+        self.kvcache_socket.send_pyobj({
+            'command': 'load_model',
+            'model_path': model_path,
+            'gguf_path': gguf_path
+        })
         
-        # 然后通知所有worker
+        response = self.kvcache_socket.recv_pyobj()
+        if response.get('status') != 'success':
+            logger.error(f"KV缓存服务器加载模型失败: {response.get('error')}")
+            return {'status': 'error', 'error': f"KV缓存服务器加载模型失败: {response.get('error')}"}
+        
+        # 然后加载到各个worker
+        logger.info("发送模型加载命令到所有workers...")
         success = True
+        errors = []
+        
         for addr, socket in self.workers:
             try:
-                logger.info(f"Loading model on worker at {addr}...")
+                logger.info(f"加载模型到worker: {addr}")
                 socket.send_pyobj({
                     'command': 'load_model',
                     'model_path': model_path,
                     'gguf_path': gguf_path
                 })
-                response = socket.recv_pyobj()
-                if response['status'] != 'success':
-                    logger.error(f"Failed to load model on worker at {addr}: {response.get('error')}")
+                
+                worker_response = socket.recv_pyobj()
+                if worker_response.get('status') != 'success':
+                    logger.error(f"Worker {addr} 加载模型失败: {worker_response.get('error')}")
                     success = False
+                    errors.append(f"Worker {addr}: {worker_response.get('error')}")
             except Exception as e:
-                logger.error(f"Error communicating with worker at {addr}: {str(e)}")
+                logger.error(f"与Worker {addr}通信失败: {str(e)}")
                 success = False
+                errors.append(f"Worker {addr}: 通信失败 - {str(e)}")
         
-        return success
+        # 返回结果
+        if success:
+            logger.info("所有worker成功加载模型")
+            return {'status': 'success', 'message': '所有worker成功加载模型'}
+        else:
+            error_msg = "; ".join(errors)
+            logger.error(f"部分或全部worker加载模型失败: {error_msg}")
+            return {'status': 'error', 'error': f"加载模型失败: {error_msg}"}
     
     def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
         """处理生成请求"""

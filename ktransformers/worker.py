@@ -13,6 +13,8 @@ import torch.nn as nn
 import json
 import numpy as np
 import glob
+from ktransformers.optimize.optimize import optimize_and_load_gguf
+import tempfile
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -417,153 +419,28 @@ class ModelWorker:
                 logger.error(f"加载模型配置出错: {str(e)}")
                 return {'status': 'error', 'error': f"加载模型配置失败: {str(e)}"}
             
-            # 检测是否有FALLBACK_MODE环境变量，用于在GGUF加载失败时回退
-            fallback_mode = os.environ.get('KTRANSFORMERS_FALLBACK', 'FALSE').upper() == 'TRUE'
-            
-            logger.info("加载模型权重...")
+            # 完全跳过规则优化，直接使用简单加载
+            logger.info("使用直接加载模式（跳过GGUF优化）...")
             try:
-                # 尝试加载模型
-                if fallback_mode:
-                    # 简单加载模式 - 不使用GGUF，直接从HuggingFace加载
-                    logger.info("使用简单加载模式 (FALLBACK MODE)...")
-                    from transformers import AutoModelForCausalLM
-                    
-                    # 确保CUDA可用
-                    if torch.cuda.is_available():
-                        device_map = "auto"
-                    else:
-                        device_map = "cpu"
-                        logger.warning("CUDA不可用，使用CPU加载模型")
-                    
-                    # 直接加载原始模型
-                    self.model = AutoModelForCausalLM.from_pretrained(
-                        model_path,
-                        config=self.config,
-                        trust_remote_code=True,
-                        torch_dtype=self.config.torch_dtype,
-                        device_map=device_map
-                    )
-                    logger.info("使用简单模式成功加载模型")
+                from transformers import AutoModelForCausalLM
+                
+                # 确保CUDA可用
+                if torch.cuda.is_available():
+                    device_map = "auto"
                 else:
-                    # 标准GGUF加载模式
-                    try:
-                        # 自定义模型处理
-                        with torch.device("meta"):
-                            from transformers import AutoModelForCausalLM
-                            
-                            # 检查是否是自定义模型类型
-                            if hasattr(self.config, 'architectures') and len(self.config.architectures) > 0:
-                                arch = self.config.architectures[0]
-                                logger.info(f"模型架构: {arch}")
-                                
-                                # 加载自定义模型类
-                                if "Llama" in arch:
-                                    from ktransformers.models.modeling_llama import LlamaForCausalLM
-                                    self.config._attn_implementation = "eager"
-                                    self.model = LlamaForCausalLM(self.config)
-                                elif "DeepseekV2" in arch:
-                                    from ktransformers.models.modeling_deepseek import DeepseekV2ForCausalLM
-                                    self.model = DeepseekV2ForCausalLM(self.config)
-                                elif "DeepseekV3" in arch:
-                                    from ktransformers.models.modeling_deepseek_v3 import DeepseekV3ForCausalLM
-                                    self.model = DeepseekV3ForCausalLM(self.config)  
-                                elif "Qwen2Moe" in arch:
-                                    from ktransformers.models.modeling_qwen2_moe import Qwen2MoeForCausalLM
-                                    self.config._attn_implementation = "flash_attention_2"
-                                    self.model = Qwen2MoeForCausalLM(self.config)
-                                elif "Mixtral" in arch:
-                                    from ktransformers.models.modeling_mixtral import MixtralForCausalLM
-                                    self.config._attn_implementation = "flash_attention_2"
-                                    self.model = MixtralForCausalLM(self.config)
-                                else:
-                                    # 默认模型
-                                    logger.info(f"使用默认AutoModelForCausalLM加载: {arch}")
-                                    self.model = AutoModelForCausalLM.from_config(
-                                        self.config, trust_remote_code=True, attn_implementation="flash_attention_2"
-                                    )
-                            else:
-                                # 没有指定架构，使用默认模型
-                                logger.info("未找到模型架构，使用默认AutoModelForCausalLM")
-                                self.model = AutoModelForCausalLM.from_config(
-                                    self.config, trust_remote_code=True
-                                )
-                        
-                        # 从这里开始尝试使用optimize_and_load_gguf
-                        logger.info(f"尝试使用optimize_and_load_gguf加载模型: {gguf_path}")
-                        
-                        # 获取优化规则路径
-                        from ktransformers.optimize.optimize import optimize_and_load_gguf
-                        
-                        # 简化规则路径查找
-                        current_dir = os.path.dirname(os.path.abspath(__file__))
-                        ktransformer_rules_dir = os.path.join(current_dir, "..", "ktransformers", "optimize", "optimize_rules")
-                        if not os.path.exists(ktransformer_rules_dir):
-                            # 尝试其他可能的路径
-                            ktransformer_rules_dir = os.path.join(current_dir, "optimize", "optimize_rules")
-                        
-                        logger.info(f"优化规则目录: {ktransformer_rules_dir}")
-                        
-                        # 设置超时，防止无限等待
-                        import signal
-                        
-                        def timeout_handler(signum, frame):
-                            raise TimeoutError("优化和加载GGUF模型超时")
-                        
-                        # 设置30秒超时
-                        signal.signal(signal.SIGALRM, timeout_handler)
-                        signal.alarm(30)  # 30秒超时
-                        
-                        try:
-                            # 确保有合适的优化规则文件
-                            # 查找可能的规则文件
-                            arch_name = self.config.architectures[0] if hasattr(self.config, 'architectures') and self.config.architectures else "unknown"
-                            rule_files = glob.glob(os.path.join(ktransformer_rules_dir, "*.yaml"))
-                            
-                            # 尝试找到匹配的规则文件
-                            optimize_config_path = None
-                            if rule_files:
-                                # 有规则文件，选择匹配度最高的
-                                for rule_file in rule_files:
-                                    rule_name = os.path.basename(rule_file)
-                                    # 尝试根据模型类型匹配规则文件
-                                    if arch_name in rule_name:
-                                        optimize_config_path = rule_file
-                                        logger.info(f"找到匹配的规则文件: {rule_name}")
-                                        break
-                                
-                                # 如果没有匹配的，使用第一个作为默认
-                                if optimize_config_path is None:
-                                    optimize_config_path = rule_files[0]
-                                    logger.info(f"使用默认规则文件: {os.path.basename(optimize_config_path)}")
-                            else:
-                                # 没有找到规则文件，改用简单加载模式
-                                logger.error("找不到优化规则文件，切换到简单加载模式")
-                                signal.alarm(0)  # 取消超时
-                                os.environ['KTRANSFORMERS_FALLBACK'] = 'TRUE'
-                                return self.load_model(model_path, gguf_path)
-                            
-                            # 执行optimize_and_load_gguf，现在确保规则文件存在
-                            logger.info(f"使用规则文件: {optimize_config_path}")
-                            optimize_and_load_gguf(self.model, optimize_config_path, gguf_path, self.config)
-                            # 取消超时
-                            signal.alarm(0)
-                        except TimeoutError:
-                            logger.error("GGUF加载超时，切换到简单加载模式")
-                            signal.alarm(0)  # 确保取消超时
-                            # 递归调用自身，但启用fallback模式
-                            os.environ['KTRANSFORMERS_FALLBACK'] = 'TRUE'
-                            return self.load_model(model_path, gguf_path)
-                            
-                    except Exception as e:
-                        logger.error(f"尝试使用optimize_and_load_gguf失败: {str(e)}")
-                        import traceback
-                        logger.error(traceback.format_exc())
-                        
-                        # 切换到简单加载模式
-                        logger.info("切换到简单加载模式...")
-                        os.environ['KTRANSFORMERS_FALLBACK'] = 'TRUE'
-                        return self.load_model(model_path, gguf_path)
-                    
+                    device_map = "cpu"
+                    logger.warning("CUDA不可用，使用CPU加载模型")
+                
+                # 直接加载原始模型
+                logger.info(f"直接从HuggingFace加载模型: {model_path}")
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    model_path,
+                    config=self.config,
+                    trust_remote_code=True,
+                    torch_dtype=self.config.torch_dtype,
+                    device_map=device_map
+                )
+                
                 # 设置为评估模式
                 self.model.eval()
                 logger.info("模型加载成功，设置为评估模式")
@@ -580,7 +457,8 @@ class ModelWorker:
                     gen_config = GenerationConfig(
                         temperature=0.7,
                         top_p=0.9,
-                        do_sample=True
+                        do_sample=True,
+                        max_new_tokens=512  # 设置合理的默认值
                     )
                     self.model.generation_config = gen_config
                     
@@ -589,7 +467,24 @@ class ModelWorker:
                     self.model.generation_config.pad_token_id = self.model.generation_config.eos_token_id
                     
                 logger.info("模型和相关配置加载完成")
-                return {'status': 'success', 'message': '模型加载成功'}
+                
+                # 在GGUF加载部分
+                # 创建一个临时的空优化文件
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+                    f.write("# 空白优化文件\n")
+                    optimize_config_path = f.name
+
+                # 使用这个临时文件
+                logger.info(f"使用临时空白优化文件: {optimize_config_path}")
+                try:
+                    optimize_and_load_gguf(self.model, optimize_config_path, gguf_path, self.config)
+                    # 使用完后删除临时文件
+                    os.unlink(optimize_config_path)
+                except Exception as e:
+                    # 错误处理
+                    os.unlink(optimize_config_path)  # 确保清理
+                
+                return {'status': 'success', 'message': '模型加载成功（直接加载模式）'}
                 
             except Exception as e:
                 logger.error(f"加载模型出错: {str(e)}")

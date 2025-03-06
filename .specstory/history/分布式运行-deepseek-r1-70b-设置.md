@@ -16410,6 +16410,223 @@ TypeError: expected str, bytes or os.PathLike object, not NoneType
 
 _**Assistant**_
 
+<think>
+我们需要解决 optimize_and_load_gguf 函数无法处理 rule_file 为 None 的情况。这表明该函数期望一个有效的规则文件路径，而不是 None。
+
+从错误信息来看，问题出在：
+1. 我们传递了 None 作为 optimize_config_path 参数
+2. 函数尝试用这个值打开文件 `with open(rule_file, 'r', encoding='utf-8')`
+
+有几种解决方案：
+1. 我们可以传递一个默认的规则文件路径，而不是 None
+2. 修改 worker.py 中如何调用 optimize_and_load_gguf 函数
+3. 如果可能的话，修改原始的 optimize_and_load_gguf 函数以处理 None 值
+
+让我们选择方案2，修改 worker.py 中的代码以确保我们总是提供一个有效的规则文件。
+</think>
+
+我们需要修复规则文件为None的问题。从报错信息来看，`optimize_and_load_gguf`函数需要一个有效的规则文件路径，而不是`None`。让我们修正这个问题：
+
+```python:ktransformers/worker.py
+# 替换超时和optimize_and_load_gguf调用部分
+# 设置超时，防止无限等待
+import signal
+
+def timeout_handler(signum, frame):
+    raise TimeoutError("优化和加载GGUF模型超时")
+
+# 设置30秒超时
+signal.signal(signal.SIGALRM, timeout_handler)
+signal.alarm(30)  # 30秒超时
+
+try:
+    # 确保有合适的优化规则文件
+    import glob
+    # 查找可能的规则文件
+    arch_name = self.config.architectures[0] if hasattr(self.config, 'architectures') and self.config.architectures else "unknown"
+    rule_files = glob.glob(os.path.join(ktransformer_rules_dir, "*.yaml"))
+    
+    # 尝试找到匹配的规则文件
+    optimize_config_path = None
+    if rule_files:
+        # 有规则文件，选择匹配度最高的
+        for rule_file in rule_files:
+            rule_name = os.path.basename(rule_file)
+            # 尝试根据模型类型匹配规则文件
+            if arch_name in rule_name:
+                optimize_config_path = rule_file
+                logger.info(f"找到匹配的规则文件: {rule_name}")
+                break
+        
+        # 如果没有匹配的，使用第一个作为默认
+        if optimize_config_path is None:
+            optimize_config_path = rule_files[0]
+            logger.info(f"使用默认规则文件: {os.path.basename(optimize_config_path)}")
+    else:
+        # 没有找到规则文件，改用简单加载模式
+        logger.error("找不到优化规则文件，切换到简单加载模式")
+        signal.alarm(0)  # 取消超时
+        os.environ['KTRANSFORMERS_FALLBACK'] = 'TRUE'
+        return self.load_model(model_path, gguf_path)
+    
+    # 执行optimize_and_load_gguf，现在确保规则文件存在
+    logger.info(f"使用规则文件: {optimize_config_path}")
+    optimize_and_load_gguf(self.model, optimize_config_path, gguf_path, self.config)
+    # 取消超时
+    signal.alarm(0)
+except TimeoutError:
+    logger.error("GGUF加载超时，切换到简单加载模式")
+    signal.alarm(0)  # 确保取消超时
+    # 递归调用自身，但启用fallback模式
+    os.environ['KTRANSFORMERS_FALLBACK'] = 'TRUE'
+    return self.load_model(model_path, gguf_path)
+```
+
+
+这个修改：
+
+1. 动态查找和选择优化规则文件，而不是传递None
+2. 优先选择与模型架构匹配的规则文件
+3. 如果找不到匹配的，使用第一个可用的规则文件
+4. 如果完全找不到规则文件，改用简单加载模式
+5. 日志记录选择的规则文件，便于调试
+
+这样应该能解决`expected str, bytes or os.PathLike object, not NoneType`的错误。
+
+---
+
+_**User**_
+
+跳过规则优化
+
+---
+
+_**Assistant**_
+
+<think>
+根据用户的最后消息"跳过规则优化"，我理解他希望完全跳过GGUF加载和优化步骤，直接使用简单加载模式。这样可以避免与GGUF相关的所有问题。
+
+我们需要修改worker.py，直接使用fallback模式来加载模型，而不是尝试GGUF加载。
+</think>
+
+让我们修改代码，直接跳过规则优化和GGUF加载，使用简单的模型加载方式：
+
+```python:ktransformers/worker.py
+def load_model(self, model_path: str, gguf_path: str) -> Dict[str, Any]:
+    """加载模型"""
+    try:
+        logger.info(f"开始加载模型: {model_path}")
+        
+        # 先验证路径
+        if not model_path:
+            logger.error("模型路径为空")
+            return {'status': 'error', 'error': '模型路径不能为空'}
+        
+        # 加载tokenizer
+        logger.info("加载tokenizer...")
+        try:
+            from transformers import AutoTokenizer
+            self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+            logger.info("Tokenizer加载成功")
+        except Exception as e:
+            logger.error(f"加载tokenizer出错: {str(e)}")
+            return {'status': 'error', 'error': f"加载tokenizer失败: {str(e)}"}
+        
+        # 加载模型配置
+        logger.info("加载模型配置...")
+        try:
+            from transformers import AutoConfig
+            self.config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+            # 设置默认数据类型
+            torch.set_default_dtype(self.config.torch_dtype)
+            logger.info(f"模型配置加载成功，类型: {self.config.model_type}")
+        except Exception as e:
+            logger.error(f"加载模型配置出错: {str(e)}")
+            return {'status': 'error', 'error': f"加载模型配置失败: {str(e)}"}
+        
+        # 完全跳过规则优化，直接使用简单加载
+        logger.info("使用直接加载模式（跳过GGUF优化）...")
+        try:
+            from transformers import AutoModelForCausalLM
+            
+            # 确保CUDA可用
+            if torch.cuda.is_available():
+                device_map = "auto"
+            else:
+                device_map = "cpu"
+                logger.warning("CUDA不可用，使用CPU加载模型")
+            
+            # 直接加载原始模型
+            logger.info(f"直接从HuggingFace加载模型: {model_path}")
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                config=self.config,
+                trust_remote_code=True,
+                torch_dtype=self.config.torch_dtype,
+                device_map=device_map
+            )
+            
+            # 设置为评估模式
+            self.model.eval()
+            logger.info("模型加载成功，设置为评估模式")
+            
+            # 加载生成配置
+            try:
+                from transformers import GenerationConfig
+                self.model.generation_config = GenerationConfig.from_pretrained(model_path)
+                logger.info("生成配置加载成功")
+            except Exception as e:
+                logger.warning(f"无法加载生成配置，使用默认配置: {str(e)}")
+                # 创建默认生成配置
+                from transformers import GenerationConfig
+                gen_config = GenerationConfig(
+                    temperature=0.7,
+                    top_p=0.9,
+                    do_sample=True,
+                    max_new_tokens=512  # 设置合理的默认值
+                )
+                self.model.generation_config = gen_config
+                
+            # 确保pad_token_id设置
+            if self.model.generation_config.pad_token_id is None:
+                self.model.generation_config.pad_token_id = self.model.generation_config.eos_token_id
+                
+            logger.info("模型和相关配置加载完成")
+            return {'status': 'success', 'message': '模型加载成功（直接加载模式）'}
+            
+        except Exception as e:
+            logger.error(f"加载模型出错: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {'status': 'error', 'error': f"加载模型失败: {str(e)}"}
+            
+    except Exception as e:
+        logger.error(f"模型加载过程中出现未知错误: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return {'status': 'error', 'error': f"未知错误: {str(e)}"}
+```
+
+
+这个简化版本：
+
+1. 完全跳过了GGUF加载和优化步骤
+2. 直接使用HuggingFace的标准方法加载模型
+3. 保留了tokenizer和配置加载
+4. 设置了默认的生成参数
+
+这种方法应该能避免所有与GGUF相关的复杂问题，直接使用原始模型进行推理。
+
+---
+
+_**User**_
+
+gguf不跳过，只跳过执行.yaml优化文件
+
+---
+
+_**Assistant**_
+
 
 
 ---

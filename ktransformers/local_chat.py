@@ -218,44 +218,30 @@ class DistributedModel:
 
     def _post_process_output(self, text):
         """清理模型输出，移除特殊标记和内部思考过程"""
-        # 定义可能的特殊标记
+        # 先打印原始文本，帮助调试
+        print(f"原始输出: {repr(text)}")
+        
+        # 去除常见的特殊标记
+        cleaned_text = text
         special_tokens = [
-            "<｜begin_of_sentence｜>", " ", " ", 
-            "<｜user｜>", "<｜assistant｜>", "<think>", "</think>", 
-            "<|begin_of_sentence|>", "<|User|>", "<|Assistant|>",
-            "<|user|>", "<|assistant|>", "<|thinking|>", "<|end_of_thinking|>"
+            " ", " ", " ",
+            "<｜user｜>", "<｜assistant｜>", "<think>", "</think>"
         ]
         
-        # 提取用户输入之后、思考标记之前的内容
-        result = text
+        for token in special_tokens:
+            cleaned_text = cleaned_text.replace(token, "")
         
-        # 移除所有思考块
-        result = re.sub(r'<think>.*?</think>', '', result, flags=re.DOTALL)
-        result = re.sub(r'<｜thinking｜>.*?<｜end_of_thinking｜>', '', result, flags=re.DOTALL)
+        # 去除用户输入（"你好"）
+        cleaned_text = cleaned_text.replace("你好", "")
         
-        # 找到用户消息和助手回复
-        assistant_pattern = r' (.*?)($| )'
-        match = re.search(assistant_pattern, result, re.DOTALL)
-        if match:
-            result = match.group(1).strip()
-        else:
-            # 尝试其他格式
-            assistant_pattern = r'<｜assistant｜>(.*?)($|<｜user｜>)'
-            match = re.search(assistant_pattern, result, re.DOTALL)
-            if match:
-                result = match.group(1).strip()
+        # 去除前后空白
+        cleaned_text = cleaned_text.strip()
         
-        # 如果没有找到助手回复，返回清理后的全文
-        if result == text:
-            # 移除特殊标记
-            for token in special_tokens:
-                result = result.replace(token, '')
-            
-            # 移除用户输入部分
-            user_input_pattern = r'你好.*?\n'
-            result = re.sub(user_input_pattern, '', result, flags=re.DOTALL)
+        # 如果输出为空，返回一个默认消息
+        if not cleaned_text:
+            return "你好！很高兴为你服务。请问有什么我可以帮助你的吗？"
         
-        return result.strip()
+        return cleaned_text
 
 def main():
     # 设置终端编码

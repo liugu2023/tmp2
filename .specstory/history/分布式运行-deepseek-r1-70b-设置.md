@@ -10145,6 +10145,233 @@ RuntimeError: Expected all tensors to be on the same device, but found at least 
 
 ---
 
+_**Assistant**_
+
+
+
+看起来有两个问题需要修复：
+
+1. KVCacheClient.retrieve() 需要一个 device 参数
+2. 设备不匹配的问题（CPU vs CUDA）
+
+让我们修复这些问题：
+
+```python:ktransformers/worker.py
+def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        logger.info("Received generation request")
+        logger.info(f"Input sequence length: {len(input_data['input_ids'])}")
+        
+        # 创建输入张量
+        logger.info("Moving input tensors to GPU...")
+        device = self.model.device  # 使用模型的设备
+        input_ids = torch.tensor(input_data['input_ids'], device=device)
+        attention_mask = torch.tensor(input_data['attention_mask'], device=device)
+        
+        # 生成参数日志
+        max_new_tokens = input_data.get('max_new_tokens', 512)
+        temperature = input_data.get('temperature', 0.6)
+        top_p = input_data.get('top_p', 0.9)
+        logger.info(f"Generation parameters: max_new_tokens={max_new_tokens}, "
+                   f"temperature={temperature}, "
+                   f"top_p={top_p}")
+        
+        # 生成文本
+        logger.info("Starting text generation...")
+        start_time = time.time()
+        
+        # 创建 KV Cache 客户端
+        kvcache_client = KVCacheClient("10.21.22.206:29600")
+        
+        # 生成唯一的 batch ID
+        batch_id = f"{time.time()}_{self.worker_id}"
+        
+        with torch.no_grad(), torch.amp.autocast('cuda'):
+            hidden_states = input_ids  # 初始化隐藏状态
+            
+            # 在每一层处理完后，存储 KV Cache
+            for i, layer in enumerate(self.model.layers):
+                if i >= self.model.start_layer and i < self.model.end_layer:
+                    # 这是当前 worker 负责的层
+                    # 确保输入在正确的设备上
+                    hidden_states = hidden_states.to(device)
+                    hidden_states = layer(hidden_states)
+                    # 存储中间结果
+                    kvcache_client.store(batch_id, i, hidden_states)
+                else:
+                    # 需要从其他 worker 获取的层
+                    hidden_states = kvcache_client.retrieve(batch_id, i, device=device)
+                    if hidden_states is None:
+                        logger.error(f"Failed to retrieve hidden states for layer {i}")
+                        raise RuntimeError(f"Failed to retrieve hidden states for layer {i}")
+            
+            # 生成完成后清理缓存
+            kvcache_client.clear(batch_id)
+            
+            # 确保输出在CPU上，以便序列化
+            hidden_states = hidden_states.cpu()
+            
+            # 返回结果
+            return {
+                'status': 'success',
+                'output': hidden_states.tolist(),
+                'time_taken': time.time() - start_time
+            }
+        
+    except Exception as e:
+        logger.error(f"Generation error: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return {
+            'status': 'error',
+            'error': str(e)
+        }
+```
+
+主要修改：
+
+1. 使用模型的设备来确保一致性
+2. 在调用 retrieve 时传入设备参数
+3. 在每次使用张量前确保它在正确的设备上
+4. 在返回结果前将张量移到 CPU 以便序列化
+5. 添加了更多的错误检查和日志记录
+
+同时，我们也应该确保 SimpleModel 的 forward 方法正确处理设备：
+
+```python:ktransformers/worker.py
+def forward(self, hidden_states, attention_mask=None, **kwargs):
+    """前向传播，只处理当前worker负责的层"""
+    try:
+        # 确保输入在正确的设备上
+        hidden_states = hidden_states.to(self.device)
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(self.device)
+        
+        # 如果是第一个worker，需要处理词嵌入
+        if self.worker_id == 0 and self.embed_tokens is not None:
+            hidden_states = self.embed_tokens(hidden_states)
+        
+        # 处理当前worker负责的层
+        for i, layer in enumerate(self.layers):
+            # 按需加载层参数
+            layer_idx = self.start_layer + i
+            self.load_layer_params(layer_idx)
+            # 确保层在正确的设备上
+            layer = layer.to(self.device)
+            # 处理这一层
+            hidden_states = layer(hidden_states)
+        
+        # 如果是最后一个worker，需要处理norm和lm_head
+        if self.worker_id == self.worker_count - 1:
+            if self.norm is not None:
+                self.norm = self.norm.to(self.device)
+                hidden_states = self.norm(hidden_states)
+            if self.lm_head is not None:
+                self.lm_head = self.lm_head.to(self.device)
+                hidden_states = self.lm_head(hidden_states)
+        
+        return hidden_states
+        
+    except Exception as e:
+        logger.error(f"Forward pass error: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise
+```
+
+这些修改应该能解决设备不匹配的问题。请更新代码并重试。
+
+---
+
+_**User**_
+
+ERROR:__main__:Failed to retrieve hidden states for layer 0
+ERROR:__main__:Generation error: Failed to retrieve hidden states for layer 0
+ERROR:__main__:Traceback (most recent call last):
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 420, in generate
+    raise RuntimeError(f"Failed to retrieve hidden states for layer {i}")
+RuntimeError: Failed to retrieve hidden states for layer 0
+
+INFO:__main__:Generation parameters: max_new_tokens=50, temperature=0.7, top_p=0.9
+INFO:__main__:Starting text generation...
+ERROR:__main__:Failed to retrieve hidden states for layer 0
+ERROR:__main__:Generation error: Failed to retrieve hidden states for layer 0
+ERROR:__main__:Traceback (most recent call last):
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 420, in generate
+    raise RuntimeError(f"Failed to retrieve hidden states for layer {i}")
+RuntimeError: Failed to retrieve hidden states for layer 0
+
+INFO:__main__:Generation parameters: max_new_tokens=50, temperature=0.7, top_p=0.9
+INFO:__main__:Starting text generation...
+INFO:__main__:Generation parameters: max_new_tokens=50, temperature=0.7, top_p=0.9
+INFO:__main__:Starting text generation...
+ERROR:__main__:Failed to retrieve hidden states for layer 0
+ERROR:__main__:Generation error: Failed to retrieve hidden states for layer 0
+ERROR:__main__:Traceback (most recent call last):
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 420, in generate
+    raise RuntimeError(f"Failed to retrieve hidden states for layer {i}")
+RuntimeError: Failed to retrieve hidden states for layer 0
+
+ERROR:__main__:Failed to retrieve hidden states for layer 0
+ERROR:__main__:Generation error: Failed to retrieve hidden states for layer 0
+ERROR:__main__:Traceback (most recent call last):
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 420, in generate
+    raise RuntimeError(f"Failed to retrieve hidden states for layer {i}")
+RuntimeError: Failed to retrieve hidden states for layer 0
+
+INFO:__main__:Generation parameters: max_new_tokens=50, temperature=0.7, top_p=0.9
+INFO:__main__:Starting text generation...
+INFO:__main__:Generation parameters: max_new_tokens=50, temperature=0.7, top_p=0.9
+INFO:__main__:Starting text generation...
+ERROR:__main__:Generation error: Expected all tensors to be on the same device, but found at least two devices, cpu and cuda:0! (when checking argument for argument mat1 in method wrapper_CUDA_addmm)
+ERROR:__main__:Failed to retrieve hidden states for layer 0
+ERROR:__main__:Generation error: Failed to retrieve hidden states for layer 0
+ERROR:__main__:Traceback (most recent call last):
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 420, in generate
+    raise RuntimeError(f"Failed to retrieve hidden states for layer {i}")
+RuntimeError: Failed to retrieve hidden states for layer 0
+
+ERROR:__main__:Traceback (most recent call last):
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 412, in generate
+    hidden_states = layer(hidden_states)
+                    ^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/torch/nn/modules/linear.py", line 125, in forward
+    return F.linear(input, self.weight, self.bias)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: Expected all tensors to be on the same device, but found at least two devices, cpu and cuda:0! (when checking argument for argument mat1 in method wrapper_CUDA_addmm)
+
+INFO:__main__:Generation parameters: max_new_tokens=50, temperature=0.7, top_p=0.9
+INFO:__main__:Starting text generation...
+ERROR:__main__:Failed to retrieve hidden states for layer 0
+ERROR:__main__:Generation error: Failed to retrieve hidden states for layer 0
+ERROR:__main__:Traceback (most recent call last):
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 420, in generate
+    raise RuntimeError(f"Failed to retrieve hidden states for layer {i}")
+RuntimeError: Failed to retrieve hidden states for layer 0
+
+INFO:__main__:Generation parameters: max_new_tokens=50, temperature=0.7, top_p=0.9
+INFO:__main__:Starting text generation...
+ERROR:__main__:Failed to retrieve hidden states for layer 0
+ERROR:__main__:Generation error: Failed to retrieve hidden states for layer 0
+ERROR:__main__:Traceback (most recent call last):
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 420, in generate
+    raise RuntimeError(f"Failed to retrieve hidden states for layer {i}")
+RuntimeError: Failed to retrieve hidden states for layer 0
+
+---
+
+_**Assistant**_
+
+
+
+---
+
 
 
 ---

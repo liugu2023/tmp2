@@ -403,21 +403,53 @@ class ModelWorker:
             with torch.no_grad(), torch.amp.autocast('cuda'):
                 hidden_states = input_ids  # 初始化隐藏状态
                 
-                # 在每一层处理完后，存储 KV Cache
-                for i, layer in enumerate(self.model.layers):
-                    if i >= self.model.start_layer and i < self.model.end_layer:
-                        # 这是当前 worker 负责的层
-                        # 确保输入在正确的设备上
-                        hidden_states = hidden_states.to(device)
-                        hidden_states = layer(hidden_states)
-                        # 存储中间结果
-                        kvcache_client.store(batch_id, i, hidden_states)
-                    else:
-                        # 需要从其他 worker 获取的层
-                        hidden_states = kvcache_client.retrieve(batch_id, i, device=device)
-                        if hidden_states is None:
-                            logger.error(f"Failed to retrieve hidden states for layer {i}")
-                            raise RuntimeError(f"Failed to retrieve hidden states for layer {i}")
+                # 如果是第一个worker，需要处理词嵌入
+                if self.worker_id == 0:
+                    if self.model.embed_tokens is not None:
+                        hidden_states = self.model.embed_tokens(hidden_states)
+                    # 存储嵌入结果供其他worker使用
+                    kvcache_client.store(batch_id, "embeddings", hidden_states)
+                else:
+                    # 其他worker需要等待并获取嵌入结果
+                    for _ in range(10):  # 最多尝试10次
+                        hidden_states = kvcache_client.retrieve(batch_id, "embeddings", device=device)
+                        if hidden_states is not None:
+                            break
+                        time.sleep(0.1)  # 等待100ms后重试
+                    
+                    if hidden_states is None:
+                        raise RuntimeError("Failed to retrieve embeddings from first worker")
+                
+                # 处理当前worker负责的层
+                for layer_idx in range(self.model.start_layer, self.model.end_layer):
+                    # 确保输入在正确的设备上
+                    hidden_states = hidden_states.to(device)
+                    # 获取当前层
+                    layer = self.model.layers[layer_idx - self.model.start_layer].to(device)
+                    # 处理这一层
+                    hidden_states = layer(hidden_states)
+                    # 存储结果
+                    kvcache_client.store(batch_id, f"layer_{layer_idx}", hidden_states)
+                
+                # 如果是最后一个worker，需要处理norm和lm_head
+                if self.worker_id == self.num_workers - 1:
+                    if self.model.norm is not None:
+                        hidden_states = self.model.norm(hidden_states.to(device))
+                    if self.model.lm_head is not None:
+                        hidden_states = self.model.lm_head(hidden_states)
+                    # 存储最终结果
+                    kvcache_client.store(batch_id, "final", hidden_states)
+                
+                # 等待最终结果
+                if self.worker_id != self.num_workers - 1:
+                    for _ in range(10):  # 最多尝试10次
+                        hidden_states = kvcache_client.retrieve(batch_id, "final", device=device)
+                        if hidden_states is not None:
+                            break
+                        time.sleep(0.1)
+                    
+                    if hidden_states is None:
+                        raise RuntimeError("Failed to retrieve final output from last worker")
                 
                 # 生成完成后清理缓存
                 kvcache_client.clear(batch_id)

@@ -197,27 +197,49 @@ class CentralServer:
             }
             self.active_batches[batch_id]['completed'] = True
     
+    def shutdown_workers(self):
+        """关闭所有连接的worker进程"""
+        logger.info("正在关闭所有worker进程...")
+        
+        for addr, socket in self.workers:
+            try:
+                logger.info(f"正在关闭worker: {addr}")
+                socket.send_pyobj({'command': 'shutdown'})
+                response = socket.recv_pyobj()  # 等待确认
+                logger.info(f"Worker {addr} 回应: {response.get('message', 'No message')}")
+            except Exception as e:
+                logger.error(f"关闭worker {addr}时出错: {str(e)}")
+        
+        # 关闭KV缓存服务器
+        try:
+            logger.info("正在关闭KV缓存服务器...")
+            self.kvcache_socket.send_pyobj({'command': 'shutdown'})
+            response = self.kvcache_socket.recv_pyobj()
+            logger.info(f"KV缓存服务器回应: {response.get('message', 'No message')}")
+        except Exception as e:
+            logger.error(f"关闭KV缓存服务器时出错: {str(e)}")
+        
+        logger.info("所有worker进程已关闭")
+        return True
+    
     def process_client_message(self, message: Dict[str, Any]) -> Dict[str, Any]:
         """处理客户端消息"""
-        command = message.get('command', '')
-        logger.info(f"Received command: {command}")
-        
         try:
+            command = message.get('command', '')
+            logger.info(f"Received command: {command}")
+            
             if command == 'load_model':
                 model_path = message.get('model_path', '')
                 gguf_path = message.get('gguf_path', '')
-                success = self.load_model_on_workers(model_path, gguf_path)
-                return {
-                    'status': 'success' if success else 'error',
-                    'error': None if success else 'Failed to load model on workers'
-                }
+                return self.load_model_on_workers(model_path, gguf_path)
             elif command == 'generate':
-                data = message.get('data', {})
-                result = self.generate(data)
-                return result
+                return self.generate(message.get('data', {}))
             elif command == 'shutdown':
-                self.shutdown_workers()
-                return {'status': 'success'}
+                # 关闭所有worker进程
+                result = self.shutdown_workers()
+                return {'status': 'success' if result else 'error', 'message': 'Shutdown complete'}
+            elif command == 'ping':
+                return {'status': 'success', 'message': 'pong'}
             else:
                 return {
                     'status': 'error',

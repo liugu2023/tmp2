@@ -4,7 +4,6 @@ import logging
 from typing import Dict, Any
 import numpy as np
 import time
-import os
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -156,33 +155,43 @@ class KVCacheServer:
                 
                 # 添加load_model命令处理
                 elif command == 'load_model':
-                    model_path = message['model_path']
-                    gguf_path = message.get('gguf_path')
+                    model_path = message.get('model_path', '')
+                    gguf_path = message.get('gguf_path', '')
+                    
+                    # 输出详细日志
+                    logger.info(f"收到加载模型请求，模型路径: '{model_path}', GGUF路径: '{gguf_path}'")
+                    
+                    # 验证模型路径
+                    if not model_path or model_path.strip() == '':
+                        logger.error("错误: 模型路径为空")
+                        self.socket.send_pyobj({
+                            'status': 'error',
+                            'error': '模型路径不能为空'
+                        })
+                        continue
                     
                     # 初始化或重新初始化模型加载器
                     try:
                         from ktransformers.model_loader import ModelLoader
-                        logger.info(f"请求加载模型: {model_path}, GGUF: {gguf_path}")
-                        
-                        # 验证路径
-                        if not model_path:
-                            logger.error("模型路径为空")
-                            return {'status': 'error', 'error': '模型路径不能为空'}
-                        
-                        # 打印当前工作目录，以便调试
-                        logger.info(f"当前工作目录: {os.getcwd()}")
-                        
-                        # 加载模型
+                        logger.info(f"初始化/重新初始化模型加载器，模型路径: {model_path}")
                         self.model_loader = ModelLoader(model_path, gguf_path)
-                        self.model_config = self.model_loader.get_config()
+                        success = self.model_loader.load_model()
                         
-                        logger.info("模型加载成功")
-                        return {'status': 'success'}
+                        if success:
+                            logger.info("模型加载器初始化完成")
+                            self.socket.send_pyobj({'status': 'success'})
+                        else:
+                            logger.error("模型加载器初始化失败")
+                            self.socket.send_pyobj({
+                                'status': 'error',
+                                'error': 'Failed to initialize model loader'
+                            })
                     except Exception as e:
-                        logger.error(f"加载模型时出错: {str(e)}")
-                        import traceback
-                        logger.error(traceback.format_exc())
-                        return {'status': 'error', 'error': str(e)}
+                        logger.error(f"模型加载器初始化出错: {str(e)}")
+                        self.socket.send_pyobj({
+                            'status': 'error',
+                            'error': str(e)
+                        })
                 
             except Exception as e:
                 logger.error(f"Error in KV Cache Server: {str(e)}")

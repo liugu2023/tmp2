@@ -49,21 +49,19 @@ class DistributedModel:
         if gguf_path:
             print(f"使用GGUF模型: {gguf_path}")
         
-        # 确保model_path不为空
-        if not model_path:
+        # 确保路径不为空字符串
+        if not model_path or model_path.strip() == '':
             print("错误: 模型路径不能为空")
             return False
         
-        # 确保路径存在
-        if not os.path.exists(model_path):
-            print(f"警告: 模型路径不存在: {model_path}")
-            # 在开发环境中，我们可能依赖的是远程模型，所以继续执行
-        
-        # 发送加载请求到服务器
-        response = self._send_command('load_model', {
+        # 打印详细的请求内容，用于调试
+        request_data = {
             'model_path': model_path,
-            'gguf_path': gguf_path if gguf_path else ""
-        })
+            'gguf_path': gguf_path
+        }
+        print(f"发送加载模型请求: {request_data}")
+        
+        response = self._send_command('load_model', request_data)
         
         # 检查response是否是字典
         if isinstance(response, bool):

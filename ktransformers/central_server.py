@@ -43,44 +43,36 @@ class CentralServer:
         
     def load_model_on_workers(self, model_path: str, gguf_path: str) -> Dict[str, Any]:
         """加载模型到所有worker上"""
-        logger.info(f"加载模型: {model_path}, GGUF: {gguf_path}")
+        logger.info(f"加载模型，路径: '{model_path}', GGUF路径: '{gguf_path}'")
+        
+        # 验证模型路径
+        if not model_path or model_path.strip() == '':
+            logger.error("错误: 模型路径为空")
+            return {'status': 'error', 'error': '模型路径不能为空'}
         
         # 首先加载到KV缓存服务器
         logger.info("发送模型加载命令到KV缓存服务器...")
+        load_request = {
+            'command': 'load_model',
+            'model_path': model_path,
+            'gguf_path': gguf_path
+        }
+        logger.info(f"发送请求到KV缓存服务器: {load_request}")
+        self.kvcache_socket.send_pyobj(load_request)
         
-        # 设置套接字超时
-        self.kvcache_socket.setsockopt(zmq.RCVTIMEO, 30000)  # 30秒超时
+        response = self.kvcache_socket.recv_pyobj()
+        if response.get('status') != 'success':
+            logger.error(f"KV缓存服务器加载模型失败: {response.get('error')}")
+            return {'status': 'error', 'error': f"KV缓存服务器加载模型失败: {response.get('error')}"}
         
-        try:
-            self.kvcache_socket.send_pyobj({
-                'command': 'load_model',
-                'model_path': model_path,
-                'gguf_path': gguf_path
-            })
-            
-            response = self.kvcache_socket.recv_pyobj()
-            logger.info(f"KV缓存服务器响应: {response}")
-            
-            if response.get('status') != 'success':
-                logger.error(f"KV缓存服务器加载模型失败: {response.get('error')}")
-                return {'status': 'error', 'error': f"KV缓存服务器加载模型失败: {response.get('error')}"}
-        except zmq.error.Again:
-            logger.error("KV缓存服务器响应超时")
-            return {'status': 'error', 'error': "KV缓存服务器响应超时，请检查服务器状态"}
-        except Exception as e:
-            logger.error(f"与KV缓存服务器通信出错: {str(e)}")
-            return {'status': 'error', 'error': f"与KV缓存服务器通信出错: {str(e)}"}
-        
-        # 然后加载到各个worker（并行）
+        # 然后加载到各个worker
         logger.info("发送模型加载命令到所有workers...")
         success = True
         errors = []
         
-        # 使用线程并行加载
-        def load_on_worker(addr, socket, results, idx):
+        for addr, socket in self.workers:
             try:
                 logger.info(f"加载模型到worker: {addr}")
-                socket.setsockopt(zmq.RCVTIMEO, 30000)  # 30秒超时
                 socket.send_pyobj({
                     'command': 'load_model',
                     'model_path': model_path,
@@ -89,50 +81,20 @@ class CentralServer:
                 
                 worker_response = socket.recv_pyobj()
                 if worker_response.get('status') != 'success':
-                    error_msg = f"Worker {addr} 加载模型失败: {worker_response.get('error')}"
-                    logger.error(error_msg)
-                    results[idx] = (False, error_msg)
-                else:
-                    results[idx] = (True, None)
-            except zmq.error.Again:
-                error_msg = f"Worker {addr} 响应超时"
-                logger.error(error_msg)
-                results[idx] = (False, error_msg)
+                    logger.error(f"Worker {addr} 加载模型失败: {worker_response.get('error')}")
+                    success = False
+                    errors.append(f"Worker {addr}: {worker_response.get('error')}")
             except Exception as e:
-                error_msg = f"与Worker {addr}通信失败: {str(e)}"
-                logger.error(error_msg)
-                results[idx] = (False, error_msg)
-        
-        # 创建线程并启动
-        threads = []
-        results = [(None, None)] * len(self.workers)
-        
-        for i, (addr, socket) in enumerate(self.workers):
-            thread = threading.Thread(
-                target=load_on_worker, 
-                args=(addr, socket, results, i)
-            )
-            thread.daemon = True
-            threads.append(thread)
-            thread.start()
-        
-        # 等待所有线程完成
-        for thread in threads:
-            thread.join(timeout=35)  # 给35秒超时，比socket超时多一点
-        
-        # 检查结果
-        for (success_flag, error_msg) in results:
-            if not success_flag:
+                logger.error(f"与Worker {addr}通信失败: {str(e)}")
                 success = False
-                if error_msg:
-                    errors.append(error_msg)
+                errors.append(f"Worker {addr}: 通信失败 - {str(e)}")
         
         # 返回结果
         if success:
             logger.info("所有worker成功加载模型")
             return {'status': 'success', 'message': '所有worker成功加载模型'}
         else:
-            error_msg = "; ".join(errors) if errors else "未知错误"
+            error_msg = "; ".join(errors)
             logger.error(f"部分或全部worker加载模型失败: {error_msg}")
             return {'status': 'error', 'error': f"加载模型失败: {error_msg}"}
     
@@ -284,28 +246,27 @@ class CentralServer:
             logger.info(f"Received command: {command}")
             
             if command == 'load_model':
-                # 检查参数是在顶层还是在data字段中
-                if 'model_path' in message:
-                    model_path = message['model_path']
-                elif 'data' in message and 'model_path' in message['data']:
-                    model_path = message['data']['model_path']
-                else:
-                    return {'status': 'error', 'error': '缺少模型路径参数'}
+                # 验证模型路径参数
+                model_path = message.get('model_path', '')
+                gguf_path = message.get('gguf_path', '')
                 
-                # 同样检查gguf_path
-                if 'gguf_path' in message:
-                    gguf_path = message['gguf_path']
-                elif 'data' in message and 'gguf_path' in message['data']:
-                    gguf_path = message['data'].get('gguf_path', '')
-                else:
-                    gguf_path = ''
+                logger.info(f"收到加载模型请求，路径: '{model_path}', GGUF: '{gguf_path}'")
                 
-                # 验证model_path不为空
-                if not model_path:
+                # 检查参数来源
+                if 'data' in message and isinstance(message['data'], dict):
+                    # 有些客户端可能将参数放在data字段中
+                    data = message['data']
+                    if not model_path and 'model_path' in data:
+                        model_path = data['model_path']
+                        logger.info(f"从data字段获取model_path: {model_path}")
+                    if not gguf_path and 'gguf_path' in data:
+                        gguf_path = data['gguf_path']
+                        logger.info(f"从data字段获取gguf_path: {gguf_path}")
+                
+                # 验证参数
+                if not model_path or model_path.strip() == '':
+                    logger.error("模型路径为空")
                     return {'status': 'error', 'error': '模型路径不能为空'}
-                
-                # 打印接收到的路径，以便调试
-                logger.info(f"从客户端收到路径 - model_path: '{model_path}', gguf_path: '{gguf_path}'")
                 
                 return self.load_model_on_workers(model_path, gguf_path)
             elif command == 'generate':
@@ -321,10 +282,6 @@ class CentralServer:
                     'status': 'error',
                     'error': f'Unknown command: {command}'
                 }
-        except KeyError as e:
-            # 处理缺少必要参数的情况
-            logger.error(f"消息缺少必要参数: {str(e)}")
-            return {'status': 'error', 'error': f'缺少必要参数: {str(e)}'}
         except Exception as e:
             logger.error(f"Error processing message: {str(e)}")
             import traceback

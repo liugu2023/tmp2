@@ -45,23 +45,41 @@ class CentralServer:
         """在所有worker上加载模型"""
         logger.info(f"Loading model on all workers: {model_path}")
         
-        for addr, socket in self.workers:
-            logger.info(f"Sending load model command to {addr}")
-            message = {
+        # 首先通知KVCache服务器加载模型
+        try:
+            logger.info("通知KVCache服务器加载模型...")
+            self.kvcache_socket.send_pyobj({
                 'command': 'load_model',
                 'model_path': model_path,
                 'gguf_path': gguf_path
-            }
-            socket.send_pyobj(message)
-            response = socket.recv_pyobj()
-            
+            })
+            response = self.kvcache_socket.recv_pyobj()
             if response['status'] != 'success':
-                logger.error(f"Failed to load model on {addr}: {response.get('error')}")
+                logger.error(f"KVCache服务器加载模型失败: {response.get('error')}")
                 return False
-            
-            logger.info(f"Model loaded successfully on {addr}")
+        except Exception as e:
+            logger.error(f"与KVCache服务器通信出错: {str(e)}")
+            return False
         
-        return True
+        # 然后通知所有worker
+        success = True
+        for addr, socket in self.workers:
+            try:
+                logger.info(f"Loading model on worker at {addr}...")
+                socket.send_pyobj({
+                    'command': 'load_model',
+                    'model_path': model_path,
+                    'gguf_path': gguf_path
+                })
+                response = socket.recv_pyobj()
+                if response['status'] != 'success':
+                    logger.error(f"Failed to load model on worker at {addr}: {response.get('error')}")
+                    success = False
+            except Exception as e:
+                logger.error(f"Error communicating with worker at {addr}: {str(e)}")
+                success = False
+        
+        return success
     
     def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
         """处理生成请求"""

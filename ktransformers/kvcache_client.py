@@ -47,4 +47,37 @@ class KVCacheClient:
         self.socket.send_pyobj({'command': 'shutdown'})
         self.socket.recv_pyobj()
         self.socket.close()
-        self.context.term() 
+        self.context.term()
+
+    def get_config(self):
+        """获取模型配置"""
+        message = {
+            'command': 'get_config'
+        }
+        self.socket.send_pyobj(message)
+        return self.socket.recv_pyobj()
+
+    def get_tokenizer(self):
+        """获取tokenizer"""
+        message = {
+            'command': 'get_tokenizer'
+        }
+        self.socket.send_pyobj(message)
+        return self.socket.recv_pyobj()
+
+    def get_layer_params(self, layer_index):
+        """获取特定层参数"""
+        message = {
+            'command': 'get_layer_params',
+            'layer_index': layer_index
+        }
+        self.socket.send_pyobj(message)
+        return self.socket.recv_pyobj()
+
+    def get_shared_params(self):
+        """获取共享参数"""
+        message = {
+            'command': 'get_shared_params'
+        }
+        self.socket.send_pyobj(message)
+        return self.socket.recv_pyobj() 

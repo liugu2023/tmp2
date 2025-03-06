@@ -7863,7 +7863,477 @@ INFO:__main__:Cleaning up shared resources...
 
 _**Assistant**_
 
+<think>
+这个用户提出了一个非常好的问题。他们指出目前的实现中每个worker进程都在尝试加载模型的一部分，这导致了CUDA内存不足错误。而一个更高效的设计应该是:
 
+1. 只有KVcache进程负责加载完整模型
+2. 其他worker进程直接从KVcache服务器请求它们需要的参数
+
+这是一个很好的架构建议，可以解决内存不足的问题。让我思考一下如何实现这种架构:
+
+1. KVcache服务器需要扩展功能，不仅存储key-value缓存，还需要存储和提供模型参数
+2. Worker进程不再直接加载模型，而是从KVcache服务器请求它们需要的层参数
+3. 中央服务器的协调角色保持不变
+
+我需要修改几个主要组件:
+1. kvcache_server.py - 扩展功能以存储模型参数
+2. worker.py - 修改为从KVcache服务器请求参数而不是自行加载
+3. model_sharder.py - 可能需要修改以适应新架构
+4. kvcache_client.py - 添加获取模型参数的功能
+
+这是一个较大的架构变更，需要仔细设计。
+</think>
+
+# 优化分布式架构设计
+
+您提出了一个非常好的观察！确实，当前架构中存在资源使用效率问题，每个进程都在尝试加载部分模型，这导致了GPU内存不足错误。我们可以改进架构设计，使其更加高效。
+
+下面是一个更优的架构设计方案：
+
+```python:ktransformers/model_loader.py
+import torch
+from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
+import logging
+import os
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class ModelLoader:
+    """负责加载模型并提供参数查询服务"""
+    
+    def __init__(self, model_path, gguf_path):
+        self.model_path = model_path
+        self.gguf_path = gguf_path
+        self.config = None
+        self.tokenizer = None
+        self.loaded_layers = {}
+        
+    def load_model(self):
+        """加载模型配置和tokenizer"""
+        logger.info(f"加载模型配置和tokenizer: {self.model_path}")
+        self.config = AutoConfig.from_pretrained(self.model_path, trust_remote_code=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(self.model_path, trust_remote_code=True)
+        
+        # 加载嵌入层和规范化层
+        logger.info("加载嵌入层和lm_head")
+        self._load_shared_layers()
+        
+        logger.info("模型加载器初始化完成")
+        return True
+        
+    def _load_shared_layers(self):
+        """加载所有worker共享的层"""
+        import safetensors.torch
+        
+        # 尝试从safetensors加载
+        for filename in os.listdir(self.model_path):
+            if filename.endswith('.safetensors'):
+                try:
+                    weights_path = os.path.join(self.model_path, filename)
+                    logger.info(f"从 {weights_path} 加载权重")
+                    weights = safetensors.torch.load_file(weights_path)
+                    
+                    # 加载嵌入层
+                    if 'model.embed_tokens.weight' in weights:
+                        logger.info("加载嵌入层")
+                        self.loaded_layers['embeddings'] = weights['model.embed_tokens.weight']
+                        
+                    # 加载LM头部
+                    if 'lm_head.weight' in weights:
+                        logger.info("加载LM头部")
+                        self.loaded_layers['lm_head'] = weights['lm_head.weight']
+                    
+                    # 加载规范化层
+                    if 'model.norm.weight' in weights:
+                        logger.info("加载规范化层")
+                        self.loaded_layers['norm'] = weights['model.norm.weight']
+                        
+                    break
+                except Exception as e:
+                    logger.error(f"加载权重文件出错: {str(e)}")
+                    continue
+    
+    def load_layer(self, layer_index):
+        """按需加载特定层"""
+        if f'layer_{layer_index}' in self.loaded_layers:
+            return True
+            
+        logger.info(f"按需加载层 {layer_index}")
+        try:
+            # 实现按需加载特定层的逻辑
+            # 这里可以使用更细粒度的方法加载单层
+            # ...
+            
+            return True
+        except Exception as e:
+            logger.error(f"加载层 {layer_index} 时出错: {str(e)}")
+            return False
+    
+    def get_config(self):
+        """获取模型配置"""
+        return self.config
+        
+    def get_tokenizer(self):
+        """获取tokenizer"""
+        return self.tokenizer
+        
+    def get_layer_params(self, layer_index):
+        """获取特定层的参数"""
+        key = f'layer_{layer_index}'
+        if key not in self.loaded_layers:
+            success = self.load_layer(layer_index)
+            if not success:
+                return None
+                
+        return self.loaded_layers[key]
+        
+    def get_shared_params(self):
+        """获取共享参数(嵌入层、LM头等)"""
+        return {
+            'embeddings': self.loaded_layers.get('embeddings'),
+            'lm_head': self.loaded_layers.get('lm_head'),
+            'norm': self.loaded_layers.get('norm')
+        }
+```
+
+
+```python:ktransformers/kvcache_server.py
+# 在KVCache服务器中添加模型加载器集成
+
+def __init__(self, port: int = 29600, max_retries: int = 5, model_path: str = None, gguf_path: str = None):
+    # 现有的初始化代码...
+    
+    # 如果提供了模型路径，初始化模型加载器
+    self.model_loader = None
+    if model_path:
+        from ktransformers.model_loader import ModelLoader
+        logger.info(f"初始化模型加载器，模型路径: {model_path}")
+        self.model_loader = ModelLoader(model_path, gguf_path)
+        self.model_loader.load_model()
+        logger.info("模型加载器初始化完成")
+
+def run(self):
+    while True:
+        try:
+            message = self.socket.recv_pyobj()
+            command = message['command']
+            
+            # 原有的KV缓存命令处理...
+            
+            # 添加模型参数相关命令
+            elif command == 'get_config':
+                if self.model_loader:
+                    self.socket.send_pyobj({
+                        'status': 'success',
+                        'config': self.model_loader.get_config()
+                    })
+                else:
+                    self.socket.send_pyobj({
+                        'status': 'error',
+                        'error': 'Model loader not initialized'
+                    })
+                    
+            elif command == 'get_tokenizer':
+                if self.model_loader:
+                    self.socket.send_pyobj({
+                        'status': 'success',
+                        'tokenizer': self.model_loader.get_tokenizer()
+                    })
+                else:
+                    self.socket.send_pyobj({
+                        'status': 'error',
+                        'error': 'Model loader not initialized'
+                    })
+                    
+            elif command == 'get_layer_params':
+                layer_index = message['layer_index']
+                if self.model_loader:
+                    params = self.model_loader.get_layer_params(layer_index)
+                    self.socket.send_pyobj({
+                        'status': 'success' if params is not None else 'error',
+                        'params': params
+                    })
+                else:
+                    self.socket.send_pyobj({
+                        'status': 'error',
+                        'error': 'Model loader not initialized'
+                    })
+                    
+            elif command == 'get_shared_params':
+                if self.model_loader:
+                    self.socket.send_pyobj({
+                        'status': 'success',
+                        'params': self.model_loader.get_shared_params()
+                    })
+                else:
+                    self.socket.send_pyobj({
+                        'status': 'error',
+                        'error': 'Model loader not initialized'
+                    })
+```
+
+
+```python:ktransformers/worker.py
+# 修改worker.py，使其从KVCache服务器获取参数而不是自行加载
+
+def load_model(self, model_path: str, gguf_path: str):
+    # 创建KVCache客户端
+    self.kvcache_client = KVCacheClient(f"10.21.22.206:29600")
+    
+    # 获取模型配置
+    logger.info("从KVCache服务器获取模型配置")
+    response = self.kvcache_client.get_config()
+    if response['status'] != 'success':
+        logger.error("获取模型配置失败")
+        raise RuntimeError("Failed to get model config")
+    
+    config = response['config']
+    
+    # 获取tokenizer
+    logger.info("从KVCache服务器获取tokenizer")
+    response = self.kvcache_client.get_tokenizer()
+    if response['status'] != 'success':
+        logger.error("获取tokenizer失败")
+        raise RuntimeError("Failed to get tokenizer")
+    
+    self.tokenizer = response['tokenizer']
+    
+    # 计算每个进程应该处理的层
+    total_layers = config.num_hidden_layers
+    layers_per_process = total_layers // self.num_workers
+    start_layer = self.worker_id * layers_per_process
+    end_layer = start_layer + layers_per_process if self.worker_id < self.num_workers - 1 else total_layers
+    
+    # 其他内存计算和初始化代码...
+    
+    # 创建模型实例但不加载参数
+    # 这里需要创建一个空的模型结构
+    
+    # 获取共享参数(嵌入层、LM头等)
+    logger.info("从KVCache服务器获取共享参数")
+    response = self.kvcache_client.get_shared_params()
+    if response['status'] != 'success':
+        logger.error("获取共享参数失败")
+        raise RuntimeError("Failed to get shared parameters")
+    
+    shared_params = response['params']
+    
+    # 应用共享参数到模型
+    # ...
+    
+    # 获取此worker负责的层参数
+    for i in range(start_layer, end_layer):
+        logger.info(f"从KVCache服务器获取层 {i} 参数")
+        response = self.kvcache_client.get_layer_params(i)
+        if response['status'] != 'success':
+            logger.error(f"获取层 {i} 参数失败")
+            continue
+            
+        # 应用层参数到模型
+        # ...
+    
+    logger.info(f"Worker {self.worker_id} 成功加载层 {start_layer}-{end_layer-1}")
+```
+
+```bash:start_service.sh
+# 在206上运行的命令
+if [ "$(hostname)" = "compute06" ]; then
+    echo "Starting services on compute06 (206)..."
+    
+    # 终止占用端口的进程
+    echo "检查并终止占用端口的进程..."
+    kill_port_process 29600  # KV Cache 服务器端口
+    for port in $(seq 29500 29507); do
+        kill_port_process $port  # Worker进程端口
+    done
+    
+    # 启动 KV Cache 服务器，并传入模型路径
+    echo "Starting KV Cache Server with model loader..."
+    python -m ktransformers.kvcache_server \
+        --port 29600 \
+        --model_path $MODEL_PATH \
+        --gguf_path $GGUF_PATH &
+    sleep 5  # 等待KV Cache服务器和模型加载器启动
+    
+    # 启动worker进程，它们将从KV Cache服务器获取模型参数
+    echo "Starting Worker processes..."
+    for i in $(seq 0 7); do
+        worker_port=$((29500 + i))
+        echo "Starting Worker $i on port $worker_port..."
+        python -m ktransformers.worker \
+            --worker_address=10.21.22.206:$worker_port \
+            --worker_id=$i \
+            --num_workers=8 &
+    done
+```
+
+这个设计的主要优点：
+
+1. **集中式加载**：只有KVCache服务器负责加载模型参数，避免多个进程竞争GPU资源
+2. **按需加载**：层参数可以按需加载，不必一次性加载整个模型
+3. **参数共享**：所有worker进程共享相同的参数，减少内存使用
+4. **灵活性**：可以轻松扩展到更多worker，因为它们不直接加载模型
+
+这种设计将大大减少GPU内存使用，并解决当前遇到的CUDA内存不足问题。实现这个方案需要较大的重构，但会使系统更加稳定和可扩展。
+
+---
+
+_**User**_
+
+INFO:__main__:Running in distributed mode
+INFO:__main__:Connected to central server at localhost:29400
+INFO:__main__:Requesting model load from central server...
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/archive/liugu/ds/ktransformers/ktransformers/local_chat.py", line 197, in <module>
+    main()
+  File "/archive/liugu/ds/ktransformers/ktransformers/local_chat.py", line 139, in main
+    model.load_model(args.model_path, args.gguf_path)
+  File "/archive/liugu/ds/ktransformers/ktransformers/local_chat.py", line 54, in load_model
+    raise Exception(f"Failed to load model: {response.get('error')}")
+Exception: Failed to load model: None
+
+---
+
+_**User**_
+
+INFO:__main__:Running in distributed mode
+INFO:__main__:Connected to central server at localhost:29400
+INFO:__main__:Requesting model load from central server...
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/archive/liugu/ds/ktransformers/ktransformers/local_chat.py", line 197, in <module>
+    main()
+  File "/archive/liugu/ds/ktransformers/ktransformers/local_chat.py", line 139, in main
+    model.load_model(args.model_path, args.gguf_path)
+  File "/archive/liugu/ds/ktransformers/ktransformers/local_chat.py", line 54, in load_model
+    raise Exception(f"Failed to load model: {response.get('error')}")
+Exception: Failed to load model: None
+
+---
+
+_**Assistant**_
+
+<think>
+这个错误表明 local_chat.py 试图通过中央服务器加载模型，但遇到了问题。看起来是中央服务器无法正确处理来自 local_chat 的请求，返回了一个错误，但错误消息为 None。
+
+我需要检查以下几个方面：
+
+1. kvcache_client.py 需要添加新的命令支持
+2. central_server.py 需要正确处理请求并与worker通信
+3. local_chat.py 可能需要调整以适应新的架构
+
+让我思考怎么解决：
+</think>
+
+# 修复中央服务器和客户端通信问题
+
+您遇到的错误是因为我们改变了架构，但没有更新相应的客户端和中央服务器代码。让我们修复这些问题，使得整个系统能够正常工作：
+
+```python:ktransformers/kvcache_client.py
+def get_config(self):
+    """获取模型配置"""
+    message = {
+        'command': 'get_config'
+    }
+    self.socket.send_pyobj(message)
+    return self.socket.recv_pyobj()
+
+def get_tokenizer(self):
+    """获取tokenizer"""
+    message = {
+        'command': 'get_tokenizer'
+    }
+    self.socket.send_pyobj(message)
+    return self.socket.recv_pyobj()
+
+def get_layer_params(self, layer_index):
+    """获取特定层参数"""
+    message = {
+        'command': 'get_layer_params',
+        'layer_index': layer_index
+    }
+    self.socket.send_pyobj(message)
+    return self.socket.recv_pyobj()
+
+def get_shared_params(self):
+    """获取共享参数"""
+    message = {
+        'command': 'get_shared_params'
+    }
+    self.socket.send_pyobj(message)
+    return self.socket.recv_pyobj()
+```
+
+```python:ktransformers/central_server.py
+# 在load_model_on_workers中添加传递模型路径到KVCache服务器
+def load_model_on_workers(self, model_path: str, gguf_path: str):
+    """在所有worker上加载模型"""
+    logger.info(f"Loading model on all workers: {model_path}")
+    
+    # 首先通知KVCache服务器加载模型
+    try:
+        logger.info("通知KVCache服务器加载模型...")
+        self.kvcache_socket.send_pyobj({
+            'command': 'load_model',
+            'model_path': model_path,
+            'gguf_path': gguf_path
+        })
+        response = self.kvcache_socket.recv_pyobj()
+        if response['status'] != 'success':
+            logger.error(f"KVCache服务器加载模型失败: {response.get('error')}")
+            return False
+    except Exception as e:
+        logger.error(f"与KVCache服务器通信出错: {str(e)}")
+        return False
+    
+    # 然后通知所有worker
+    success = True
+    for addr, socket in self.workers:
+        try:
+            logger.info(f"Loading model on worker at {addr}...")
+            socket.send_pyobj({
+                'command': 'load_model',
+                'model_path': model_path,
+                'gguf_path': gguf_path
+            })
+            response = socket.recv_pyobj()
+            if response['status'] != 'success':
+                logger.error(f"Failed to load model on worker at {addr}: {response.get('error')}")
+                success = False
+        except Exception as e:
+            logger.error(f"Error communicating with worker at {addr}: {str(e)}")
+            success = False
+    
+    return success
+```
+
+```python:ktransformers/kvcache_server.py
+# 添加load_model命令处理
+elif command == 'load_model':
+    model_path = message['model_path']
+    gguf_path = message.get('gguf_path')
+    
+    # 初始化或重新初始化模型加载器
+    try:
+        from ktransformers.model_loader import ModelLoader
+        logger.info(f"初始化/重新初始化模型加载器，模型路径: {model_path}")
+        self.model_loader = ModelLoader(model_path, gguf_path)
+        success = self.model_loader.load_model()
+        
+        if success:
+            logger.info("模型加载器初始化完成")
+            self.socket.send_pyobj({'status': 'success'})
+        else:
+            logger.error("模型加载器初始化失败")
+            self.socket.send_pyobj({
+                'status': 'error',
+                'error': 'Failed to initialize model loader'
+            })
+    except Exception as
 
 ---
 

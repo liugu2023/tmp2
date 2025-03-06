@@ -39,6 +39,7 @@ class DistributedModel:
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.REQ)
         self.socket.connect(f"tcp://{server_address}")
+        self.distributed = True  # 添加这个属性
         logger.info(f"Connected to central server at {server_address}")
         
     def load_model(self, model_path: str, gguf_path: str = None) -> bool:

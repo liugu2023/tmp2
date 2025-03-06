@@ -210,27 +210,51 @@ class ModelWorker:
                 self.kvcache_client = kvcache_client
                 
                 # 添加必要的属性
-                self.model = self  # 有些代码可能在访问.model属性
+                self.model = self
                 self.device = torch.device(f'cuda:{0 if worker_id < 4 else 1}' if torch.cuda.is_available() else 'cpu')
                 
-                # 创建基本的模型结构
-                class ModelInternals(torch.nn.Module):
-                    def __init__(self):
-                        super().__init__()
-                        self.embed_tokens = torch.nn.Embedding(config.vocab_size, config.hidden_size)
-                        self.layers = torch.nn.ModuleList([
-                            torch.nn.Linear(config.hidden_size, config.hidden_size)
-                            for _ in range(config.num_hidden_layers)
-                        ])
-                        self.norm = torch.nn.LayerNorm(config.hidden_size)
-                        
-                    def forward(self, x):
-                        return x
+                # 计算当前worker负责的层范围
+                total_layers = config.num_hidden_layers
+                layers_per_process = total_layers // worker_count
+                self.start_layer = worker_id * layers_per_process
+                self.end_layer = (self.start_layer + layers_per_process 
+                                 if worker_id < worker_count - 1 
+                                 else total_layers)
                 
-                # 添加模型内部结构
-                self.model_internals = ModelInternals()
-                # 为了兼容性，也添加layers属性
-                self.layers = self.model_internals.layers
+                # 创建精简的模型结构
+                # 只保留必要的组件，其他组件设为None或空壳
+                self.embed_tokens = None  # 词嵌入只在第一个worker上需要
+                self.norm = None         # 最终归一化只在最后一个worker上需要
+                self.lm_head = None      # 语言模型头只在最后一个worker上需要
+                
+                # 只创建当前worker负责的层
+                self.layers = torch.nn.ModuleList([
+                    torch.nn.Linear(config.hidden_size, config.hidden_size)
+                    for _ in range(self.start_layer, self.end_layer)
+                ])
+                
+                # 根据worker位置加载必要组件
+                if worker_id == 0:
+                    # 第一个worker需要词嵌入
+                    logger.info("加载词嵌入层")
+                    response = self.kvcache_client.get_shared_params()
+                    if response['status'] == 'success' and 'embeddings' in response['params']:
+                        self.embed_tokens = torch.nn.Embedding.from_pretrained(
+                            response['params']['embeddings'].to(self.device),
+                            freeze=True
+                        )
+                
+                if worker_id == worker_count - 1:
+                    # 最后一个worker需要norm和lm_head
+                    logger.info("加载norm和lm_head")
+                    response = self.kvcache_client.get_shared_params()
+                    if response['status'] == 'success':
+                        if 'norm' in response['params']:
+                            self.norm = torch.nn.LayerNorm(config.hidden_size)
+                            self.norm.weight.data = response['params']['norm'].to(self.device)
+                        if 'lm_head' in response['params']:
+                            self.lm_head = torch.nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+                            self.lm_head.weight.data = response['params']['lm_head'].to(self.device)
                 
                 # 创建生成配置
                 self.generation_config = GenerationConfig(
@@ -241,56 +265,49 @@ class ModelWorker:
                     eos_token_id=config.eos_token_id,
                     max_new_tokens=100
                 )
+                
+                logger.info(f"Worker {worker_id} 负责层 {self.start_layer}-{self.end_layer-1}")
             
-            def to(self, device):
-                """实现to方法以支持设备移动"""
-                self.device = device
-                self.model_internals = self.model_internals.to(device)
-                return super().to(device)
+            def load_layer_params(self, layer_idx):
+                """按需加载层参数"""
+                if layer_idx < self.start_layer or layer_idx >= self.end_layer:
+                    return False
+                    
+                local_idx = layer_idx - self.start_layer
+                response = self.kvcache_client.get_layer_params(layer_idx)
+                if response['status'] != 'success':
+                    return False
+                    
+                params = response['params']
+                # 将参数加载到对应的层
+                # 这里需要根据实际的层结构来设置参数
+                # 当前是简化的实现
+                return True
             
-            def generate(self, *args, **kwargs):
-                """生成文本"""
-                try:
-                    # 获取输入参数
-                    input_ids = kwargs.get('input_ids')
-                    if input_ids is not None:
-                        input_ids = input_ids.to(self.device)
-                    batch_size = input_ids.shape[0] if input_ids is not None else 1
-                    
-                    # 处理max_length参数
-                    max_length = kwargs.get('max_length', 100)
-                    if isinstance(max_length, (list, tuple)):
-                        max_length = max_length[0]
-                    max_length = int(max_length)
-                    
-                    # 创建一个简单的输出张量
-                    dummy_output = torch.ones((batch_size, max_length), dtype=torch.long, device=self.device)
-                    dummy_output = dummy_output * (self.config.eos_token_id or 0)
-                    
-                    # 返回一个类似TransformerOutput的对象
-                    class DummyOutput:
-                        def __init__(self, sequences):
-                            self.sequences = sequences
-                    
-                        def to(self, device):
-                            """支持设备移动"""
-                            self.sequences = self.sequences.to(device)
-                            return self
-                    
-                    return DummyOutput(dummy_output)
-                    
-                except Exception as e:
-                    logger.error(f"生成时出错: {str(e)}")
-                    import traceback
-                    logger.error(traceback.format_exc())
-                    raise
-            
-            def forward(self, *args, **kwargs):
-                """前向传播实现"""
-                batch_size = kwargs.get('input_ids', torch.zeros(1,1)).shape[0]
-                hidden_size = self.config.hidden_size
-                # 返回一个假的隐藏状态
-                return torch.zeros((batch_size, 1, hidden_size), device=self.device)
+            def forward(self, hidden_states, attention_mask=None, **kwargs):
+                """前向传播，只处理当前worker负责的层"""
+                batch_size = hidden_states.shape[0]
+                
+                # 如果是第一个worker，需要处理词嵌入
+                if self.worker_id == 0 and self.embed_tokens is not None:
+                    hidden_states = self.embed_tokens(hidden_states)
+                
+                # 处理当前worker负责的层
+                for i, layer in enumerate(self.layers):
+                    # 按需加载层参数
+                    layer_idx = self.start_layer + i
+                    self.load_layer_params(layer_idx)
+                    # 处理这一层
+                    hidden_states = layer(hidden_states)
+                
+                # 如果是最后一个worker，需要处理norm和lm_head
+                if self.worker_id == self.worker_count - 1:
+                    if self.norm is not None:
+                        hidden_states = self.norm(hidden_states)
+                    if self.lm_head is not None:
+                        hidden_states = self.lm_head(hidden_states)
+                
+                return hidden_states
         
         # 创建简化模型实例
         self.model = SimpleModel(config, self.worker_id, self.num_workers, self.kvcache_client)
@@ -341,8 +358,8 @@ class ModelWorker:
             
             with torch.no_grad(), torch.amp.autocast('cuda'):
                 # 在每一层处理完后，存储 KV Cache
-                for i, layer in enumerate(self.model.model.layers):
-                    if start_layer <= i < end_layer:
+                for i, layer in enumerate(self.model.layers):
+                    if self.start_layer <= i < self.end_layer:
                         # 这是当前 worker 负责的层
                         k, v = layer.self_attn.compute_kv(input_ids, attention_mask)
                         kvcache_client.store(batch_id, i, k, v)

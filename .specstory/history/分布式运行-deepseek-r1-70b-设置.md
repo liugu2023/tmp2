@@ -9438,6 +9438,189 @@ _**Assistant**_
 
 
 
+看起来代码在尝试访问模型的 layers 属性。我们需要在 SimpleModel 中添加一个基本的模型结构。让我们修改 SimpleModel 类：
+
+```python:ktransformers/worker.py
+class SimpleModel(torch.nn.Module):
+    def __init__(self, config, worker_id, worker_count, kvcache_client):
+        super().__init__()
+        self.config = config
+        self.worker_id = worker_id
+        self.worker_count = worker_count
+        self.kvcache_client = kvcache_client
+        
+        # 添加必要的属性
+        self.model = self  # 有些代码可能在访问.model属性
+        self.device = torch.device(f'cuda:{0 if worker_id < 4 else 1}' if torch.cuda.is_available() else 'cpu')
+        
+        # 创建基本的模型结构
+        class ModelInternals(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed_tokens = torch.nn.Embedding(config.vocab_size, config.hidden_size)
+                self.layers = torch.nn.ModuleList([
+                    torch.nn.Linear(config.hidden_size, config.hidden_size)
+                    for _ in range(config.num_hidden_layers)
+                ])
+                self.norm = torch.nn.LayerNorm(config.hidden_size)
+                
+            def forward(self, x):
+                return x
+        
+        # 添加模型内部结构
+        self.model_internals = ModelInternals()
+        # 为了兼容性，也添加layers属性
+        self.layers = self.model_internals.layers
+        
+        # 创建生成配置
+        self.generation_config = GenerationConfig(
+            temperature=0.6,
+            top_p=0.9,
+            do_sample=True,
+            pad_token_id=config.pad_token_id or config.eos_token_id,
+            eos_token_id=config.eos_token_id,
+            max_new_tokens=100
+        )
+    
+    def to(self, device):
+        """实现to方法以支持设备移动"""
+        self.device = device
+        self.model_internals = self.model_internals.to(device)
+        return super().to(device)
+    
+    def generate(self, *args, **kwargs):
+        """生成文本"""
+        try:
+            # 获取输入参数
+            input_ids = kwargs.get('input_ids')
+            if input_ids is not None:
+                input_ids = input_ids.to(self.device)
+            batch_size = input_ids.shape[0] if input_ids is not None else 1
+            
+            # 处理max_length参数
+            max_length = kwargs.get('max_length', 100)
+            if isinstance(max_length, (list, tuple)):
+                max_length = max_length[0]
+            max_length = int(max_length)
+            
+            # 创建一个简单的输出张量
+            dummy_output = torch.ones((batch_size, max_length), dtype=torch.long, device=self.device)
+            dummy_output = dummy_output * (self.config.eos_token_id or 0)
+            
+            # 返回一个类似TransformerOutput的对象
+            class DummyOutput:
+                def __init__(self, sequences):
+                    self.sequences = sequences
+                
+                def to(self, device):
+                    """支持设备移动"""
+                    self.sequences = self.sequences.to(device)
+                    return self
+            
+            return DummyOutput(dummy_output)
+            
+        except Exception as e:
+            logger.error(f"生成时出错: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            raise
+    
+    def forward(self, *args, **kwargs):
+        """前向传播实现"""
+        batch_size = kwargs.get('input_ids', torch.zeros(1,1)).shape[0]
+        hidden_size = self.config.hidden_size
+        # 返回一个假的隐藏状态
+        return torch.zeros((batch_size, 1, hidden_size), device=self.device)
+```
+
+这个修改：
+
+1. 添加了一个内部的 ModelInternals 类来提供基本的模型结构
+2. 包含了必要的组件：embed_tokens、layers、norm
+3. 确保 layers 属性可以被访问
+4. 所有组件都支持设备移动
+
+这应该能解决 "no attribute 'layers'" 错误。请更新代码并重试。
+
+---
+
+_**User**_
+
+现在模型是怎么分配的
+
+---
+
+_**Assistant**_
+
+让我解释一下当前的模型分配方案：
+
+1. **层的分配**：
+```python
+# 计算每个进程应该处理的层
+total_layers = int(config_dict['num_hidden_layers'])  # 总层数
+layers_per_process = total_layers // self.num_workers  # 每个worker分配的层数
+start_layer = self.worker_id * layers_per_process     # 当前worker的起始层
+# 计算结束层
+if self.worker_id < self.num_workers - 1:
+    end_layer = start_layer + layers_per_process
+else:
+    end_layer = total_layers  # 最后一个worker处理剩余的所有层
+```
+
+2. **GPU分配**：
+```python
+gpu_id = 0 if self.worker_id < 4 else 1  # 前4个worker在GPU 0，后4个在GPU 1
+```
+
+3. **内存计算**：
+```python
+# KV缓存大小计算
+kv_size_per_layer = 2 * hidden_size * context_len * 2 / (1024**3)  # GB
+my_layers = end_layer - start_layer
+total_kv_cache = kv_size_per_layer * my_layers
+
+# 模型参数大小计算
+param_size_per_layer = (12 * hidden_dim * hidden_dim + 4 * hidden_dim * intermediate_dim) * 2 / (1024**3)
+base_model_size = param_size_per_layer * my_layers
+
+# 总内存预算
+final_memory_budget = total_kv_cache + base_model_size + workspace_size
+```
+
+具体分配示例（假设70层模型）：
+- Worker 0: 层 0-8 (GPU 0)
+- Worker 1: 层 9-17 (GPU 0)
+- Worker 2: 层 18-26 (GPU 0)
+- Worker 3: 层 27-35 (GPU 0)
+- Worker 4: 层 36-44 (GPU 1)
+- Worker 5: 层 45-53 (GPU 1)
+- Worker 6: 层 54-62 (GPU 1)
+- Worker 7: 层 63-69 (GPU 1)
+
+每个 worker 都创建了一个简化的模型结构（SimpleModel），包含：
+- embed_tokens：词嵌入层
+- layers：模型层（虽然目前是空的线性层）
+- norm：层归一化
+
+这个结构目前是一个占位符，实际的模型计算还没有实现。要完成分布式推理，我们还需要：
+1. 实现实际的层间通信
+2. 添加KV缓存管理
+3. 实现真实的Transformer层计算
+
+需要我帮你实现这些功能吗？
+
+---
+
+_**User**_
+
+不行，模型权重不能全加载到内存上，内存不够，选出一部分最重要的加载到显存上
+
+---
+
+_**Assistant**_
+
+
+
 ---
 
 

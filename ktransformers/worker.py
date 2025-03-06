@@ -411,10 +411,21 @@ class ModelWorker:
                 if self.worker_id == 0:
                     if self.model.embed_tokens is not None:
                         # 将输入转换为正确的数据类型
+                        # 确保input_ids有正确的形状
+                        logger.info(f"Input shape before embedding: {input_ids.shape}")
+                        
+                        # 如果是单一的token ID序列，增加batch维度
+                        if len(input_ids.shape) == 1:
+                            input_ids = input_ids.unsqueeze(0)
+                            
                         hidden_states = self.model.embed_tokens(input_ids)
                         hidden_states = hidden_states.to(dtype)
+                        
+                        # 记录嵌入后的形状
+                        logger.info(f"Embedding output shape: {hidden_states.shape}")
+                        
                         # 存储嵌入结果供其他worker使用
-                        cpu_hidden_states = hidden_states.cpu().numpy()  # 使用numpy而不是tolist
+                        cpu_hidden_states = hidden_states.cpu().numpy()
                         kvcache_client.store(batch_id, "embeddings", cpu_hidden_states)
                         logger.info(f"Stored embeddings with shape {hidden_states.shape}")
                 else:
@@ -444,12 +455,27 @@ class ModelWorker:
                 for layer_idx in range(self.model.start_layer, self.model.end_layer):
                     # 确保输入在正确的设备和数据类型上
                     hidden_states = hidden_states.to(device).to(dtype)
-                    # 获取当前层
-                    layer = self.model.layers[layer_idx - self.model.start_layer].to(device)
-                    # 记录形状以便调试
+                    
+                    # 记录当前层的输入形状
                     logger.info(f"Layer {layer_idx} input shape: {hidden_states.shape}")
-                    # 处理这一层
-                    hidden_states = layer(hidden_states)
+                    
+                    # 获取当前层
+                    local_idx = layer_idx - self.model.start_layer
+                    if local_idx >= len(self.model.layers):
+                        logger.error(f"Local index {local_idx} out of range for layers list (length {len(self.model.layers)})")
+                        raise IndexError(f"Layer index out of range: {local_idx}")
+                        
+                    layer = self.model.layers[local_idx].to(device)
+                    
+                    # 使用简化的前向传播，只进行线性变换
+                    if hasattr(layer, 'forward_simplified'):
+                        hidden_states = layer.forward_simplified(hidden_states)
+                    else:
+                        # 确保输入形状是三维的 [batch_size, seq_len, hidden_dim]
+                        if len(hidden_states.shape) == 2:
+                            hidden_states = hidden_states.unsqueeze(0)
+                        hidden_states = layer(hidden_states)
+                    
                     # 存储结果
                     cpu_hidden_states = hidden_states.cpu().numpy()
                     kvcache_client.store(batch_id, f"layer_{layer_idx}", cpu_hidden_states)

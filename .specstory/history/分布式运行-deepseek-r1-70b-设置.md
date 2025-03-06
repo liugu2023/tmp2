@@ -11318,7 +11318,47 @@ def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
             kvcache_client.clear(batch_id)
             
             # 确保输出在CPU上，以便序列化
-            hidden_states = hidden_
+            hidden_states = hidden_states.cpu().numpy()
+            
+            # 返回结果
+            return {
+                'status': 'success',
+                'output': hidden_states.tolist(),
+                'time_taken': time.time() - start_time
+            }
+            
+    except Exception as e:
+        logger.error(f"Generation error: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return {
+            'status': 'error',
+            'error': str(e)
+        }
+```
+
+主要修改：
+
+1. 在条件分支之前初始化 `hidden_states = input_ids`，确保变量总是被定义
+2. 添加了更多的错误检查和异常处理
+3. 添加了重试机制中的异常捕获
+4. 在各个关键点添加了额外的日志记录
+5. 添加了明确的检查，确保 `hidden_states` 在处理层之前已正确初始化
+
+这些修改应该能解决变量未初始化的问题，并提供更好的错误报告以便调试。
+
+---
+
+_**User**_
+
+ERROR:__main__:Error in generate: Generation failed: Worker 10.21.22.206:29500 error: mat1 and mat2 shapes cannot be multiplied (1x6 and 8192x8192)
+ERROR:__main__:Error: Generation failed: Worker 10.21.22.206:29500 error: mat1 and mat2 shapes cannot be multiplied (1x6 and 8192x8192)
+
+---
+
+_**Assistant**_
+
+
 
 ---
 

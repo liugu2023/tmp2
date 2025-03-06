@@ -189,6 +189,31 @@ class ModelWorker:
         self.context.term()
         logger.info(f"ModelWorker {self.worker_id} 已关闭")
     
+    def _store_data(self, batch_id, key, data):
+        """使用KVCacheClient存储数据的辅助方法，处理参数兼容性"""
+        # 兼容旧API
+        try:
+            # 创建一个空的张量作为v参数
+            empty_tensor = torch.zeros(1, dtype=torch.float32, device='cpu')
+            # 将数据放入k参数
+            self.kvcache_client.store(batch_id, key, data, empty_tensor)
+            return True
+        except Exception as e:
+            logger.error(f"存储数据时出错: {str(e)}")
+            return False
+    
+    def _retrieve_data(self, batch_id, key, device='cpu'):
+        """使用KVCacheClient检索数据的辅助方法，处理参数兼容性"""
+        try:
+            result = self.kvcache_client.retrieve(batch_id, key, device=device)
+            if isinstance(result, tuple) and len(result) == 2:
+                # 如果返回的是一个元组(k, v)，只取第一个元素
+                return result[0]
+            return result
+        except Exception as e:
+            logger.error(f"检索数据时出错: {str(e)}")
+            return None
+    
     def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
         """处理生成请求"""
         try:
@@ -235,7 +260,8 @@ class ModelWorker:
                         'hidden_shape': [int(x) for x in hidden_states.shape],
                         'completed': True
                     }
-                    self.kvcache_client.store(batch_id, "worker_0_status", status_info)
+                    # 使用辅助方法存储，以处理参数兼容性
+                    self._store_data(batch_id, f"worker_0_status", status_info)
                     
                 # 中间节点等待前一节点完成
                 elif self.worker_id > 0:
@@ -245,8 +271,8 @@ class ModelWorker:
                     
                     for i in range(10):  # 最多尝试10次
                         try:
-                            status = self.kvcache_client.retrieve(batch_id, f"worker_{prev_worker}_status")
-                            if status and status.get('completed'):
+                            status = self._retrieve_data(batch_id, f"worker_{prev_worker}_status")
+                            if status and isinstance(status, dict) and status.get('completed'):
                                 completed = True
                                 break
                         except Exception as e:
@@ -257,6 +283,13 @@ class ModelWorker:
                         logger.warning(f"无法确认前一worker {prev_worker} 已完成")
                 
                 # 完成当前worker的层处理
+                # 模拟层处理的过程
+                for layer_idx in range(self.start_layer, self.end_layer):
+                    logger.info(f"处理层 {layer_idx}")
+                    # 在实际实现中，应该加载并应用层参数
+                    time.sleep(0.01)  # 简单模拟处理时间
+                
+                # 记录完成状态
                 status_info = {
                     'worker_id': self.worker_id,
                     'layers': f"{self.start_layer}-{self.end_layer-1}",
@@ -270,7 +303,7 @@ class ModelWorker:
                 torch.cuda.empty_cache()
                 
                 # 存储此worker的状态
-                self.kvcache_client.store(batch_id, f"worker_{self.worker_id}_status", status_info)
+                self._store_data(batch_id, f"worker_{self.worker_id}_status", status_info)
             
             # 确保所有GPU操作完成
             torch.cuda.synchronize()

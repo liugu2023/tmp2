@@ -9769,7 +9769,160 @@ if worker_id == 0:
         params = response['params']
         if params and 'embeddings' in params and params['embeddings'] is not None:
             embeddings_tensor = params['embeddings']
-            # 确保是张量并且在正
+            # 确保是张量并且在正确的设备上
+            if isinstance(embeddings_tensor, torch.Tensor):
+                self.embed_tokens = torch.nn.Embedding.from_pretrained(
+                    embeddings_tensor.to(self.device),
+                    freeze=True
+                )
+                logger.info("词嵌入层加载成功")
+            else:
+                logger.warning("词嵌入参数不是张量类型")
+        else:
+            logger.warning("未找到词嵌入参数")
+    else:
+        logger.warning("获取共享参数失败或响应格式错误")
+
+if worker_id == worker_count - 1:
+    # 最后一个worker需要norm和lm_head
+    logger.info("加载norm和lm_head")
+    response = self.kvcache_client.get_shared_params()
+    if response['status'] == 'success' and 'params' in response:
+        params = response['params']
+        if params:
+            # 加载norm
+            if 'norm' in params and params['norm'] is not None:
+                norm_tensor = params['norm']
+                if isinstance(norm_tensor, torch.Tensor):
+                    self.norm = torch.nn.LayerNorm(config.hidden_size)
+                    self.norm.weight.data = norm_tensor.to(self.device)
+                    logger.info("norm层加载成功")
+                else:
+                    logger.warning("norm参数不是张量类型")
+            
+            # 加载lm_head
+            if 'lm_head' in params and params['lm_head'] is not None:
+                lm_head_tensor = params['lm_head']
+                if isinstance(lm_head_tensor, torch.Tensor):
+                    self.lm_head = torch.nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+                    self.lm_head.weight.data = lm_head_tensor.to(self.device)
+                    logger.info("lm_head加载成功")
+                else:
+                    logger.warning("lm_head参数不是张量类型")
+    else:
+        logger.warning("获取共享参数失败或响应格式错误")
+```
+
+这个修改：
+
+1. 添加了更多的错误检查
+2. 确保参数存在且是正确的类型
+3. 添加了详细的日志记录
+4. 优雅地处理参数缺失的情况
+
+同时，我们也应该检查 KVCache 服务器是否正确返回了参数。让我们检查一下 model_loader.py 中的 get_shared_params 方法：
+
+```python:ktransformers/model_loader.py
+def get_shared_params(self):
+    """获取共享参数(嵌入层、LM头等)"""
+    params = {
+        'embeddings': None,
+        'lm_head': None,
+        'norm': None
+    }
+    
+    try:
+        if 'embeddings' in self.loaded_layers:
+            params['embeddings'] = self.loaded_layers['embeddings']
+            logger.info("返回词嵌入参数")
+        
+        if 'lm_head' in self.loaded_layers:
+            params['lm_head'] = self.loaded_layers['lm_head']
+            logger.info("返回lm_head参数")
+        
+        if 'norm' in self.loaded_layers:
+            params['norm'] = self.loaded_layers['norm']
+            logger.info("返回norm参数")
+        
+        return {
+            'status': 'success',
+            'params': params
+        }
+    except Exception as e:
+        logger.error(f"获取共享参数时出错: {str(e)}")
+        return {
+            'status': 'error',
+            'error': str(e)
+        }
+```
+
+这样我们可以：
+
+1. 确保返回的参数格式正确
+2. 提供更好的错误处理
+3. 添加日志来帮助调试
+4. 即使某些参数不存在，也能正常工作
+
+请更新这些代码并重试。如果还有错误，日志会帮助我们找出具体问题。
+
+---
+
+_**User**_
+
+INFO:__main__:Received generation request
+INFO:__main__:Input sequence length: 1
+INFO:__main__:Moving input tensors to GPU...
+INFO:__main__:Received generation request
+INFO:__main__:Input sequence length: 1
+INFO:__main__:Moving input tensors to GPU...
+INFO:__main__:Received generation request
+INFO:__main__:Input sequence length: 1
+INFO:__main__:Moving input tensors to GPU...
+INFO:__main__:Received generation request
+INFO:__main__:Input sequence length: 1
+INFO:__main__:Moving input tensors to GPU...
+INFO:__main__:Received generation request
+INFO:__main__:Input sequence length: 1
+INFO:__main__:Moving input tensors to GPU...
+INFO:__main__:Received generation request
+INFO:__main__:Input sequence length: 1
+INFO:__main__:Moving input tensors to GPU...
+INFO:__main__:Received generation request
+INFO:__main__:Input sequence length: 1
+INFO:__main__:Moving input tensors to GPU...
+INFO:__main__:Received generation request
+INFO:__main__:Input sequence length: 1
+INFO:__main__:Moving input tensors to GPU...
+INFO:__main__:Generation parameters: max_new_tokens=50, temperature=0.7, top_p=0.9
+INFO:__main__:Starting text generation...
+INFO:__main__:Generation parameters: max_new_tokens=50, temperature=0.7, top_p=0.9
+INFO:__main__:Starting text generation...
+INFO:__main__:Generation parameters: max_new_tokens=50, temperature=0.7, top_p=0.9
+INFO:__main__:Starting text generation...
+ERROR:__main__:Generation error: 'ModelWorker' object has no attribute 'start_layer'
+ERROR:__main__:Generation error: 'ModelWorker' object has no attribute 'start_layer'
+ERROR:__main__:Generation error: 'ModelWorker' object has no attribute 'start_layer'
+INFO:__main__:Generation parameters: max_new_tokens=50, temperature=0.7, top_p=0.9
+INFO:__main__:Starting text generation...
+ERROR:__main__:Generation error: 'ModelWorker' object has no attribute 'start_layer'
+INFO:__main__:Generation parameters: max_new_tokens=50, temperature=0.7, top_p=0.9
+INFO:__main__:Starting text generation...
+ERROR:__main__:Generation error: 'ModelWorker' object has no attribute 'start_layer'
+INFO:__main__:Generation parameters: max_new_tokens=50, temperature=0.7, top_p=0.9
+INFO:__main__:Starting text generation...
+INFO:__main__:Generation parameters: max_new_tokens=50, temperature=0.7, top_p=0.9
+INFO:__main__:Starting text generation...
+ERROR:__main__:Generation error: 'ModelWorker' object has no attribute 'start_layer'
+ERROR:__main__:Generation error: 'ModelWorker' object has no attribute 'start_layer'
+INFO:__main__:Generation parameters: max_new_tokens=50, temperature=0.7, top_p=0.9
+INFO:__main__:Starting text generation...
+ERROR:__main__:Generation error: 'ModelWorker' object has no attribute 'start_layer'
+
+---
+
+_**Assistant**_
+
+
 
 ---
 

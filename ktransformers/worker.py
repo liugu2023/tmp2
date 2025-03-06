@@ -315,28 +315,33 @@ class ModelWorker:
             
             def forward(self, hidden_states, attention_mask=None, **kwargs):
                 """前向传播，只处理当前worker负责的层"""
-                batch_size = hidden_states.shape[0]
+                try:
+                    # 如果是第一个worker，需要处理词嵌入
+                    if self.worker_id == 0 and self.embed_tokens is not None:
+                        hidden_states = self.embed_tokens(hidden_states)
+                    
+                    # 处理当前worker负责的层
+                    for i, layer in enumerate(self.layers):
+                        # 按需加载层参数
+                        layer_idx = self.start_layer + i
+                        self.load_layer_params(layer_idx)
+                        # 处理这一层
+                        hidden_states = layer(hidden_states)
+                    
+                    # 如果是最后一个worker，需要处理norm和lm_head
+                    if self.worker_id == self.worker_count - 1:
+                        if self.norm is not None:
+                            hidden_states = self.norm(hidden_states)
+                        if self.lm_head is not None:
+                            hidden_states = self.lm_head(hidden_states)
+                    
+                    return hidden_states
                 
-                # 如果是第一个worker，需要处理词嵌入
-                if self.worker_id == 0 and self.embed_tokens is not None:
-                    hidden_states = self.embed_tokens(hidden_states)
-                
-                # 处理当前worker负责的层
-                for i, layer in enumerate(self.layers):
-                    # 按需加载层参数
-                    layer_idx = self.start_layer + i
-                    self.load_layer_params(layer_idx)
-                    # 处理这一层
-                    hidden_states = layer(hidden_states)
-                
-                # 如果是最后一个worker，需要处理norm和lm_head
-                if self.worker_id == self.worker_count - 1:
-                    if self.norm is not None:
-                        hidden_states = self.norm(hidden_states)
-                    if self.lm_head is not None:
-                        hidden_states = self.lm_head(hidden_states)
-                
-                return hidden_states
+                except Exception as e:
+                    logger.error(f"Forward pass error: {str(e)}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+                    raise
         
         # 创建简化模型实例
         self.model = SimpleModel(config, self.worker_id, self.num_workers, self.kvcache_client)
@@ -388,87 +393,32 @@ class ModelWorker:
             with torch.no_grad(), torch.amp.autocast('cuda'):
                 # 在每一层处理完后，存储 KV Cache
                 for i, layer in enumerate(self.model.layers):
-                    if self.start_layer <= i < self.end_layer:
+                    if i >= self.model.start_layer and i < self.model.end_layer:
                         # 这是当前 worker 负责的层
-                        k, v = layer.self_attn.compute_kv(input_ids, attention_mask)
-                        kvcache_client.store(batch_id, i, k, v)
+                        hidden_states = layer(input_ids)
+                        # 存储中间结果
+                        kvcache_client.store(batch_id, i, hidden_states)
                     else:
                         # 需要从其他 worker 获取的层
-                        k, v = kvcache_client.retrieve(batch_id, i, f"cuda:{gpu_id}")
-                        if k is not None and v is not None:
-                            # 使用获取的 KV Cache 继续处理
-                            layer.self_attn.use_cached_kv(k, v)
+                        hidden_states = kvcache_client.retrieve(batch_id, i)
+                        if hidden_states is not None:
+                            # 使用获取的中间结果继续处理
+                            input_ids = hidden_states
                 
                 # 生成完成后清理缓存
                 kvcache_client.clear(batch_id)
                 
-                # 创建自定义流式处理器
-                class StreamingHandler:
-                    def __init__(self, socket, tokenizer):
-                        self.socket = socket
-                        self.tokenizer = tokenizer
-                        self.current_text = ""
-                        self.last_send_time = time.time()
-                        
-                    def __call__(self, text_chunk: str, stream_end: bool = False):
-                        current_time = time.time()
-                        self.current_text += text_chunk
-                        
-                        # 每0.5秒或结束时发送一次
-                        if stream_end or (current_time - self.last_send_time) > 0.5:
-                            self.socket.send_pyobj({
-                                'status': 'streaming',
-                                'text': self.current_text,
-                                'finished': stream_end
-                            })
-                            # 等待客户端确认
-                            self.socket.recv_pyobj()
-                            self.last_send_time = current_time
-                
-                # 创建流式处理器
-                streamer = self.CustomStreamer(
-                    self.tokenizer,
-                    on_text_chunk=StreamingHandler(self.socket, self.tokenizer),
-                    skip_prompt=True,
-                    skip_special_tokens=True
-                )
-                
-                outputs = self.model.generate(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    max_new_tokens=max_new_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    do_sample=input_data.get('do_sample', True),
-                    streamer=streamer
-                )
-                
-                # 记录生成完成的信息
-                final_time = time.time()
-                total_gen_time = final_time - start_time
-                logger.info("  - Generation completed:")
-                logger.info(f"    - Total generation time: {total_gen_time:.2f} seconds")
-                logger.info(f"    - Final sequence length: {len(outputs[0])} tokens")
-                logger.info(f"    - New tokens generated: {len(outputs[0]) - len(input_ids[0])}")
-                logger.info(f"    - Average speed: {(len(outputs[0]) - len(input_ids[0])) / total_gen_time:.2f} tokens/sec")
+                # 返回结果
+                return {
+                    'status': 'success',
+                    'output': hidden_states.tolist(),
+                    'time_taken': time.time() - start_time
+                }
             
-            end_time = time.time()
-            generation_time = end_time - start_time
-            tokens_generated = len(outputs[0]) - len(input_ids[0])
-            tokens_per_second = tokens_generated / generation_time
-            
-            logger.info(f"Generation completed in {generation_time:.2f} seconds")
-            logger.info(f"Tokens generated: {tokens_generated}")
-            logger.info(f"Generation speed: {tokens_per_second:.2f} tokens/second")
-            logger.info(f"Final sequence length: {len(outputs[0])}")
-            
-            # 最终返回完整的 token ids
-            return {
-                'status': 'success',
-                'output_ids': outputs.cpu().numpy().tolist()
-            }
         except Exception as e:
             logger.error(f"Generation error: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
             return {
                 'status': 'error',
                 'error': str(e)

@@ -175,6 +175,9 @@ class ModelWorker:
         logger.info(f"- Estimated workspace: {workspace_size:.2f} GB")
         logger.info(f"- Total GPU memory budget: {gpu_mem} GB")
         
+        # 设置GPU ID
+        gpu_id = 0 if self.worker_id < 4 else 1
+        
         # 设置内存分配
         max_memory = {
             0: f"{gpu_mem}GiB" if self.worker_id < 4 else None,    # 前4个进程使用 GPU 0

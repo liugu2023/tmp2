@@ -6820,7 +6820,488 @@ AttributeError: Can't pickle local object 'add_hook_to_module.<locals>.new_forwa
 
 _**Assistant**_
 
+<think>
+我看到问题了。错误显示："Can't pickle local object 'add_hook_to_module.<locals>.new_forward'"。
 
+这是一个典型的 Python 多进程中的 pickling 错误。我们试图在进程间共享 PyTorch 模型层，但这些层包含无法序列化的对象，如闭包或本地函数。
+
+解决方案是放弃共享层的尝试，让每个 worker 单独加载自己的层，不再尝试将层放入共享字典中。我们应该修改 model_sharder.py 和 worker.py。
+</think>
+
+# 修复序列化问题
+
+看起来程序启动时遇到了一个序列化问题。错误是 "Can't pickle local object 'add_hook_to_module.<locals>.new_forward'"，这是由于我们尝试在进程间共享模型层，但 PyTorch 模型包含无法被 pickle 的闭包函数。
+
+让我们修改代码，去掉共享层的功能：
+
+```python:ktransformers/worker.py
+def load_model(self, model_path: str, gguf_path: str):
+    # 如果有共享组件，使用共享组件
+    if self.shared_components:
+        logger.info("Using shared model components...")
+        config = self.shared_components['config']
+        self.tokenizer = AutoTokenizer.from_pretrained(self.shared_components['tokenizer_path'], trust_remote_code=True)
+    else:
+        # 否则正常加载
+        logger.info("Loading tokenizer...")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        
+        logger.info("Loading model config...")
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    
+    torch.set_default_dtype(config.torch_dtype)
+    
+    # 计算每个进程应该处理的层
+    total_layers = config.num_hidden_layers
+    layers_per_process = total_layers // self.num_workers
+    start_layer = self.worker_id * layers_per_process
+    end_layer = start_layer + layers_per_process if self.worker_id < self.num_workers - 1 else total_layers
+    
+    # 内存计算部分保持不变...
+    
+    # 创建一个空模型结构
+    class PartialModel(torch.nn.Module):
+        def __init__(self, config):
+            super().__init__()
+            self.config = config
+            # 创建必要的属性结构
+            self.model = torch.nn.Module()
+            self.model.embed_tokens = None
+            self.model.layers = torch.nn.ModuleList()
+            self.model.norm = None
+            self.lm_head = None
+            # 添加设备映射属性以避免错误
+            self.hf_device_map = {}
+    
+    # 初始化模型
+    self.model = PartialModel(config)
+    
+    # 添加共享的embedding层
+    self.model.model.embed_tokens = self.shared_components['embed_tokens']
+    self.model.lm_head = self.shared_components['lm_head']
+    
+    # 确保模型结构完整
+    for i in range(config.num_hidden_layers):
+        self.model.model.layers.append(None)  # 占位
+    
+    # 单独加载最终归一化层，而不是加载整个模型
+    logger.info("Loading normalization layer...")
+    try:
+        # 创建一个空的LayerNorm
+        self.model.model.norm = torch.nn.LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.model.model.norm.to('cpu')
+    except Exception as e:
+        logger.error(f"Error creating norm layer: {str(e)}")
+        raise
+    
+    # 只加载本worker需要处理的层，不再尝试共享
+    for i in range(start_layer, end_layer):
+        logger.info(f"Loading layer {i} to cuda:{gpu_id}...")
+        
+        try:
+            # 为所有层创建meta设备映射
+            temp_device_map = {'model.embed_tokens': 'meta', 'lm_head': 'meta', 'model.norm': 'meta'}
+            for j in range(config.num_hidden_layers):
+                if j == i:
+                    # 当前加载的层用GPU
+                    temp_device_map[f'model.layers.{j}'] = f'cuda:{gpu_id}'
+                else:
+                    # 其他所有层用meta设备
+                    temp_device_map[f'model.layers.{j}'] = 'meta'
+            
+            logger.info(f"Loading layer with device map: {temp_device_map}")
+            
+            # 加载模型的指定层
+            layer_model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                config=config,
+                trust_remote_code=True,
+                device_map=temp_device_map,
+                torch_dtype=torch.float16,
+                low_cpu_mem_usage=True
+            )
+            
+            # 获取层并添加到我们的模型中，不再添加到共享字典
+            self.model.model.layers[i] = layer_model.model.layers[i]
+            
+            # 清除不需要的内容，释放内存
+            del layer_model
+            torch.cuda.empty_cache()
+            
+        except Exception as e:
+            logger.error(f"Error loading layer {i}: {str(e)}")
+            raise
+```
+
+```python:ktransformers/model_sharder.py
+# 修改SharedModelComponents类，去掉loaded_layers
+
+class SharedModelComponents:
+    """用于在多个进程间共享模型组件的类"""
+    def __init__(self, model_path: str):
+        # 保持不变...
+        
+        # 删除以下内容:
+        # self.manager = mp.Manager()
+        # self.loaded_layers = self.manager.dict()
+    
+    def get_components(self):
+        """获取所有共享组件"""
+        return {
+            'tokenizer_path': self.tokenizer_path,
+            'config': self.config,
+            'embed_tokens': self.embed_tokens,
+            'lm_head': self.lm_head
+            # 删除 'loaded_layers': self.loaded_layers
+        }
+```
+
+这个修改将:
+1. 去掉在工作进程之间共享层的尝试
+2. 让每个工作进程单独加载并维护自己负责的层
+3. 只共享嵌入层和LM head，这些是可以安全序列化的
+
+请重启服务器脚本尝试这个修改。
+
+---
+
+_**User**_
+
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/archive/liugu/ds/ktransformers/ktransformers/kvcache_server.py", line 98, in <module>
+    main()
+    ^^^^^^
+  File "/archive/liugu/ds/ktransformers/ktransformers/kvcache_server.py", line 94, in main
+    server = KVCacheServer(args.port)
+             ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ktransformers/ktransformers/kvcache_server.py", line 14, in __init__
+    self.socket.bind(f"tcp://0.0.0.0:{port}")
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/zmq/sugar/socket.py", line 317, in bind
+    super().bind(addr)
+  File "_zmq.py", line 917, in zmq.backend.cython._zmq.Socket.bind
+  File "_zmq.py", line 179, in zmq.backend.cython._zmq._check_rc
+zmq.error.ZMQError: Address already in use (addr='tcp://0.0.0.0:29600')
+
+---
+
+_**Assistant**_
+
+<think>
+看起来我们运行脚本时遇到了一个ZMQ端口已被占用的错误。这通常意味着之前运行的服务还没有完全关闭，或者有另一个进程正在使用相同的端口。
+
+错误信息显示KV Cache服务器无法绑定到端口29600，因为该端口已经被使用。
+
+我们有几种选择来解决这个问题：
+
+1. 找到并终止使用该端口的进程
+2. 修改脚本以使用不同的端口
+3. 添加逻辑来优雅地处理端口冲突情况
+
+让我们提供一个解决方案，包括终止现有进程的方法和修改脚本以支持更灵活的端口使用。
+</think>
+
+# 解决端口冲突问题
+
+看起来KV Cache服务器无法启动，因为端口29600已经被使用。这可能是因为之前的服务没有正确关闭。让我们修复这个问题：
+
+## 解决方案1：先终止占用端口的进程
+
+```bash:kill_existing_processes.sh
+#!/bin/bash
+
+# 终止使用特定端口的进程
+kill_port_process() {
+    port=$1
+    pid=$(lsof -t -i:$port)
+    if [ ! -z "$pid" ]; then
+        echo "终止使用端口 $port 的进程 (PID: $pid)..."
+        kill -9 $pid
+    else
+        echo "端口 $port 没有被占用"
+    fi
+}
+
+# 终止占用关键端口的进程
+kill_port_process 29600  # KV Cache 服务器
+for port in $(seq 29500 29507); do
+    kill_port_process $port  # Worker进程
+done
+kill_port_process 29400  # 中央服务器
+
+# 清理所有Python进程(谨慎使用)
+# pkill -9 python
+```
+
+## 解决方案2：修改KV Cache服务器添加端口重试逻辑
+
+```python:ktransformers/kvcache_server.py
+import zmq
+import torch
+import logging
+from typing import Dict, Any
+import numpy as np
+import time
+import random
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class KVCacheServer:
+    def __init__(self, port: int = 29600, max_retries: int = 5):
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.REP)
+        
+        # 尝试绑定端口，如果失败则重试
+        self.port = port
+        retry_count = 0
+        bound = False
+        
+        while not bound and retry_count < max_retries:
+            try:
+                self.socket.bind(f"tcp://0.0.0.0:{self.port}")
+                bound = True
+                logger.info(f"KV Cache Server 成功绑定到端口 {self.port}")
+            except zmq.error.ZMQError as e:
+                retry_count += 1
+                logger.warning(f"端口 {self.port} 被占用，尝试重新绑定... ({retry_count}/{max_retries})")
+                if retry_
+
+---
+
+_**User**_
+
+(ds) root@compute06:/archive/liugu/ds/ktransformers# ./start_service.sh
+Starting services on compute06 (206)...
+Starting KV Cache Server...
+Starting Model Sharder...
+INFO:__main__:KV Cache Server started on port 29600
+INFO:__main__:Loading shared model components...
+INFO:__main__:Loading model config...
+INFO:__main__:Loading embedding and lm_head weights...
+INFO:__main__:Created shared embedding layer with dim=8192, vocab_size=128256
+INFO:__main__:Shared model components loaded and ready
+INFO:__main__:Started 8 worker processes
+INFO:ktransformers.worker:Worker 1 using GPU 1
+INFO:ktransformers.worker:Worker 0 using GPU 0
+INFO:ktransformers.worker:Worker 4 using GPU 0
+INFO:ktransformers.worker:Worker 3 using GPU 1
+INFO:ktransformers.worker:Worker 1 started at 10.21.22.206:29501, listening on all interfaces
+INFO:ktransformers.worker:Using shared model components...
+INFO:ktransformers.worker:Worker 2 using GPU 0
+INFO:ktransformers.worker:Worker 0 started at 10.21.22.206:29500, listening on all interfaces
+INFO:ktransformers.worker:Using shared model components...
+INFO:ktransformers.worker:Worker 4 started at 10.21.22.206:29504, listening on all interfaces
+INFO:ktransformers.worker:Worker 6 using GPU 0
+INFO:ktransformers.worker:Using shared model components...
+INFO:ktransformers.worker:Worker 7 using GPU 1
+INFO:ktransformers.worker:Worker 3 started at 10.21.22.206:29503, listening on all interfaces
+INFO:ktransformers.worker:Using shared model components...
+INFO:ktransformers.worker:Worker 5 using GPU 1
+INFO:ktransformers.worker:Worker 2 started at 10.21.22.206:29502, listening on all interfaces
+INFO:ktransformers.worker:Using shared model components...
+INFO:ktransformers.worker:Worker 6 started at 10.21.22.206:29506, listening on all interfaces
+INFO:ktransformers.worker:Using shared model components...
+INFO:ktransformers.worker:Worker 7 started at 10.21.22.206:29507, listening on all interfaces
+INFO:ktransformers.worker:Using shared model components...
+INFO:ktransformers.worker:Worker 5 started at 10.21.22.206:29505, listening on all interfaces
+INFO:ktransformers.worker:Using shared model components...
+INFO:ktransformers.worker:Worker 3 memory calculation:
+INFO:ktransformers.worker:- Hidden size: 8192
+INFO:ktransformers.worker:- Context length: 8192
+INFO:ktransformers.worker:- KV cache per layer: 0.25 GB
+INFO:ktransformers.worker:- Layer parameters: 3.25 GB per layer
+INFO:ktransformers.worker:- Handling 10 layers: from 30 to 39
+INFO:ktransformers.worker:- Estimated KV cache: 2.50 GB
+INFO:ktransformers.worker:- Estimated model parameters: 32.50 GB
+INFO:ktransformers.worker:- Estimated workspace: 1.00 GB
+INFO:ktransformers.worker:- Total GPU memory budget: 37 GB
+INFO:ktransformers.worker:Loading normalization layer...
+Process Process-4:
+Traceback (most recent call last):
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/archive/liugu/ds/ktransformers/ktransformers/model_sharder.py", line 154, in start_worker
+    worker.load_model(model_path, gguf_path)
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 222, in load_model
+    logger.info(f"Loading layer {i} to cuda:{gpu_id}...")
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnboundLocalError: cannot access local variable 'gpu_id' where it is not associated with a value
+INFO:ktransformers.worker:Worker 7 memory calculation:
+INFO:ktransformers.worker:- Hidden size: 8192
+INFO:ktransformers.worker:- Context length: 8192
+INFO:ktransformers.worker:- KV cache per layer: 0.25 GB
+INFO:ktransformers.worker:- Layer parameters: 3.25 GB per layer
+INFO:ktransformers.worker:- Handling 10 layers: from 70 to 79
+INFO:ktransformers.worker:- Estimated KV cache: 2.50 GB
+INFO:ktransformers.worker:- Estimated model parameters: 32.50 GB
+INFO:ktransformers.worker:- Estimated workspace: 1.00 GB
+INFO:ktransformers.worker:- Total GPU memory budget: 37 GB
+INFO:ktransformers.worker:Loading normalization layer...
+Process Process-8:
+Traceback (most recent call last):
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/archive/liugu/ds/ktransformers/ktransformers/model_sharder.py", line 154, in start_worker
+    worker.load_model(model_path, gguf_path)
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 222, in load_model
+    logger.info(f"Loading layer {i} to cuda:{gpu_id}...")
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnboundLocalError: cannot access local variable 'gpu_id' where it is not associated with a value
+INFO:ktransformers.worker:Worker 4 memory calculation:
+INFO:ktransformers.worker:- Hidden size: 8192
+INFO:ktransformers.worker:- Context length: 8192
+INFO:ktransformers.worker:- KV cache per layer: 0.25 GB
+INFO:ktransformers.worker:- Layer parameters: 3.25 GB per layer
+INFO:ktransformers.worker:- Handling 10 layers: from 40 to 49
+INFO:ktransformers.worker:- Estimated KV cache: 2.50 GB
+INFO:ktransformers.worker:- Estimated model parameters: 32.50 GB
+INFO:ktransformers.worker:- Estimated workspace: 1.00 GB
+INFO:ktransformers.worker:- Total GPU memory budget: 37 GB
+INFO:ktransformers.worker:Loading normalization layer...
+Process Process-5:
+Traceback (most recent call last):
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/archive/liugu/ds/ktransformers/ktransformers/model_sharder.py", line 154, in start_worker
+    worker.load_model(model_path, gguf_path)
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 222, in load_model
+    logger.info(f"Loading layer {i} to cuda:{gpu_id}...")
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnboundLocalError: cannot access local variable 'gpu_id' where it is not associated with a value
+INFO:ktransformers.worker:Worker 6 memory calculation:
+INFO:ktransformers.worker:Worker 0 memory calculation:
+INFO:ktransformers.worker:- Hidden size: 8192
+INFO:ktransformers.worker:- Hidden size: 8192
+INFO:ktransformers.worker:- Context length: 8192
+INFO:ktransformers.worker:- Context length: 8192
+INFO:ktransformers.worker:- KV cache per layer: 0.25 GB
+INFO:ktransformers.worker:- KV cache per layer: 0.25 GB
+INFO:ktransformers.worker:- Layer parameters: 3.25 GB per layer
+INFO:ktransformers.worker:- Layer parameters: 3.25 GB per layer
+INFO:ktransformers.worker:- Handling 10 layers: from 0 to 9
+INFO:ktransformers.worker:- Handling 10 layers: from 60 to 69
+INFO:ktransformers.worker:- Estimated KV cache: 2.50 GB
+INFO:ktransformers.worker:- Estimated KV cache: 2.50 GB
+INFO:ktransformers.worker:- Estimated model parameters: 32.50 GB
+INFO:ktransformers.worker:- Estimated model parameters: 32.50 GB
+INFO:ktransformers.worker:- Estimated workspace: 1.00 GB
+INFO:ktransformers.worker:- Estimated workspace: 1.00 GB
+INFO:ktransformers.worker:- Total GPU memory budget: 37 GB
+INFO:ktransformers.worker:- Total GPU memory budget: 37 GB
+INFO:ktransformers.worker:Worker 2 memory calculation:
+INFO:ktransformers.worker:- Hidden size: 8192
+INFO:ktransformers.worker:- Context length: 8192
+INFO:ktransformers.worker:- KV cache per layer: 0.25 GB
+INFO:ktransformers.worker:- Layer parameters: 3.25 GB per layer
+INFO:ktransformers.worker:- Handling 10 layers: from 20 to 29
+INFO:ktransformers.worker:- Estimated KV cache: 2.50 GB
+INFO:ktransformers.worker:- Estimated model parameters: 32.50 GB
+INFO:ktransformers.worker:- Estimated workspace: 1.00 GB
+INFO:ktransformers.worker:- Total GPU memory budget: 37 GB
+INFO:ktransformers.worker:Loading normalization layer...
+INFO:ktransformers.worker:Loading normalization layer...
+INFO:ktransformers.worker:Loading normalization layer...
+Process Process-7:
+Process Process-1:
+Process Process-3:
+INFO:ktransformers.worker:Worker 5 memory calculation:
+INFO:ktransformers.worker:- Hidden size: 8192
+INFO:ktransformers.worker:- Context length: 8192
+Traceback (most recent call last):
+Traceback (most recent call last):
+INFO:ktransformers.worker:- KV cache per layer: 0.25 GB
+INFO:ktransformers.worker:- Layer parameters: 3.25 GB per layer
+INFO:ktransformers.worker:- Handling 10 layers: from 50 to 59
+INFO:ktransformers.worker:- Estimated KV cache: 2.50 GB
+INFO:ktransformers.worker:- Estimated model parameters: 32.50 GB
+INFO:ktransformers.worker:- Estimated workspace: 1.00 GB
+INFO:ktransformers.worker:- Total GPU memory budget: 37 GB
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/archive/liugu/ds/ktransformers/ktransformers/model_sharder.py", line 154, in start_worker
+    worker.load_model(model_path, gguf_path)
+  File "/archive/liugu/ds/ktransformers/ktransformers/model_sharder.py", line 154, in start_worker
+    worker.load_model(model_path, gguf_path)
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 222, in load_model
+    logger.info(f"Loading layer {i} to cuda:{gpu_id}...")
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 222, in load_model
+    logger.info(f"Loading layer {i} to cuda:{gpu_id}...")
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnboundLocalError: cannot access local variable 'gpu_id' where it is not associated with a value
+UnboundLocalError: cannot access local variable 'gpu_id' where it is not associated with a value
+Traceback (most recent call last):
+INFO:ktransformers.worker:Worker 1 memory calculation:
+INFO:ktransformers.worker:- Hidden size: 8192
+INFO:ktransformers.worker:- Context length: 8192
+INFO:ktransformers.worker:- KV cache per layer: 0.25 GB
+INFO:ktransformers.worker:- Layer parameters: 3.25 GB per layer
+INFO:ktransformers.worker:- Handling 10 layers: from 10 to 19
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/archive/liugu/ds/ktransformers/ktransformers/model_sharder.py", line 154, in start_worker
+    worker.load_model(model_path, gguf_path)
+INFO:ktransformers.worker:- Estimated KV cache: 2.50 GB
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 222, in load_model
+    logger.info(f"Loading layer {i} to cuda:{gpu_id}...")
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnboundLocalError: cannot access local variable 'gpu_id' where it is not associated with a value
+INFO:ktransformers.worker:- Estimated model parameters: 32.50 GB
+INFO:ktransformers.worker:- Estimated workspace: 1.00 GB
+INFO:ktransformers.worker:- Total GPU memory budget: 37 GB
+INFO:ktransformers.worker:Loading normalization layer...
+INFO:ktransformers.worker:Loading normalization layer...
+Process Process-6:
+Traceback (most recent call last):
+Process Process-2:
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/archive/liugu/ds/ktransformers/ktransformers/model_sharder.py", line 154, in start_worker
+    worker.load_model(model_path, gguf_path)
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 222, in load_model
+    logger.info(f"Loading layer {i} to cuda:{gpu_id}...")
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnboundLocalError: cannot access local variable 'gpu_id' where it is not associated with a value
+Traceback (most recent call last):
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/archive/liugu/ds/ktransformers/ktransformers/model_sharder.py", line 154, in start_worker
+    worker.load_model(model_path, gguf_path)
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 222, in load_model
+    logger.info(f"Loading layer {i} to cuda:{gpu_id}...")
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnboundLocalError: cannot access local variable 'gpu_id' where it is not associated with a value
+
+---
+
+_**Assistant**_
+
+<think>
+我们需要修复 `worker.py` 文件中的 `load_model` 函数，因为它尝试访问一个未定义的变量 `gpu_id`。这个 `gpu_id` 变量应该是在每个工作进程根据其 `worker_id` 来确定使用哪个 GPU。
+
+在我们提供的代码中，有这样一段：
+```python
+#
 
 ---
 

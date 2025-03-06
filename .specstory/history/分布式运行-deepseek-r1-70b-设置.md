@@ -14650,6 +14650,110 @@ TypeError: argument 'ids': 'list' object cannot be interpreted as an integer
 
 _**Assistant**_
 
+<think>
+错误表明 `tokenizer.decode()` 方法在尝试解码时遇到了类型问题。特别是它期望接收整数或整数列表，但接收到了嵌套列表（即列表的列表）。
+
+根据错误消息：
+```
+TypeError: argument 'ids': 'list' object cannot be interpreted as an integer
+```
+
+这表明 `output_ids.tolist()` 可能返回的是嵌套列表，而不是单一的整数列表。
+
+当我们调用 `output_ids.tolist()` 时，如果 `output_ids` 是一个多维张量，那么 `.tolist()` 会保留嵌套结构。例如，如果 `output_ids` 的形状是 `[1, n]`（batch size 为 1），那么 `.tolist()` 会返回一个列表的列表：`[[id1, id2, ..., idn]]`。
+
+我们需要修改代码，确保传递给 `tokenizer.decode()` 的是一个简单的整数列表，而不是嵌套列表。
+</think>
+
+我们需要修复嵌套列表问题，确保传给`tokenizer.decode()`的是一维整数列表：
+
+```python:ktransformers/local_chat.py
+def generate(self, input_ids, attention_mask, **kwargs):
+    """生成文本"""
+    try:
+        # 准备请求数据
+        generate_data = {
+            'input_ids': input_ids,
+            'attention_mask': attention_mask
+        }
+        # 添加其他生成参数
+        generate_data.update(kwargs)
+        
+        # 发送生成请求
+        response = self._send_command('generate', generate_data)
+        
+        if response.get('status') != 'success':
+            error_msg = response.get('error', 'Unknown error')
+            print(f"生成失败: {error_msg}")
+            return []
+        
+        # 获取输出token IDs
+        output_ids = response.get('output_ids', [])
+        
+        print("生成成功!")
+        # 修复: 使用长度检查而不是直接用张量作为布尔值
+        if isinstance(output_ids, torch.Tensor):
+            has_outputs = len(output_ids) > 0
+        else:
+            has_outputs = bool(output_ids)
+            
+        if has_outputs:
+            # 确保输出为列表，以便切片操作安全
+            if isinstance(output_ids, torch.Tensor):
+                # 修复: 确保转换为一维列表
+                output_ids_list = output_ids.tolist()
+                if isinstance(output_ids_list, list) and isinstance(output_ids_list[0], list):
+                    # 处理嵌套列表情况 [[id1, id2, ...]]
+                    output_ids_list = output_ids_list[0]
+                output_preview = output_ids_list[:10]
+            else:
+                # 处理已经是列表的情况
+                output_ids_list = output_ids
+                if isinstance(output_ids_list, list) and len(output_ids_list) > 0 and isinstance(output_ids_list[0], list):
+                    # 处理嵌套列表
+                    output_ids_list = output_ids_list[0]
+                output_preview = output_ids_list[:10]
+                
+            print(f"生成的tokens: {output_preview}...")
+            
+            # 安全地检查tokenizer属性
+            tokenizer = getattr(self, 'tokenizer', None)
+            if tokenizer is not None:
+                try:
+                    # 使用已展平的一维列表进行解码
+                    output_text = tokenizer.decode(output_ids_list)
+                    print(f"\n生成的文本:\n{output_text}\n")
+                except Exception as e:
+                    print(f"\n解码文本时出错: {str(e)}")
+                    print(f"Token IDs: {output_ids_list}\n")
+            else:
+                print("\n无法解码文本: tokenizer不可用\n")
+        else:
+            print("警告: 未收到任何生成的tokens")
+        
+        return output_ids
+```
+
+主要修改：
+
+1. 统一处理`output_ids`，确保它转换为一维列表
+2. 添加对嵌套列表的检测和展平处理 
+3. 添加更详细的异常处理，打印出实际的token IDs以便调试
+4. 使用同一个展平后的`output_ids_list`变量进行后续操作
+
+这个修改应该能够解决嵌套列表导致的`decode()`方法错误。
+
+---
+
+_**User**_
+
+生成的文本:
+<｜begin▁of▁sentence｜><｜User｜>你好<｜Assistant｜><think>请使用模型进行推理，而不是将我输入的文本进行添加文字后重新输出
+
+---
+
+_**Assistant**_
+
 
 
 ---

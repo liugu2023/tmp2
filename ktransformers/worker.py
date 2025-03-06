@@ -238,23 +238,52 @@ class ModelWorker:
                     # 第一个worker需要词嵌入
                     logger.info("加载词嵌入层")
                     response = self.kvcache_client.get_shared_params()
-                    if response['status'] == 'success' and 'embeddings' in response['params']:
-                        self.embed_tokens = torch.nn.Embedding.from_pretrained(
-                            response['params']['embeddings'].to(self.device),
-                            freeze=True
-                        )
+                    if response['status'] == 'success' and 'params' in response:
+                        params = response['params']
+                        if params and 'embeddings' in params and params['embeddings'] is not None:
+                            embeddings_tensor = params['embeddings']
+                            # 确保是张量并且在正确的设备上
+                            if isinstance(embeddings_tensor, torch.Tensor):
+                                self.embed_tokens = torch.nn.Embedding.from_pretrained(
+                                    embeddings_tensor.to(self.device),
+                                    freeze=True
+                                )
+                                logger.info("词嵌入层加载成功")
+                            else:
+                                logger.warning("词嵌入参数不是张量类型")
+                        else:
+                            logger.warning("未找到词嵌入参数")
+                    else:
+                        logger.warning("获取共享参数失败或响应格式错误")
                 
                 if worker_id == worker_count - 1:
                     # 最后一个worker需要norm和lm_head
                     logger.info("加载norm和lm_head")
                     response = self.kvcache_client.get_shared_params()
-                    if response['status'] == 'success':
-                        if 'norm' in response['params']:
-                            self.norm = torch.nn.LayerNorm(config.hidden_size)
-                            self.norm.weight.data = response['params']['norm'].to(self.device)
-                        if 'lm_head' in response['params']:
-                            self.lm_head = torch.nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-                            self.lm_head.weight.data = response['params']['lm_head'].to(self.device)
+                    if response['status'] == 'success' and 'params' in response:
+                        params = response['params']
+                        if params:
+                            # 加载norm
+                            if 'norm' in params and params['norm'] is not None:
+                                norm_tensor = params['norm']
+                                if isinstance(norm_tensor, torch.Tensor):
+                                    self.norm = torch.nn.LayerNorm(config.hidden_size)
+                                    self.norm.weight.data = norm_tensor.to(self.device)
+                                    logger.info("norm层加载成功")
+                                else:
+                                    logger.warning("norm参数不是张量类型")
+                            
+                            # 加载lm_head
+                            if 'lm_head' in params and params['lm_head'] is not None:
+                                lm_head_tensor = params['lm_head']
+                                if isinstance(lm_head_tensor, torch.Tensor):
+                                    self.lm_head = torch.nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+                                    self.lm_head.weight.data = lm_head_tensor.to(self.device)
+                                    logger.info("lm_head加载成功")
+                                else:
+                                    logger.warning("lm_head参数不是张量类型")
+                    else:
+                        logger.warning("获取共享参数失败或响应格式错误")
                 
                 # 创建生成配置
                 self.generation_config = GenerationConfig(

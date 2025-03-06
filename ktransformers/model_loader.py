@@ -144,8 +144,32 @@ class ModelLoader:
         
     def get_shared_params(self):
         """获取共享参数(嵌入层、LM头等)"""
-        return {
-            'embeddings': self.loaded_layers.get('embeddings'),
-            'lm_head': self.loaded_layers.get('lm_head'),
-            'norm': self.loaded_layers.get('norm')
-        } 
+        params = {
+            'embeddings': None,
+            'lm_head': None,
+            'norm': None
+        }
+        
+        try:
+            if 'embeddings' in self.loaded_layers:
+                params['embeddings'] = self.loaded_layers['embeddings']
+                logger.info("返回词嵌入参数")
+            
+            if 'lm_head' in self.loaded_layers:
+                params['lm_head'] = self.loaded_layers['lm_head']
+                logger.info("返回lm_head参数")
+            
+            if 'norm' in self.loaded_layers:
+                params['norm'] = self.loaded_layers['norm']
+                logger.info("返回norm参数")
+            
+            return {
+                'status': 'success',
+                'params': params
+            }
+        except Exception as e:
+            logger.error(f"获取共享参数时出错: {str(e)}")
+            return {
+                'status': 'error',
+                'error': str(e)
+            } 

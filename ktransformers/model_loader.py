@@ -22,6 +22,13 @@ class ModelLoader:
         
         # 加载配置并转换为字典
         config = AutoConfig.from_pretrained(self.model_path, trust_remote_code=True)
+        
+        # 处理token_id可能是列表的情况
+        def safe_int_convert(value):
+            if isinstance(value, (list, tuple)):
+                return int(value[0]) if value else None
+            return int(value) if value is not None else None
+        
         # 将配置转换为可序列化的字典，确保所有值都是基本类型
         self.config = {
             'architectures': list(config.architectures),  # 确保是列表
@@ -32,9 +39,9 @@ class ModelLoader:
             'num_attention_heads': int(config.num_attention_heads),  # 确保是整数
             'max_position_embeddings': int(config.max_position_embeddings),  # 确保是整数
             'torch_dtype': str(config.torch_dtype),  # 转换为字符串
-            'pad_token_id': int(config.pad_token_id) if config.pad_token_id is not None else None,
-            'bos_token_id': int(config.bos_token_id) if config.bos_token_id is not None else None,
-            'eos_token_id': int(config.eos_token_id) if config.eos_token_id is not None else None,
+            'pad_token_id': safe_int_convert(config.pad_token_id),
+            'bos_token_id': safe_int_convert(config.bos_token_id),
+            'eos_token_id': safe_int_convert(config.eos_token_id),
             'vocab_size': int(config.vocab_size)  # 确保是整数
         }
         

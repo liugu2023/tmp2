@@ -9136,7 +9136,94 @@ def load_model(self, model_path: str, gguf_path: str):
     if self.worker_id < self.num_workers - 1:
         end_layer = start_layer + layers_per_process
     else:
-        end_layer
+        end_layer = total_layers
+    
+    # 确保所有数值都是整数
+    start_layer = int(start_layer)
+    end_layer = int(end_layer)
+    
+    # 动态计算所需显存
+    hidden_size = int(config_dict['hidden_size'])  # 确保是整数
+    # 假设最大上下文长度为8K
+    context_len = 8192
+    # 每层KV Cache = 2 * hidden_size * context_len * dtype_size (float16=2B)
+    kv_size_per_layer = 2 * hidden_size * context_len * 2 / (1024**3)  # 单位：GB
+    # 当前worker负责的层数
+    my_layers = end_layer - start_layer
+    # 预估KV缓存显存
+    total_kv_cache = kv_size_per_layer * my_layers
+    # 每层模型参数估算 (单位: GB)
+    hidden_dim = hidden_size
+    intermediate_dim = int(config_dict.get('intermediate_size', 4 * hidden_dim))  # 确保是整数
+    param_size_per_layer = (12 * hidden_dim * hidden_dim + 4 * hidden_dim * intermediate_dim) * 2 / (1024**3)
+    base_model_size = param_size_per_layer * my_layers
+    # 工作空间估算 (1GB)
+    workspace_size = 1.0
+    # 最终显存预算
+    final_memory_budget = total_kv_cache + base_model_size + workspace_size
+    # 取整并加上安全余量
+    gpu_mem = max(3, int(final_memory_budget) + 1)
+    
+    # ... 后面的代码保持不变 ...
+```
+
+这个修改：
+
+1. 确保从配置字典中获取的值都转换为整数
+2. 避免使用条件表达式计算 end_layer，改用 if-else 语句
+3. 明确转换所有用于计算的数值为整数类型
+
+同时，让我们在 model_loader.py 中确保返回的配置值都是基本类型：
+
+```python:ktransformers/model_loader.py
+def load_model(self):
+    """加载模型配置和tokenizer"""
+    logger.info(f"加载模型配置和tokenizer: {self.model_path}")
+    
+    # 加载配置并转换为字典
+    config = AutoConfig.from_pretrained(self.model_path, trust_remote_code=True)
+    # 将配置转换为可序列化的字典，确保所有值都是基本类型
+    self.config = {
+        'architectures': list(config.architectures),  # 确保是列表
+        'model_type': str(config.model_type),  # 确保是字符串
+        'num_hidden_layers': int(config.num_hidden_layers),  # 确保是整数
+        'hidden_size': int(config.hidden_size),  # 确保是整数
+        'intermediate_size': int(getattr(config, 'intermediate_size', 4 * config.hidden_size)),  # 确保是整数
+        'num_attention_heads': int(config.num_attention_heads),  # 确保是整数
+        'max_position_embeddings': int(config.max_position_embeddings),  # 确保是整数
+        'torch_dtype': str(config.torch_dtype),  # 转换为字符串
+        'pad_token_id': int(config.pad_token_id) if config.pad_token_id is not None else None,
+        'bos_token_id': int(config.bos_token_id) if config.bos_token_id is not None else None,
+        'eos_token_id': int(config.eos_token_id) if config.eos_token_id is not None else None,
+        'vocab_size': int(config.vocab_size)  # 确保是整数
+    }
+    
+    # ... 其余代码保持不变 ...
+```
+
+这些修改应该能解决类型比较的问题。请更新这些文件并重试。
+
+---
+
+_**User**_
+
+INFO:__main__:初始化模型加载器，模型路径: /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B
+INFO:ktransformers.model_loader:加载模型配置和tokenizer: /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/archive/liugu/ds/ktransformers/ktransformers/kvcache_server.py", line 206, in <module>
+    main()
+    ^^^^^^
+  File "/archive/liugu/ds/ktransformers/ktransformers/kvcache_server.py", line 202, in main
+    server = KVCacheServer(args.port, model_path=args.model_path, gguf_path=args.gguf_path)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ktransformers/ktransformers/kvcache_server.py", line 45, in __init__
+    self.model_loader.load_model()
+  File "/archive/liugu/ds/ktransformers/ktransformers/model_loader.py", line 37, in load_model
+    'eos_token_id': int(config.eos_token_id) if config.eos_token_id is not None else None,
+                    ^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: int() argument must be a string, a bytes-like object or a real number, not 'list'
 
 ---
 

@@ -14198,6 +14198,21 @@ def process_client_message(self, message: Dict[str, Any]) -> Dict[str, Any]:
 
 ---
 
+_**User**_
+
+INFO:__main__:请求加载模型: /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/, GGUF: /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/
+INFO:__main__:当前工作目录: /archive/liugu/ds/ktransformers
+INFO:__main__:模型加载成功这是kvcache、服务器的输出；正在加载模型: /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/
+使用GGUF模型: /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/这是客户端的输出，卡在这里了
+
+---
+
+_**Assistant**_
+
+
+
+---
+
 
 
 ---

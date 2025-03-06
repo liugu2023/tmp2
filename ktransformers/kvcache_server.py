@@ -3,15 +3,33 @@ import torch
 import logging
 from typing import Dict, Any
 import numpy as np
+import time
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class KVCacheServer:
-    def __init__(self, port: int = 29600):
+    def __init__(self, port: int = 29600, max_retries: int = 5):
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.REP)
-        self.socket.bind(f"tcp://0.0.0.0:{port}")
+        
+        # 尝试绑定端口，如果失败则重试
+        self.port = port
+        retry_count = 0
+        bound = False
+        
+        while not bound and retry_count < max_retries:
+            try:
+                self.socket.bind(f"tcp://0.0.0.0:{self.port}")
+                bound = True
+                logger.info(f"KV Cache Server 成功绑定到端口 {self.port}")
+            except zmq.error.ZMQError as e:
+                retry_count += 1
+                logger.warning(f"端口 {self.port} 被占用，尝试重新绑定... ({retry_count}/{max_retries})")
+                if retry_count >= max_retries:
+                    logger.error(f"无法绑定到端口 {self.port}，请手动终止占用该端口的进程")
+                    raise
+                time.sleep(1)
         
         # 存储 KV Cache
         # {batch_id: {layer_id: {'k': tensor, 'v': tensor}}}

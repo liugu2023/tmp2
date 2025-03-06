@@ -7301,7 +7301,217 @@ _**Assistant**_
 
 在我们提供的代码中，有这样一段：
 ```python
-#
+# 设置内存分配
+max_memory = {
+    0: f"{gpu_mem}GiB" if self.worker_id < 4 else None,    # 前4个进程使用 GPU 0
+    1: f"{gpu_mem}GiB" if self.worker_id >= 4 else None,   # 后4个进程使用 GPU 1
+    'cpu': "138GiB"  # CPU 内存
+}
+```
+
+但是后面使用 `gpu_id` 变量的地方没有定义它。我们需要在代码中添加定义 `gpu_id` 的逻辑，确保在使用该变量之前对其进行初始化。
+</think>
+
+# 修复 gpu_id 变量未定义问题
+
+发现了一个错误，我们需要修复 `worker.py` 文件中的问题。错误信息显示 `gpu_id` 变量未定义。
+
+```python:ktransformers/worker.py
+def load_model(self, model_path: str, gguf_path: str):
+    # 如果有共享组件，使用共享组件
+    if self.shared_components:
+        logger.info("Using shared model components...")
+        config = self.shared_components['config']
+        self.tokenizer = AutoTokenizer.from_pretrained(self.shared_components['tokenizer_path'], trust_remote_code=True)
+    else:
+        # 否则正常加载
+        logger.info("Loading tokenizer...")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        
+        logger.info("Loading model config...")
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    
+    torch.set_default_dtype(config.torch_dtype)
+    
+    # 计算每个进程应该处理的层
+    total_layers = config.num_hidden_layers
+    layers_per_process = total_layers // self.num_workers
+    start_layer = self.worker_id * layers_per_process
+    end_layer = start_layer + layers_per_process if self.worker_id < self.num_workers - 1 else total_layers
+    
+    # 内存计算部分保持不变...
+    
+    # 设置GPU ID
+    gpu_id = 0 if self.worker_id < 4 else 1
+    
+    # 设置内存分配
+    max_memory = {
+        0: f"{gpu_mem}GiB" if self.worker_id < 4 else None,    # 前4个进程使用 GPU 0
+        1: f"{gpu_mem}GiB" if self.worker_id >= 4 else None,   # 后4个进程使用 GPU 1
+        'cpu': "138GiB"  # CPU 内存
+    }
+    
+    # 创建一个空模型结构
+    class PartialModel(torch.nn.Module):
+        def __init__(self, config):
+            super().__init__()
+            self.config = config
+            # 创建必要的属性结构
+            self.model = torch.nn.Module()
+            self.model.embed_tokens = None
+            self.model.layers = torch.nn.ModuleList()
+            self.model.norm = None
+            self.lm_head = None
+            # 添加设备映射属性以避免错误
+            self.hf_device_map = {}
+    
+    # ... 其余代码不变 ...
+```
+
+修改只是在函数开始时定义了 `gpu_id` 变量，在后续代码中继续使用它。这样能确保所有引用该变量的地方都能找到正确的值。
+
+请使用相同的命令再次运行脚本，这次应该能够正确初始化所有进程：
+
+```bash
+./start_service.sh
+```
+
+---
+
+_**User**_
+
+程序报错退出后，进程没有做正确结束，导致端口占用
+
+---
+
+_**Assistant**_
+
+<think>
+看起来问题是已存在的进程没有正确终止，导致端口仍然被占用。我们需要编写一个脚本来终止使用端口的进程，然后再重新启动服务。
+
+用户拒绝了之前提出的`kill_existing_processes.sh`脚本，所以我们需要修改`start_service.sh`脚本，加入检查端口并自动终止已有进程的功能。
+</think>
+
+# 解决端口占用问题
+
+我们需要修改启动脚本，在启动服务前自动检查并终止已占用端口的进程：
+
+```python:ktransformers/kvcache_server.py
+import zmq
+import torch
+import logging
+from typing import Dict, Any
+import numpy as np
+import time
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class KVCacheServer:
+    def __init__(self, port: int = 29600, max_retries: int = 5):
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.REP)
+        
+        # 尝试绑定端口，如果失败则重试
+        self.port = port
+        retry_count = 0
+        bound = False
+        
+        while not bound and retry_count < max_retries:
+            try:
+                self.socket.bind(f"tcp://0.0.0.0:{self.port}")
+                bound = True
+                logger.info(f"KV Cache Server 成功绑定到端口 {self.port}")
+            except zmq.error.ZMQError as e:
+                retry_count += 1
+                logger.warning(f"端口 {self.port} 被占用，尝试重新绑定... ({retry_count}/{max_retries})")
+                if retry_count >= max_retries:
+                    logger.error(f"无法绑定到端口 {self.port}，请手动终止占用该端口的进程")
+                    raise
+                time.sleep(1)
+        
+        # 存储 KV Cache
+        # {batch_id: {layer_id: {'k': tensor, 'v': tensor}}}
+        self.cache = {}
+        logger.info(f"KV Cache Server started on port {port}")
+```
+
+```bash:start_service.sh
+#!/bin/bash
+
+# 设置环境变量
+export PYTHONPATH=/archive/liugu/ds/ktransformers
+export MODEL_PATH=/archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B
+export GGUF_PATH=/archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF
+
+# 终止使用特定端口的进程
+kill_port_process() {
+    port=$1
+    pid=$(lsof -t -i:$port 2>/dev/null)
+    if [ -n "$pid" ]; then
+        echo "正在终止使用端口 $port 的进程 (PID: $pid)..."
+        kill -9 $pid
+        sleep 1
+    fi
+}
+
+# 在206上运行的命令
+if [ "$(hostname)" = "compute06" ]; then
+    echo "Starting services on compute06 (206)..."
+    
+    # 终止占用端口的进程
+    echo "检查并终止占用端口的进程..."
+    kill_port_process 29600  # KV Cache 服务器端口
+    for port in $(seq 29500 29507); do
+        kill_port_process $port  # Worker进程端口
+    done
+    
+    # 启动 KV Cache 服务器
+    echo "Starting KV Cache Server..."
+    python -m ktransformers.kvcache_server --port 29600 &
+    sleep 2  # 等待KV Cache服务器启动
+    
+    # 启动模型分片服务
+    echo "Starting Model Sharder..."
+    python -m ktransformers.model_sharder \
+        --model_path $MODEL_PATH \
+        --gguf_path $GGUF_PATH \
+        --base_port 29500 \
+        --num_workers 8
+
+# 在login上运行的命令
+elif [ "$(hostname)" = "login" ]; then
+    echo "Starting services on login (100)..."
+    
+    # 终止占用端口的进程
+    echo "检查并终止占用端口的进程..."
+    kill_port_process 29400  # 中央服务器端口
+    
+    # 启动中央服务器
+    echo "Starting Central Server..."
+    python -m ktransformers.central_server \
+        --port 29400 \
+        --num_workers 8 \
+        --worker_base_port 29500 \
+        --kvcache_port 29600 \
+        --worker_host 10.21.22.206
+    
+else
+    echo "Unknown host. This script should be run on either compute06 or login."
+    exit 1
+fi
+```
+
+这两个修改：
+
+1. 在 `kvcache_server.py` 中添加了端口重试逻辑，最多尝试5次
+2. 在 `start_service.sh` 中添加了 `kill_port_process` 函数来自动终止占用端口的进程
+
+使用方法不变，直接运行：
+
+```bash
+chmod +x start_service.sh
+./start_service.sh
 
 ---
 

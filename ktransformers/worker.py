@@ -316,6 +316,11 @@ class ModelWorker:
             def forward(self, hidden_states, attention_mask=None, **kwargs):
                 """前向传播，只处理当前worker负责的层"""
                 try:
+                    # 确保输入在正确的设备上
+                    hidden_states = hidden_states.to(self.device)
+                    if attention_mask is not None:
+                        attention_mask = attention_mask.to(self.device)
+                    
                     # 如果是第一个worker，需要处理词嵌入
                     if self.worker_id == 0 and self.embed_tokens is not None:
                         hidden_states = self.embed_tokens(hidden_states)
@@ -325,14 +330,18 @@ class ModelWorker:
                         # 按需加载层参数
                         layer_idx = self.start_layer + i
                         self.load_layer_params(layer_idx)
+                        # 确保层在正确的设备上
+                        layer = layer.to(self.device)
                         # 处理这一层
                         hidden_states = layer(hidden_states)
                     
                     # 如果是最后一个worker，需要处理norm和lm_head
                     if self.worker_id == self.worker_count - 1:
                         if self.norm is not None:
+                            self.norm = self.norm.to(self.device)
                             hidden_states = self.norm(hidden_states)
                         if self.lm_head is not None:
+                            self.lm_head = self.lm_head.to(self.device)
                             hidden_states = self.lm_head(hidden_states)
                     
                     return hidden_states
@@ -369,8 +378,9 @@ class ModelWorker:
             
             # 创建输入张量
             logger.info("Moving input tensors to GPU...")
-            input_ids = torch.tensor(input_data['input_ids'], device='cuda')
-            attention_mask = torch.tensor(input_data['attention_mask'], device='cuda')
+            device = self.model.device  # 使用模型的设备
+            input_ids = torch.tensor(input_data['input_ids'], device=device)
+            attention_mask = torch.tensor(input_data['attention_mask'], device=device)
             
             # 生成参数日志
             max_new_tokens = input_data.get('max_new_tokens', 512)
@@ -391,22 +401,29 @@ class ModelWorker:
             batch_id = f"{time.time()}_{self.worker_id}"
             
             with torch.no_grad(), torch.amp.autocast('cuda'):
+                hidden_states = input_ids  # 初始化隐藏状态
+                
                 # 在每一层处理完后，存储 KV Cache
                 for i, layer in enumerate(self.model.layers):
                     if i >= self.model.start_layer and i < self.model.end_layer:
                         # 这是当前 worker 负责的层
-                        hidden_states = layer(input_ids)
+                        # 确保输入在正确的设备上
+                        hidden_states = hidden_states.to(device)
+                        hidden_states = layer(hidden_states)
                         # 存储中间结果
                         kvcache_client.store(batch_id, i, hidden_states)
                     else:
                         # 需要从其他 worker 获取的层
-                        hidden_states = kvcache_client.retrieve(batch_id, i)
-                        if hidden_states is not None:
-                            # 使用获取的中间结果继续处理
-                            input_ids = hidden_states
+                        hidden_states = kvcache_client.retrieve(batch_id, i, device=device)
+                        if hidden_states is None:
+                            logger.error(f"Failed to retrieve hidden states for layer {i}")
+                            raise RuntimeError(f"Failed to retrieve hidden states for layer {i}")
                 
                 # 生成完成后清理缓存
                 kvcache_client.clear(batch_id)
+                
+                # 确保输出在CPU上，以便序列化
+                hidden_states = hidden_states.cpu()
                 
                 # 返回结果
                 return {

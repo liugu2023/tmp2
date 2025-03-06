@@ -19,7 +19,26 @@ class ModelLoader:
     def load_model(self):
         """加载模型配置和tokenizer"""
         logger.info(f"加载模型配置和tokenizer: {self.model_path}")
-        self.config = AutoConfig.from_pretrained(self.model_path, trust_remote_code=True)
+        
+        # 加载配置并转换为字典
+        config = AutoConfig.from_pretrained(self.model_path, trust_remote_code=True)
+        # 将配置转换为可序列化的字典
+        self.config = {
+            'architectures': config.architectures,
+            'model_type': config.model_type,
+            'num_hidden_layers': config.num_hidden_layers,
+            'hidden_size': config.hidden_size,
+            'intermediate_size': getattr(config, 'intermediate_size', 4 * config.hidden_size),
+            'num_attention_heads': config.num_attention_heads,
+            'max_position_embeddings': config.max_position_embeddings,
+            'torch_dtype': str(config.torch_dtype),
+            'pad_token_id': config.pad_token_id,
+            'bos_token_id': config.bos_token_id,
+            'eos_token_id': config.eos_token_id,
+            'vocab_size': config.vocab_size
+        }
+        
+        # 加载tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_path, trust_remote_code=True)
         
         # 加载嵌入层和规范化层

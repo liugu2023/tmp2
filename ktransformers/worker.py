@@ -121,7 +121,22 @@ class ModelWorker:
             logger.error("获取模型配置失败")
             raise RuntimeError("Failed to get model config")
         
-        config = response['config']
+        # 从字典创建配置对象
+        config_dict = response['config']
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        # 更新配置
+        for key, value in config_dict.items():
+            if hasattr(config, key):
+                if key == 'torch_dtype':
+                    # 处理torch_dtype
+                    if value == 'torch.float16':
+                        setattr(config, key, torch.float16)
+                    elif value == 'torch.float32':
+                        setattr(config, key, torch.float32)
+                    else:
+                        setattr(config, key, torch.float32)  # 默认
+                else:
+                    setattr(config, key, value)
         
         # 获取tokenizer
         logger.info("从KVCache服务器获取tokenizer")
@@ -194,26 +209,37 @@ class ModelWorker:
                 )
                 
             def generate(self, *args, **kwargs):
-                # 简化处理，返回一个有意义的结果
-                input_ids = kwargs.get('input_ids')
-                batch_size = input_ids.shape[0] if input_ids is not None else 1
-                max_length = kwargs.get('max_length', 100)
-                
-                # 确保max_length是整数，不是列表
-                if isinstance(max_length, list):
-                    max_length = max_length[0]  # 取第一个元素
-                
-                # 创建一个简单的输出张量
-                device = input_ids.device if input_ids is not None else 'cpu'
-                # 只返回一些简单标记，不要尝试生成复杂内容
-                dummy_output = torch.ones((batch_size, 10), dtype=torch.long, device=device) * self.config.eos_token_id
-                
-                # 返回一个可能看起来像TransformerOutput的对象
-                class DummyOutput:
-                    def __init__(self, sequences):
-                        self.sequences = sequences
-                
-                return DummyOutput(dummy_output)
+                """生成文本"""
+                try:
+                    # 获取输入参数
+                    input_ids = kwargs.get('input_ids')
+                    batch_size = input_ids.shape[0] if input_ids is not None else 1
+                    
+                    # 处理max_length参数
+                    max_length = kwargs.get('max_length', 100)
+                    # 如果max_length是列表，取第一个值
+                    if isinstance(max_length, (list, tuple)):
+                        max_length = max_length[0]
+                    # 确保max_length是整数
+                    max_length = int(max_length)
+                    
+                    # 创建一个简单的输出张量
+                    device = input_ids.device if input_ids is not None else 'cpu'
+                    # 只返回一些简单标记，不要尝试生成复杂内容
+                    dummy_output = torch.ones((batch_size, max_length), dtype=torch.long, device=device) * self.config.eos_token_id
+                    
+                    # 返回一个类似TransformerOutput的对象
+                    class DummyOutput:
+                        def __init__(self, sequences):
+                            self.sequences = sequences
+                    
+                    return DummyOutput(dummy_output)
+                    
+                except Exception as e:
+                    logger.error(f"生成时出错: {str(e)}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+                    raise
                 
             def forward(self, *args, **kwargs):
                 # 空实现

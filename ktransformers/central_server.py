@@ -83,59 +83,76 @@ class CentralServer:
     
     def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
         """处理生成请求"""
-        batch_id = f"batch_{time.time()}"
-        self.active_batches[batch_id] = {
-            'worker_responses': [None] * len(self.workers),
-            'completed': False,
-            'result': None,
-            'streaming_text': ""
-        }
-        
-        # 向所有worker发送生成请求
-        for i, (addr, socket) in enumerate(self.workers):
-            message = {
-                'command': 'generate',
-                'data': {
-                    **input_data,
-                    'batch_id': batch_id
-                }
-            }
-            socket.send_pyobj(message)
+        try:
+            # 确保max_length是整数
+            if 'max_length' in input_data:
+                max_length = input_data['max_length']
+                if isinstance(max_length, (list, tuple)):
+                    max_length = max_length[0]
+                input_data['max_length'] = int(max_length)
             
-            # 启动线程接收流式输出
-            thread = threading.Thread(
-                target=self._handle_worker_response,
-                args=(i, addr, socket, batch_id)
-            )
-            thread.daemon = True
-            thread.start()
+            batch_id = f"batch_{time.time()}"
+            self.active_batches[batch_id] = {
+                'worker_responses': [None] * len(self.workers),
+                'completed': False,
+                'result': None,
+                'streaming_text': ""
+            }
+            
+            # 向所有worker发送生成请求
+            for i, (addr, socket) in enumerate(self.workers):
+                message = {
+                    'command': 'generate',
+                    'data': {
+                        **input_data,
+                        'batch_id': batch_id
+                    }
+                }
+                socket.send_pyobj(message)
+                
+                # 启动线程接收流式输出
+                thread = threading.Thread(
+                    target=self._handle_worker_response,
+                    args=(i, addr, socket, batch_id)
+                )
+                thread.daemon = True
+                thread.start()
+            
+            # 等待所有worker完成
+            while not self.active_batches[batch_id]['completed']:
+                # 发送流式响应给客户端
+                current_text = self.active_batches[batch_id]['streaming_text']
+                if current_text:
+                    self.client_socket.send_pyobj({
+                        'status': 'streaming',
+                        'text': current_text,
+                        'finished': False
+                    })
+                    # 等待客户端确认
+                    self.client_socket.recv_pyobj()
+                time.sleep(0.1)
+            
+            # 清理KV缓存
+            self.kvcache_socket.send_pyobj({
+                'command': 'clear',
+                'batch_id': batch_id
+            })
+            self.kvcache_socket.recv_pyobj()
+            
+            # 发送最终结果
+            result = self.active_batches[batch_id]['result']
+            del self.active_batches[batch_id]
+            
+            return result
         
-        # 等待所有worker完成
-        while not self.active_batches[batch_id]['completed']:
-            # 发送流式响应给客户端
-            current_text = self.active_batches[batch_id]['streaming_text']
-            if current_text:
-                self.client_socket.send_pyobj({
-                    'status': 'streaming',
-                    'text': current_text,
-                    'finished': False
-                })
-                # 等待客户端确认
-                self.client_socket.recv_pyobj()
-            time.sleep(0.1)
-        
-        # 清理KV缓存
-        self.kvcache_socket.send_pyobj({
-            'command': 'clear',
-            'batch_id': batch_id
-        })
-        self.kvcache_socket.recv_pyobj()
-        
-        # 发送最终结果
-        result = self.active_batches[batch_id]['result']
-        del self.active_batches[batch_id]
-        
-        return result
+        except Exception as e:
+            logger.error(f"生成过程中出错: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {
+                'status': 'error',
+                'error': str(e)
+            }
     
     def _handle_worker_response(self, worker_idx: int, addr: str, socket: zmq.Socket, batch_id: str):
         """处理单个worker的响应"""

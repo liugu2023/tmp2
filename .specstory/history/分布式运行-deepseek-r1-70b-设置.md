@@ -16627,6 +16627,63 @@ gguf不跳过，只跳过执行.yaml优化文件
 
 _**Assistant**_
 
+<think>
+现在要求只跳过执行YAML优化文件，但依然使用GGUF加载流程。这意味着我们应该保留GGUF加载逻辑，但跳过使用optimize_config_path的部分。
+
+基于现有代码，修改过于复杂，我应该清晰回答如何操作。
+</think>
+
+理解了，您希望继续使用GGUF加载但跳过YAML优化文件。我们可以修改`worker.py`中的`load_model`方法：
+
+```python:ktransformers/worker.py
+# 在GGUF加载部分
+# 获取优化规则路径
+from ktransformers.optimize.optimize import optimize_and_load_gguf
+
+# 跳过规则文件，使用None作为optimize_config_path
+try:
+    logger.info(f"使用GGUF加载模型，但跳过YAML优化文件: {gguf_path}")
+    # 直接传递None作为optimize_config_path
+    optimize_and_load_gguf(self.model, None, gguf_path, self.config)
+except Exception as e:
+    logger.error(f"尝试使用optimize_and_load_gguf失败: {str(e)}")
+    # 错误处理和回退逻辑
+```
+
+但根据之前的错误信息，`optimize_and_load_gguf`函数似乎要求一个实际的文件路径，而不能使用`None`。所以更好的方案可能是创建一个最小的空白优化文件：
+
+```python:ktransformers/worker.py
+# 创建一个临时的空优化文件
+import tempfile
+with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+    f.write("# 空白优化文件\n")
+    optimize_config_path = f.name
+
+# 使用这个临时文件
+logger.info(f"使用临时空白优化文件: {optimize_config_path}")
+try:
+    optimize_and_load_gguf(self.model, optimize_config_path, gguf_path, self.config)
+    # 使用完后删除临时文件
+    os.unlink(optimize_config_path)
+except Exception as e:
+    # 错误处理
+    os.unlink(optimize_config_path)  # 确保清理
+```
+
+不过看起来您已经选择了跳过整个GGUF加载流程，直接用HuggingFace加载模型。这也是一个合理的解决方案，特别是在GGUF加载遇到问题的情况下。
+
+若您还想尝试GGUF加载，我可以提供更详细的修改建议。
+
+---
+
+_**User**_
+
+设置加载模型时使用的显存上限为75%
+
+---
+
+_**Assistant**_
+
 
 
 ---

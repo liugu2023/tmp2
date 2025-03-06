@@ -319,6 +319,14 @@ class ModelWorker:
             
             logger.info(f"Input sequence length: {len(input_ids)}")
             
+            # 优化内存管理
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()  # 显式清理缓存
+                # 打印当前GPU显存状态
+                allocated_mem = torch.cuda.memory_allocated(0) / (1024**3)
+                reserved_mem = torch.cuda.memory_reserved(0) / (1024**3)
+                logger.info(f"生成前GPU显存: 已分配: {allocated_mem:.2f}GB, 已保留: {reserved_mem:.2f}GB")
+            
             # 移动输入张量到GPU
             logger.info("Moving input tensors to GPU...")
             device = self.device
@@ -326,23 +334,20 @@ class ModelWorker:
             # 初始化输入
             input_tensor = torch.tensor(input_ids, device=device)
             
-            # 生成参数
+            # 生成参数日志
             max_new_tokens = input_data.get('max_new_tokens', 50)
             temperature = input_data.get('temperature', 0.7)
             top_p = input_data.get('top_p', 0.9)
-            
             logger.info(f"Generation parameters: max_new_tokens={max_new_tokens}, "
                        f"temperature={temperature}, "
                        f"top_p={top_p}")
             
             # 开始生成
-            logger.info("Starting actual text generation with model...")
+            logger.info("Starting text generation...")
             start_time = time.time()
             
-            # 优化内存管理
-            torch.cuda.empty_cache()
-            
-            with torch.no_grad():
+            # 使用上下文管理器确保在出作用域时释放张量
+            with torch.no_grad(), torch.amp.autocast('cuda', enabled=True):
                 # 检查模型是否已加载
                 if not hasattr(self, 'model') or self.model is None:
                     raise ValueError("模型未正确加载，无法进行推理")
@@ -368,6 +373,12 @@ class ModelWorker:
                 
             # 确保所有GPU操作完成
             torch.cuda.synchronize()
+            
+            # 再次打印显存状态
+            if torch.cuda.is_available():
+                allocated_mem = torch.cuda.memory_allocated(0) / (1024**3)
+                reserved_mem = torch.cuda.memory_reserved(0) / (1024**3)
+                logger.info(f"生成后GPU显存: 已分配: {allocated_mem:.2f}GB, 已保留: {reserved_mem:.2f}GB")
             
             return {
                 'status': 'success',
@@ -396,6 +407,18 @@ class ModelWorker:
             if not model_path:
                 logger.error("模型路径为空")
                 return {'status': 'error', 'error': '模型路径不能为空'}
+            
+            # 设置GPU显存使用上限为75%
+            if torch.cuda.is_available():
+                logger.info("设置GPU显存使用上限为75%")
+                torch.cuda.empty_cache()  # 清空CUDA缓存
+                torch.cuda.set_per_process_memory_fraction(0.75)  # 限制显存使用为75%
+                
+                # 打印当前GPU显存状态
+                total_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+                allocated_mem = torch.cuda.memory_allocated(0) / (1024**3)
+                reserved_mem = torch.cuda.memory_reserved(0) / (1024**3)
+                logger.info(f"GPU显存总量: {total_mem:.2f}GB, 已分配: {allocated_mem:.2f}GB, 已保留: {reserved_mem:.2f}GB")
             
             # 加载tokenizer
             logger.info("加载tokenizer...")

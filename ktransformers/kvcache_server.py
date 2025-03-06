@@ -195,9 +195,11 @@ def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, default=29600)
+    parser.add_argument('--model_path', type=str, default=None, help='Path to the model')
+    parser.add_argument('--gguf_path', type=str, default=None, help='Path to the GGUF model')
     args = parser.parse_args()
     
-    server = KVCacheServer(args.port)
+    server = KVCacheServer(args.port, model_path=args.model_path, gguf_path=args.gguf_path)
     server.run()
 
 if __name__ == '__main__':

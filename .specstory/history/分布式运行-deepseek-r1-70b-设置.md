@@ -8333,7 +8333,65 @@ elif command == 'load_model':
                 'status': 'error',
                 'error': 'Failed to initialize model loader'
             })
-    except Exception as
+    except Exception as e:
+        logger.error(f"模型加载器初始化出错: {str(e)}")
+        self.socket.send_pyobj({
+            'status': 'error',
+            'error': str(e)
+        })
+```
+
+```python:ktransformers/worker.py
+# 在main函数中添加解析worker_address参数
+def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--worker_address', type=str, required=True,
+                        help='Worker address in format host:port')
+    parser.add_argument('--worker_id', type=int, default=0,
+                        help='Worker ID (0-7)')
+    parser.add_argument('--num_workers', type=int, default=8,
+                        help='Total number of workers')
+    args = parser.parse_args()
+    
+    # 创建并运行worker
+    worker = ModelWorker(args.worker_address, args.worker_id, args.num_workers)
+    worker.run()
+```
+
+这些修改将确保：
+
+1. KVCache客户端添加了获取模型参数的方法
+2. 中央服务器先通知KVCache服务器加载模型，然后再通知worker
+3. KVCache服务器可以处理模型加载请求
+4. worker可以从命令行接收参数并创建正确的实例
+
+请实施这些更改，然后尝试重新运行服务和客户端。
+
+---
+
+_**User**_
+
+为啥不加载模型
+
+---
+
+_**Assistant**_
+
+<think>
+让我分析一下当前的问题：
+
+1. 我们已经修改了架构，将模型加载从分布式worker转移到了KVCache服务器，以便中央化模型管理并减少内存使用。
+
+2. 在`ktransformers/model_loader.py`中，我们创建了一个ModelLoader类，负责加载模型参数并提供查询API。
+
+3. 我们已经修改了KVCache服务器，添加了`load_model`命令和模型参数查询命令。
+
+4. 我们已经修改了KVCache客户端，添加了获取模型参数的方法。
+
+5. 我们已经修改了central_server.py，让它先通知KVCache服务器加载模型。
+
+但是，我看到的问题是`model_loader.py`的`load_layer`方法没有完全实
 
 ---
 

@@ -63,16 +63,37 @@ class ModelLoader:
     
     def load_layer(self, layer_index):
         """按需加载特定层"""
-        if f'layer_{layer_index}' in self.loaded_layers:
+        key = f'layer_{layer_index}'
+        if key in self.loaded_layers:
             return True
-            
+        
         logger.info(f"按需加载层 {layer_index}")
         try:
             # 实现按需加载特定层的逻辑
-            # 这里可以使用更细粒度的方法加载单层
-            # ...
+            import safetensors.torch
             
-            return True
+            layer_params = {}
+            for filename in os.listdir(self.model_path):
+                if filename.endswith('.safetensors'):
+                    weights_path = os.path.join(self.model_path, filename)
+                    weights = safetensors.torch.load_file(weights_path)
+                    
+                    # 提取该层的所有参数
+                    layer_prefix = f'model.layers.{layer_index}.'
+                    for key, value in weights.items():
+                        if key.startswith(layer_prefix):
+                            param_name = key[len(layer_prefix):]  # 去掉前缀
+                            layer_params[param_name] = value
+                    
+                    if layer_params:  # 如果找到了这一层的参数
+                        self.loaded_layers[key] = layer_params
+                        logger.info(f"成功加载层 {layer_index} 的 {len(layer_params)} 个参数")
+                        return True
+            
+            if not layer_params:
+                logger.warning(f"在权重文件中未找到层 {layer_index} 的参数")
+                return False
+            
         except Exception as e:
             logger.error(f"加载层 {layer_index} 时出错: {str(e)}")
             return False

@@ -14333,7 +14333,296 @@ INFO:__main__:Sending shutdown command to worker...
 
 _**Assistant**_
 
+<think>
+这个错误是因为尝试使用UTF-8编码解码无效的字节序列。通常发生在编码/解码过程中处理二进制数据时。
 
+可能是在`_store_data`或`_retrieve_data`方法中对字节数据的处理有问题。让我检查一下worker.py中相关的代码，我猜测是当我们试图将状态信息转换为字符串然后再转回来时出错了。
+</think>
+
+看起来我们在编码/解码数据时遇到了问题，特别是在`_store_data`和`_retrieve_data`方法中。让我们修复这个问题：
+
+```python:ktransformers/worker.py
+def _store_data(self, batch_id, key, data):
+    """使用KVCacheClient存储数据的辅助方法，处理参数兼容性"""
+    try:
+        # 将数据转换为可序列化的格式
+        if isinstance(data, torch.Tensor):
+            # 张量直接存储
+            data_tensor = data.cpu()
+        elif isinstance(data, dict):
+            # 对于字典，使用JSON字符串
+            import json
+            data_str = json.dumps(data)
+            data_tensor = torch.tensor([ord(c) for c in data_str], dtype=torch.int32, device='cpu')
+        elif isinstance(data, (list, tuple)):
+            # 对于列表或元组，直接转换为张量
+            try:
+                data_tensor = torch.tensor(data, device='cpu')
+            except:
+                # 如果无法直接转换，将其转为JSON字符串
+                import json
+                data_str = json.dumps(data)
+                data_tensor = torch.tensor([ord(c) for c in data_str], dtype=torch.int32, device='cpu')
+        elif isinstance(data, str):
+            # 字符串转换为ASCII码序列
+            data_tensor = torch.tensor([ord(c) for c in data], dtype=torch.int32, device='cpu')
+        else:
+            # 其他类型转为字符串
+            data_str = str(data)
+            data_tensor = torch.tensor([ord(c) for c in data_str], dtype=torch.int32, device='cpu')
+        
+        # 使用dummy值作为v参数，简化兼容性
+        dummy_tensor = torch.zeros(1, dtype=torch.float32, device='cpu')
+        
+        # 添加标记表示数据类型
+        metadata = {
+            'type': str(type(data).__name__),
+            'is_tensor': isinstance(data, torch.Tensor),
+            'is_dict': isinstance(data, dict),
+            'is_list': isinstance(data, list),
+            'is_string': isinstance(data, str)
+        }
+        
+        # 创建metadata张量
+        import json
+        metadata_str = json.dumps(metadata)
+        metadata_tensor = torch.tensor([ord(c) for c in metadata_str], dtype=torch.int32, device='cpu')
+        
+        # 存储元数据和数据
+        key_meta = f"{key}_metadata"
+        self.kvcache_client.store(batch_id, key_meta, metadata_tensor, dummy_tensor)
+        self.kvcache_client.store(batch_id, key, data_tensor, dummy_tensor)
+        
+        return True
+    except Exception as e:
+        logger.error(f"存储数据时出错: {str(e)}")
+        logger.error(f"数据类型: {type(data)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return False
+
+def _retrieve_data(self, batch_id, key, device='cpu'):
+    """使用KVCacheClient检索数据的辅助方法，处理参数兼容性"""
+    try:
+        # 先尝试检索元数据
+        key_meta = f"{key}_metadata"
+        metadata_tensor = self.kvcache_client.retrieve(batch_id, key_meta, device=device)
+        
+        # 检索实际数据
+        data_tensor = self.kvcache_client.retrieve(batch_id, key, device=device)
+        
+        # 如果元数据不存在或检索失败
+        if metadata_tensor is None:
+            # 尝试直接返回数据
+            return data_tensor
+        
+        # 解析元数据
+        if isinstance(metadata_tensor, torch.Tensor):
+            try:
+                metadata_str = ''.join(chr(int(i)) for i in metadata_tensor.tolist())
+                import json
+                metadata = json.loads(metadata_str)
+            except:
+                # 无法解析元数据，返回原始数据
+                return data_tensor
+        else:
+            # 元数据不是张量，直接返回数据
+            return data_tensor
+        
+        # 根据数据类型重建原始数据
+        if metadata.get('is_tensor'):
+            # 是张量，直接返回
+            return data_tensor
+        elif metadata.get('is_string'):
+            # 字符串类型，将整数转回字符
+            return ''.join(chr(int(i)) for i in data_tensor.tolist())
+        elif metadata.get('is_dict') or metadata.get('is_list'):
+            # 字典或列表，解析JSON
+            try:
+                data_str = ''.join(chr(int(i)) for i in data_tensor.tolist())
+                import json
+                return json.loads(data_str)
+            except:
+                # JSON解析失败，返回原始字符串
+                return data_str
+        else:
+            # 无法识别的类型或解析失败，返回原始数据
+            return data_tensor
+            
+    except Exception as e:
+        logger.error(f"检索数据时出错: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return None
+```
+
+这个实现：
+
+1. 使用更明确的数据类型处理，从简单的UTF-8编码改为每个字符单独存储为整数
+2. 存储了数据类型的元数据，以便正确恢复
+3. 增加了更健壮的错误处理
+4. 使用`int32`替代`uint8`以支持更宽范围的字符
+
+这种方法应该能解决编码/解码问题，使KVCache服务器能够正确存储和检索复杂的数据结构。
+
+---
+
+_**User**_
+
+Chat: 你好
+INFO:__main__:Creating chat messages...
+INFO:__main__:Tokenizing input...
+INFO:__main__:Starting generation...
+生成成功!
+生成的tokens: [[128000, 128011, 57668, 53901, 128012, 128013, 198]]...
+生成过程中出错: 'DistributedModel' object has no attribute 'tokenizer'
+Traceback (most recent call last):
+  File "/archive/liugu/ds/ktransformers/ktransformers/local_chat.py", line 141, in generate
+    if self.tokenizer:
+       ^^^^^^^^^^^^^^
+AttributeError: 'DistributedModel' object has no attribute 'tokenizer'
+
+---
+
+_**Assistant**_
+
+<think>
+在`local_chat.py`中，我们在DistributedModel类中使用self.tokenizer属性，但这个属性似乎没有被初始化。我们需要修改代码，确保DistributedModel类有一个tokenizer属性，或者修改判断逻辑避免直接访问这个属性。
+
+看起来我们需要检查DistributedModel类的初始化方法，并确保它正确初始化了tokenizer属性。
+</think>
+
+我们需要修复 `local_chat.py` 中 `DistributedModel` 类没有 `tokenizer` 属性的问题：
+
+```python:ktransformers/local_chat.py
+class DistributedModel:
+    """分布式模型客户端类"""
+    
+    def __init__(self, server_address):
+        """初始化分布式模型客户端
+        
+        Args:
+            server_address: 中央服务器地址，如 "10.21.22.206:29400"
+        """
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.REQ)
+        self.socket.connect(f"tcp://{server_address}")
+        self.distributed = True
+        
+        # 初始化tokenizer属性
+        self.tokenizer = None
+        
+        logger.info(f"Connected to central server at {server_address}")
+    
+    def load_model(self, model_path: str, gguf_path: str = None) -> bool:
+        """加载模型"""
+        print(f"正在加载模型: {model_path}")
+        if gguf_path:
+            print(f"使用GGUF模型: {gguf_path}")
+        
+        # 确保路径不为空字符串
+        if not model_path or model_path.strip() == '':
+            print("错误: 模型路径不能为空")
+            return False
+        
+        # 打印详细的请求内容，用于调试
+        request_data = {
+            'model_path': model_path,
+            'gguf_path': gguf_path
+        }
+        print(f"发送加载模型请求: {request_data}")
+        
+        response = self._send_command('load_model', request_data)
+        
+        # 检查response是否是字典
+        if isinstance(response, bool):
+            success = response
+            error = "未知错误" if not success else None
+        else:
+            success = response.get('status') == 'success'
+            error = response.get('error')
+        
+        if not success:
+            print(f"模型加载失败: {error}")
+            return False
+        
+        # 在成功加载模型后，初始化tokenizer
+        try:
+            from transformers import AutoTokenizer
+            self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+            print(f"Tokenizer loaded from {model_path}")
+        except Exception as e:
+            print(f"无法加载tokenizer: {e}")
+            print("将使用默认输出显示")
+            self.tokenizer = None
+        
+        print("模型加载成功!")
+        return True
+```
+
+
+此外，让我们在`generate`方法中改进tokenizer检查逻辑：
+
+```python:ktransformers/local_chat.py
+def generate(self, input_ids, attention_mask, **kwargs):
+    """生成文本"""
+    try:
+        # 准备请求数据
+        generate_data = {
+            'input_ids': input_ids,
+            'attention_mask': attention_mask
+        }
+        # 添加其他生成参数
+        generate_data.update(kwargs)
+        
+        # 发送生成请求
+        response = self._send_command('generate', generate_data)
+        
+        if response.get('status') != 'success':
+            error_msg = response.get('error', 'Unknown error')
+            print(f"生成失败: {error_msg}")
+            return []
+        
+        # 获取输出token IDs
+        output_ids = response.get('output_ids', [])
+        
+        print("生成成功!")
+        # 修复: 使用长度检查而不是直接用张量作为布尔值
+        if isinstance(output_ids, torch.Tensor):
+            has_outputs = len(output_ids) > 0
+        else:
+            has_outputs = bool(output_ids)
+            
+        if has_outputs:
+            # 确保输出为列表，以便切片操作安全
+            if isinstance(output_ids, torch.Tensor):
+                output_preview = output_ids[:10].tolist()
+            else:
+                output_preview = output_ids[:10]
+                
+            print(f"生成的tokens: {output_preview}...")
+            
+            # 安全地检查tokenizer属性
+            tokenizer = getattr(self, 'tokenizer', None)
+            if tokenizer is not None:
+                # 确保在解码前张量已转换为列表
+                if isinstance(output_ids, torch.Tensor):
+                    output_text = tokenizer.decode(output_ids.tolist())
+                else:
+                    output_text = tokenizer.decode(output_ids)
+                print(f"\n生成的文本:\n{output_text}\n")
+            else:
+                print("\n无法解码文本: tokenizer不可用\n")
+        else:
+            print("警告: 未收到任何生成的tokens")
+        
+        return output_ids
+```
+
+
+这些修改：
+
+1. 在`DistributedModel
 
 ---
 

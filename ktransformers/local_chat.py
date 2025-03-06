@@ -36,13 +36,24 @@ def import_local_modules():
             prefill_and_generate, get_compute_capability, Config, flashinfer_enabled)
 
 class DistributedModel:
-    def __init__(self, server_address: str):
+    """分布式模型客户端类"""
+    
+    def __init__(self, server_address):
+        """初始化分布式模型客户端
+        
+        Args:
+            server_address: 中央服务器地址，如 "10.21.22.206:29400"
+        """
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.REQ)
         self.socket.connect(f"tcp://{server_address}")
-        self.distributed = True  # 添加这个属性
-        logger.info(f"Connected to central server at {server_address}")
+        self.distributed = True
         
+        # 初始化tokenizer属性
+        self.tokenizer = None
+        
+        logger.info(f"Connected to central server at {server_address}")
+    
     def load_model(self, model_path: str, gguf_path: str = None) -> bool:
         """加载模型"""
         print(f"正在加载模型: {model_path}")
@@ -74,6 +85,16 @@ class DistributedModel:
         if not success:
             print(f"模型加载失败: {error}")
             return False
+        
+        # 在成功加载模型后，初始化tokenizer
+        try:
+            from transformers import AutoTokenizer
+            self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+            print(f"Tokenizer loaded from {model_path}")
+        except Exception as e:
+            print(f"无法加载tokenizer: {e}")
+            print("将使用默认输出显示")
+            self.tokenizer = None
         
         print("模型加载成功!")
         return True
@@ -138,13 +159,18 @@ class DistributedModel:
                     output_preview = output_ids[:10]
                 
                 print(f"生成的tokens: {output_preview}...")
-                if self.tokenizer:
+                
+                # 安全地检查tokenizer属性
+                tokenizer = getattr(self, 'tokenizer', None)
+                if tokenizer is not None:
                     # 确保在解码前张量已转换为列表
                     if isinstance(output_ids, torch.Tensor):
-                        output_text = self.tokenizer.decode(output_ids.tolist())
+                        output_text = tokenizer.decode(output_ids.tolist())
                     else:
-                        output_text = self.tokenizer.decode(output_ids)
+                        output_text = tokenizer.decode(output_ids)
                     print(f"\n生成的文本:\n{output_text}\n")
+                else:
+                    print("\n无法解码文本: tokenizer不可用\n")
             else:
                 print("警告: 未收到任何生成的tokens")
             

@@ -13924,6 +13924,201 @@ _**User**_
 
 _**Assistant**_
 
+<think>
+错误显示模型路径为空字符串（'Incorrect path_or_model_id: ''），这表明当客户端发送加载模型请求时，路径字符串可能没有正确传递。让我们检查相关部分的代码流程：
+
+1. 客户端 (local_chat.py) 调用 load_model 并发送请求到中央服务器
+2. 中央服务器 (central_server.py) 处理请求并转发到 KV 缓存服务器
+3. KV 缓存服务器尝试加载模型但失败，因为路径是空字符串
+
+我们需要检查这个流程中的每一步，特别是确保路径参数正确传递。
+</think>
+
+问题是模型路径为空字符串，让我们检查数据流动过程，确保正确传递模型路径:
+
+```python:ktransformers/local_chat.py
+def load_model(self, model_path: str, gguf_path: str = None) -> bool:
+    """加载模型"""
+    print(f"正在加载模型: {model_path}")
+    if gguf_path:
+        print(f"使用GGUF模型: {gguf_path}")
+    
+    # 确保路径不为空字符串
+    if not model_path or model_path.strip() == '':
+        print("错误: 模型路径不能为空")
+        return False
+    
+    # 打印详细的请求内容，用于调试
+    request_data = {
+        'model_path': model_path,
+        'gguf_path': gguf_path
+    }
+    print(f"发送加载模型请求: {request_data}")
+    
+    response = self._send_command('load_model', request_data)
+    
+    # 检查response是否是字典
+    if isinstance(response, bool):
+        success = response
+        error = "未知错误" if not success else None
+    else:
+        success = response.get('status') == 'success'
+        error = response.get('error')
+    
+    if not success:
+        print(f"模型加载失败: {error}")
+        return False
+    
+    print("模型加载成功!")
+    return True
+```
+
+此外，让我们修改中央服务器的处理代码，添加更多日志记录，确保模型路径正确传递：
+
+```python:ktransformers/central_server.py
+def load_model_on_workers(self, model_path: str, gguf_path: str) -> Dict[str, Any]:
+    """加载模型到所有worker上"""
+    logger.info(f"加载模型，路径: '{model_path}', GGUF路径: '{gguf_path}'")
+    
+    # 验证模型路径
+    if not model_path or model_path.strip() == '':
+        logger.error("错误: 模型路径为空")
+        return {'status': 'error', 'error': '模型路径不能为空'}
+    
+    # 首先加载到KV缓存服务器
+    logger.info("发送模型加载命令到KV缓存服务器...")
+    load_request = {
+        'command': 'load_model',
+        'model_path': model_path,
+        'gguf_path': gguf_path
+    }
+    logger.info(f"发送请求到KV缓存服务器: {load_request}")
+    self.kvcache_socket.send_pyobj(load_request)
+    
+    response = self.kvcache_socket.recv_pyobj()
+    if response.get('status') != 'success':
+        logger.error(f"KV缓存服务器加载模型失败: {response.get('error')}")
+        return {'status': 'error', 'error': f"KV缓存服务器加载模型失败: {response.get('error')}"}
+```
+
+并在process_client_message方法中添加参数验证：
+
+```python:ktransformers/central_server.py
+def process_client_message(self, message: Dict[str, Any]) -> Dict[str, Any]:
+    """处理客户端消息"""
+    try:
+        command = message.get('command', '')
+        logger.info(f"Received command: {command}")
+        
+        if command == 'load_model':
+            # 验证模型路径参数
+            model_path = message.get('model_path', '')
+            gguf_path = message.get('gguf_path', '')
+            
+            logger.info(f"收到加载模型请求，路径: '{model_path}', GGUF: '{gguf_path}'")
+            
+            # 检查参数来源
+            if 'data' in message and isinstance(message['data'], dict):
+                # 有些客户端可能将参数放在data字段中
+                data = message['data']
+                if not model_path and 'model_path' in data:
+                    model_path = data['model_path']
+                    logger.info(f"从data字段获取model_path: {model_path}")
+                if not gguf_path and 'gguf_path' in data:
+                    gguf_path = data['gguf_path']
+                    logger.info(f"从data字段获取gguf_path: {gguf_path}")
+            
+            # 验证参数
+            if not model_path or model_path.strip() == '':
+                logger.error("模型路径为空")
+                return {'status': 'error', 'error': '模型路径不能为空'}
+                
+            return self.load_model_on_workers(model_path, gguf_path)
+```
+
+最后，让我们确保KVCacheServer正确处理模型加载请求：
+
+```python:ktransformers/kvcache_server.py
+elif command == 'load_model':
+    model_path = message.get('model_path', '')
+    gguf_path = message.get('gguf_path', '')
+    
+    # 输出详细日志
+    logger.info(f"收到加载模型请求，模型路径: '{model_path}', GGUF路径: '{gguf_path}'")
+    
+    # 验证模型路径
+    if not model_path or model_path.strip() == '':
+        logger.error("错误: 模型路径为空")
+        self.socket.send_pyobj({
+            'status': 'error',
+            'error': '模型路径不能为空'
+        })
+        continue
+    
+    # 初始化或重新初始化模型加载器
+    try:
+        from ktransformers.model_loader import ModelLoader
+        logger.info(f"初始化/重新初始化模型加载器，模型路径: {model_path}")
+        self.model_loader = ModelLoader(model_path, gguf_path)
+        success = self.model_loader.load_model()
+```
+
+这些改动将帮助诊断并修复模型路径为空的问题，添加了更严格的参数验证和详细的日志记录。
+
+---
+
+_**User**_
+
+INFO:__main__:处理层 39
+INFO:__main__:处理层 57
+ERROR:__main__:处理层时发生错误: 'Tensor' object has no attribute 'copy'
+ERROR:__main__:Traceback (most recent call last):
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 316, in generate
+    output_token_ids = input_ids.copy()  # 先复制输入tokens
+                       ^^^^^^^^^^^^^^
+AttributeError: 'Tensor' object has no attribute 'copy'
+
+ERROR:__main__:Generation error: 'Tensor' object has no attribute 'copy'
+ERROR:__main__:Traceback (most recent call last):
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 316, in generate
+    output_token_ids = input_ids.copy()  # 先复制输入tokens
+                       ^^^^^^^^^^^^^^
+AttributeError: 'Tensor' object has no attribute 'copy'
+
+ERROR:__main__:处理层时发生错误: 'Tensor' object has no attribute 'copy'
+ERROR:__main__:Traceback (most recent call last):
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 316, in generate
+    output_token_ids = input_ids.copy()  # 先复制输入tokens
+                       ^^^^^^^^^^^^^^
+AttributeError: 'Tensor' object has no attribute 'copy'
+
+ERROR:__main__:Generation error: 'Tensor' object has no attribute 'copy'
+ERROR:__main__:Traceback (most recent call last):
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 316, in generate
+    output_token_ids = input_ids.copy()  # 先复制输入tokens
+                       ^^^^^^^^^^^^^^
+AttributeError: 'Tensor' object has no attribute 'copy'
+
+INFO:__main__:处理层 58
+INFO:__main__:处理层 59
+ERROR:__main__:处理层时发生错误: 'Tensor' object has no attribute 'copy'
+ERROR:__main__:Traceback (most recent call last):
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 316, in generate
+    output_token_ids = input_ids.copy()  # 先复制输入tokens
+                       ^^^^^^^^^^^^^^
+AttributeError: 'Tensor' object has no attribute 'copy'
+
+ERROR:__main__:Generation error: 'Tensor' object has no attribute 'copy'
+ERROR:__main__:Traceback (most recent call last):
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 316, in generate
+    output_token_ids = input_ids.copy()  # 先复制输入tokens
+                       ^^^^^^^^^^^^^^
+AttributeError: 'Tensor' object has no attribute 'copy'
+
+---
+
+_**Assistant**_
+
 
 
 ---

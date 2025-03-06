@@ -313,7 +313,10 @@ class ModelWorker:
                         time.sleep(0.01)  # 简单模拟处理时间
                     
                     # 模拟生成输出tokens
-                    output_token_ids = input_ids.copy()  # 先复制输入tokens
+                    if isinstance(input_ids, torch.Tensor):
+                        output_token_ids = input_ids.tolist()  # 转换为Python列表
+                    else:
+                        output_token_ids = list(input_ids)  # 创建输入的副本
                     
                     # 最后一个worker生成最终token
                     if self.worker_id == self.num_workers - 1:
@@ -346,7 +349,6 @@ class ModelWorker:
                 'status': 'success',
                 'message': f"Worker {self.worker_id} processed layers {self.start_layer}-{self.end_layer-1}",
                 'time_taken': time.time() - start_time,
-                # 关键是添加这个字段并确保它包含实际的token IDs
                 'output_ids': output_token_ids if self.worker_id == self.num_workers - 1 else input_ids
             }
             

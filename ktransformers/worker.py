@@ -161,7 +161,7 @@ class ModelWorker:
                     response = self.generate(message.get('data', {}))
                 
                 elif command == 'load_model':
-                    response = {'status': 'success'}
+                    response = self.load_model(message.get('model_path', ''), message.get('gguf_path', ''))
                 
                 elif command == 'shutdown':
                     response = {'status': 'success', 'message': 'Shutting down'}
@@ -383,6 +383,118 @@ class ModelWorker:
                 'error': str(e),
                 'output_ids': []
             }
+
+    def load_model(self, model_path: str, gguf_path: str) -> Dict[str, Any]:
+        """加载模型"""
+        try:
+            logger.info(f"开始加载模型: {model_path}")
+            
+            # 先验证路径
+            if not model_path:
+                logger.error("模型路径为空")
+                return {'status': 'error', 'error': '模型路径不能为空'}
+            
+            # 如果使用GGUF文件，确保其存在
+            if gguf_path and not os.path.exists(gguf_path):
+                logger.error(f"GGUF文件不存在: {gguf_path}")
+                return {'status': 'error', 'error': f"GGUF文件不存在: {gguf_path}"}
+            
+            # 加载tokenizer
+            logger.info("加载tokenizer...")
+            try:
+                from transformers import AutoTokenizer
+                self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+                logger.info("Tokenizer加载成功")
+            except Exception as e:
+                logger.error(f"加载tokenizer出错: {str(e)}")
+                return {'status': 'error', 'error': f"加载tokenizer失败: {str(e)}"}
+            
+            # 加载模型配置
+            logger.info("加载模型配置...")
+            try:
+                from transformers import AutoConfig
+                self.config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+                # 设置默认数据类型
+                torch.set_default_dtype(self.config.torch_dtype)
+                logger.info(f"模型配置加载成功，类型: {self.config.model_type}")
+            except Exception as e:
+                logger.error(f"加载模型配置出错: {str(e)}")
+                return {'status': 'error', 'error': f"加载模型配置失败: {str(e)}"}
+            
+            # 加载模型
+            logger.info("加载模型权重...")
+            try:
+                from transformers import AutoModelForCausalLM
+                # 确保 CUDA 可用
+                if torch.cuda.is_available():
+                    device_map = "auto"
+                else:
+                    device_map = "cpu"
+                    logger.warning("CUDA不可用，使用CPU加载模型")
+                    
+                # 使用GGUF或原始模型
+                if gguf_path:
+                    logger.info(f"使用GGUF模型: {gguf_path}")
+                    # 这里需要根据你的实际GGUF加载方法调整
+                    from ktransformers.optimize.optimize import optimize_and_load_gguf
+                    
+                    with torch.device("meta"):
+                        self.model = AutoModelForCausalLM.from_config(
+                            self.config, trust_remote_code=True
+                        )
+                    
+                    # 使用optimize_and_load_gguf加载GGUF模型
+                    logger.info("使用optimize_and_load_gguf加载GGUF模型...")
+                    optimize_config_path = None  # 可能需要根据你的配置修改
+                    optimize_and_load_gguf(self.model, optimize_config_path, gguf_path, self.config)
+                else:
+                    # 直接加载原始模型
+                    logger.info("直接从HuggingFace加载模型...")
+                    self.model = AutoModelForCausalLM.from_pretrained(
+                        model_path,
+                        config=self.config,
+                        trust_remote_code=True,
+                        device_map=device_map
+                    )
+                    
+                # 设置为评估模式
+                self.model.eval()
+                logger.info("模型加载成功，设置为评估模式")
+                
+                # 加载生成配置
+                try:
+                    from transformers import GenerationConfig
+                    self.model.generation_config = GenerationConfig.from_pretrained(model_path)
+                    logger.info("生成配置加载成功")
+                except Exception as e:
+                    logger.warning(f"无法加载生成配置，使用默认配置: {str(e)}")
+                    # 创建默认生成配置
+                    from transformers import GenerationConfig
+                    gen_config = GenerationConfig(
+                        temperature=0.7,
+                        top_p=0.9,
+                        do_sample=True
+                    )
+                    self.model.generation_config = gen_config
+                    
+                # 确保pad_token_id设置
+                if self.model.generation_config.pad_token_id is None:
+                    self.model.generation_config.pad_token_id = self.model.generation_config.eos_token_id
+                    
+                logger.info("模型和相关配置加载完成")
+                return {'status': 'success', 'message': '模型加载成功'}
+                
+            except Exception as e:
+                logger.error(f"加载模型出错: {str(e)}")
+                import traceback
+                logger.error(traceback.format_exc())
+                return {'status': 'error', 'error': f"加载模型失败: {str(e)}"}
+                
+        except Exception as e:
+            logger.error(f"模型加载过程中出现未知错误: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {'status': 'error', 'error': f"未知错误: {str(e)}"}
 
 class SimplifiedLayer(nn.Module):
     """简化的Transformer层"""

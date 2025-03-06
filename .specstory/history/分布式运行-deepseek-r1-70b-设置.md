@@ -15545,6 +15545,166 @@ _**User**_
 
 ---
 
+_**Assistant**_
+
+<think>
+让我们检查worker.py文件中的代码，看看模型是否真的执行了推理。从之前的代码片段来看，worker.py中的generate方法可能只是在模拟生成过程，而不是实际运行模型推理。
+
+现在我们需要找出真正的问题所在:
+
+1. worker.py中是否正确加载了模型
+2. generate方法是否调用模型的forward或generate方法
+3. 是否只是返回了一些模拟的token而非实际模型输出
+
+从之前的错误信息和代码实现来看，似乎worker类中只是在模拟层处理过程，然后返回一些预定义的token，而不是实际调用模型生成。这就解释了为什么输出是固定的特殊标记而不是实际的生成内容。
+
+我们需要修改worker.py中的generate方法来实际使用已加载的模型进行推理，而不是简单地返回模拟的token。
+</think>
+
+你的怀疑是正确的。我检查了代码，发现模型确实没有进行实际的推理。让我们看看`worker.py`中的关键问题：
+
+```python
+# 模拟处理 - 每个worker只处理自己的层
+for layer_idx in range(self.start_layer, self.end_layer):
+    logger.info(f"处理层 {layer_idx}")
+    # 在实际实现中，这里应该加载并应用层参数
+    time.sleep(0.01)  # 简单模拟处理时间
+
+# 模拟生成输出tokens
+if isinstance(input_ids, torch.Tensor):
+    output_token_ids = input_ids.tolist()  # 转换为Python列表
+else:
+    output_token_ids = list(input_ids)  # 创建输入的副本
+
+# 最后一个worker生成最终token
+if self.worker_id == self.num_workers - 1:
+    # 模拟生成更多的tokens
+    for i in range(min(max_new_tokens, 10)):  # 最多生成10个tokens用于测试
+        new_token = 100 + i  # 使用简单的逻辑生成新token
+        output_token_ids.append(new_token)
+    logger.info(f"最终生成的tokens: {output_token_ids}")
+```
+
+这里的关键问题是：
+
+1. 代码只是在模拟层处理，使用`time.sleep(0.01)`而不是实际运行模型层
+2. 生成的token仅仅是固定的`[100, 101, 102, ...]`而不是通过实际模型推理获得的
+3. 我们看到的输出只是原始输入加上这些固定token，而不是真正的模型回复
+
+要解决这个问题，我们需要：
+
+1. 确保`self.model`正确加载了模型
+2. 使用模型的`forward`或`generate`方法进行实际推理
+3. 返回真实的模型输出而非模拟的token
+
+修改`worker.py`中的`generate`方法：
+
+```python:ktransformers/worker.py
+def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+    """处理生成请求"""
+    try:
+        logger.info("Received generation request")
+        
+        # 检查输入格式
+        if 'input_ids' not in input_data:
+            logger.warning("输入数据中未找到'input_ids'，使用默认值")
+            input_ids = [0]  # 使用默认值
+        else:
+            input_ids = input_data['input_ids']
+            
+        logger.info(f"Input sequence length: {len(input_ids)}")
+        
+        # 移动输入张量到GPU
+        logger.info("Moving input tensors to GPU...")
+        device = self.device
+        
+        # 初始化输入
+        input_tensor = torch.tensor(input_ids, device=device)
+        
+        # 生成参数
+        max_new_tokens = input_data.get('max_new_tokens', 50)
+        temperature = input_data.get('temperature', 0.7)
+        top_p = input_data.get('top_p', 0.9)
+        
+        logger.info(f"Generation parameters: max_new_tokens={max_new_tokens}, "
+                   f"temperature={temperature}, "
+                   f"top_p={top_p}")
+        
+        # 开始生成
+        logger.info("Starting actual text generation with model...")
+        start_time = time.time()
+        
+        # 优化内存管理
+        torch.cuda.empty_cache()
+        
+        with torch.no_grad():
+            # 检查模型是否已加载
+            if not hasattr(self, 'model') or self.model is None:
+                raise ValueError("模型未正确加载，无法进行推理")
+                
+            # 设置生成参数
+            gen_kwargs = {
+                'max_new_tokens': max_new_tokens,
+                'do_sample': True,
+                'temperature': temperature,
+                'top_p': top_p
+            }
+            
+            # 使用模型进行实际生成
+            logger.info("正在使用模型生成文本...")
+            output = self.model.generate(
+                inputs=input_tensor.unsqueeze(0),  # 添加批次维度
+                **gen_kwargs
+            )
+            
+            # 获取生成的token ids
+            output_token_ids = output[0].cpu().tolist()
+            logger.info(f"模型生成了{len(output_token_ids)-len(input_ids)}个新token")
+            
+        # 确保所有GPU操作完成
+        torch.cuda.synchronize()
+        
+        return {
+            'status': 'success',
+            'message': f"Worker {self.worker_id} successfully generated text",
+            'time_taken': time.time() - start_time,
+            'output_ids': output_token_ids
+        }
+            
+    except Exception as e:
+        logger.error(f"Generation error: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        
+        return {
+            'status': 'error',
+            'error': str(e),
+            'output_ids': []
+        }
+```
+
+这段代码假设`self.model`是在`load_model`方法中正确加载的。如果`load_model`方法也存在问题，我们需要先修复它，确保正确加载模型。
+
+请告诉我这个方向是否正确，或者如果你想查看更多相关代码来确定问题所在。
+
+---
+
+_**User**_
+
+ERROR:__main__:Generation error: 模型未正确加载，无法进行推理
+ERROR:__main__:Traceback (most recent call last):
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 345, in generate
+    raise ValueError("模型未正确加载，无法进行推理")
+ValueError: 模型未正确加载，无法进行推理
+
+---
+
+_**Assistant**_
+
+
+
+---
+
 
 
 ---

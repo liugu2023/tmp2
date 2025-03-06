@@ -12,6 +12,7 @@ from ktransformers.kvcache_client import KVCacheClient
 import torch.nn as nn
 import json
 import numpy as np
+import glob
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -502,11 +503,6 @@ class ModelWorker:
                         
                         logger.info(f"优化规则目录: {ktransformer_rules_dir}")
                         
-                        # 简化加载过程，手动执行核心步骤
-                        if not os.path.exists(gguf_path):
-                            logger.error(f"GGUF文件不存在: {gguf_path}")
-                            raise FileNotFoundError(f"GGUF文件不存在: {gguf_path}")
-                            
                         # 设置超时，防止无限等待
                         import signal
                         
@@ -518,8 +514,37 @@ class ModelWorker:
                         signal.alarm(30)  # 30秒超时
                         
                         try:
-                            # 执行optimize_and_load_gguf
-                            optimize_and_load_gguf(self.model, None, gguf_path, self.config)
+                            # 确保有合适的优化规则文件
+                            # 查找可能的规则文件
+                            arch_name = self.config.architectures[0] if hasattr(self.config, 'architectures') and self.config.architectures else "unknown"
+                            rule_files = glob.glob(os.path.join(ktransformer_rules_dir, "*.yaml"))
+                            
+                            # 尝试找到匹配的规则文件
+                            optimize_config_path = None
+                            if rule_files:
+                                # 有规则文件，选择匹配度最高的
+                                for rule_file in rule_files:
+                                    rule_name = os.path.basename(rule_file)
+                                    # 尝试根据模型类型匹配规则文件
+                                    if arch_name in rule_name:
+                                        optimize_config_path = rule_file
+                                        logger.info(f"找到匹配的规则文件: {rule_name}")
+                                        break
+                                
+                                # 如果没有匹配的，使用第一个作为默认
+                                if optimize_config_path is None:
+                                    optimize_config_path = rule_files[0]
+                                    logger.info(f"使用默认规则文件: {os.path.basename(optimize_config_path)}")
+                            else:
+                                # 没有找到规则文件，改用简单加载模式
+                                logger.error("找不到优化规则文件，切换到简单加载模式")
+                                signal.alarm(0)  # 取消超时
+                                os.environ['KTRANSFORMERS_FALLBACK'] = 'TRUE'
+                                return self.load_model(model_path, gguf_path)
+                            
+                            # 执行optimize_and_load_gguf，现在确保规则文件存在
+                            logger.info(f"使用规则文件: {optimize_config_path}")
+                            optimize_and_load_gguf(self.model, optimize_config_path, gguf_path, self.config)
                             # 取消超时
                             signal.alarm(0)
                         except TimeoutError:

@@ -323,89 +323,54 @@ class ModelWorker:
             # 初始化输入
             input_tensor = torch.tensor(input_ids, device=device)
             
-            # 生成参数日志
+            # 生成参数
             max_new_tokens = input_data.get('max_new_tokens', 50)
             temperature = input_data.get('temperature', 0.7)
             top_p = input_data.get('top_p', 0.9)
+            
             logger.info(f"Generation parameters: max_new_tokens={max_new_tokens}, "
                        f"temperature={temperature}, "
                        f"top_p={top_p}")
             
             # 开始生成
-            logger.info("Starting text generation...")
+            logger.info("Starting actual text generation with model...")
             start_time = time.time()
             
             # 优化内存管理
-            torch.cuda.empty_cache()  # 显式清理缓存
+            torch.cuda.empty_cache()
             
-            # 使用上下文管理器确保在出作用域时释放张量
-            with torch.no_grad(), torch.amp.autocast('cuda', enabled=True):
-                # 使用batch ID进行分布式协调
-                batch_id = input_data.get('batch_id', f"batch_{time.time()}")
+            with torch.no_grad():
+                # 检查模型是否已加载
+                if not hasattr(self, 'model') or self.model is None:
+                    raise ValueError("模型未正确加载，无法进行推理")
+                    
+                # 设置生成参数
+                gen_kwargs = {
+                    'max_new_tokens': max_new_tokens,
+                    'do_sample': True,
+                    'temperature': temperature,
+                    'top_p': top_p
+                }
                 
-                try:
-                    # 模拟处理 - 每个worker只处理自己的层
-                    for layer_idx in range(self.start_layer, self.end_layer):
-                        logger.info(f"处理层 {layer_idx}")
-                        # 在实际实现中，这里应该加载并应用层参数
-                        time.sleep(0.01)  # 简单模拟处理时间
-                    
-                    # 模拟生成输出tokens
-                    if isinstance(input_ids, torch.Tensor):
-                        output_token_ids = input_ids.tolist()  # 转换为Python列表
-                    else:
-                        output_token_ids = list(input_ids)  # 创建输入的副本
-                    
-                    # 最后一个worker生成最终token
-                    if self.worker_id == self.num_workers - 1:
-                        # 模拟生成更多的tokens
-                        for i in range(min(max_new_tokens, 10)):  # 最多生成10个tokens用于测试
-                            new_token = 100 + i  # 使用简单的逻辑生成新token
-                            output_token_ids.append(new_token)
-                        logger.info(f"最终生成的tokens: {output_token_ids}")
-                    
-                    # 存储处理状态
-                    worker_status = f"Worker {self.worker_id} completed layers {self.start_layer}-{self.end_layer-1}"
-                    self._store_data(batch_id, f"worker_{self.worker_id}_status", worker_status)
-                    logger.info(f"已存储状态: {worker_status}")
-                    
-                    # 如果是最后一个worker，存储最终输出
-                    if self.worker_id == self.num_workers - 1:
-                        self._store_data(batch_id, "final_output", output_token_ids)
+                # 使用模型进行实际生成
+                logger.info("正在使用模型生成文本...")
+                output = self.model.generate(
+                    inputs=input_tensor.unsqueeze(0),  # 添加批次维度
+                    **gen_kwargs
+                )
                 
-                except Exception as e:
-                    logger.error(f"处理层时发生错误: {str(e)}")
-                    import traceback
-                    logger.error(traceback.format_exc())
-                    raise
-            
+                # 获取生成的token ids
+                output_token_ids = output[0].cpu().tolist()
+                logger.info(f"模型生成了{len(output_token_ids)-len(input_ids)}个新token")
+                
             # 确保所有GPU操作完成
             torch.cuda.synchronize()
             
-            # 返回成功响应，添加output_ids字段
             return {
                 'status': 'success',
-                'message': f"Worker {self.worker_id} processed layers {self.start_layer}-{self.end_layer-1}",
+                'message': f"Worker {self.worker_id} successfully generated text",
                 'time_taken': time.time() - start_time,
-                'output_ids': output_token_ids if self.worker_id == self.num_workers - 1 else input_ids
-            }
-            
-        except torch.cuda.OutOfMemoryError as e:
-            # 专门处理OOM错误
-            logger.error(f"CUDA内存不足: {str(e)}")
-            torch.cuda.empty_cache()  # 尝试释放缓存
-            
-            # 打印当前GPU内存状态
-            if torch.cuda.is_available():
-                for i in range(torch.cuda.device_count()):
-                    mem_allocated = torch.cuda.memory_allocated(i) / (1024**3)
-                    mem_reserved = torch.cuda.memory_reserved(i) / (1024**3)
-                    logger.error(f"GPU {i}: 已分配 {mem_allocated:.2f}GB, 已预留 {mem_reserved:.2f}GB")
-            
-            return {
-                'status': 'error',
-                'error': f"内存不足 (OOM): {str(e)}",
-                'output_ids': []  # 添加空的output_ids以避免键错误
+                'output_ids': output_token_ids
             }
             
         except Exception as e:
@@ -416,12 +381,8 @@ class ModelWorker:
             return {
                 'status': 'error',
                 'error': str(e),
-                'output_ids': []  # 添加空的output_ids以避免键错误
+                'output_ids': []
             }
-            
-        finally:
-            # 确保在函数结束时释放内存
-            torch.cuda.empty_cache()
 
 class SimplifiedLayer(nn.Module):
     """简化的Transformer层"""

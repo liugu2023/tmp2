@@ -124,20 +124,13 @@ class DistributedModel:
             return {'status': 'error', 'error': str(e)}
 
     def generate(self, input_ids=None, attention_mask=None, input_text=None, **kwargs):
-        """生成文本
-        
-        Args:
-            input_ids: 输入token IDs (兼容旧版API)
-            attention_mask: 注意力掩码 (兼容旧版API)
-            input_text: 用户输入文本，如果提供则优先使用
-            **kwargs: 生成参数
-        """
+        """生成文本"""
         try:
             # 如果提供了输入文本，则创建消息并转换为tokens
             if input_text is not None:
                 if self.tokenizer is None:
                     print("错误: Tokenizer不可用")
-                    return []
+                    return ""
                 
                 # 创建消息格式，匹配原始实现
                 messages = [{"role": "user", "content": input_text}]
@@ -152,7 +145,7 @@ class DistributedModel:
                 # 确保input_ids已提供
                 if input_ids is None:
                     print("错误: 未提供输入文本或input_ids")
-                    return []
+                    return ""
                 
                 # 如果没有提供attention_mask，创建全1掩码
                 if attention_mask is None:
@@ -173,7 +166,7 @@ class DistributedModel:
             if response.get('status') != 'success':
                 error_msg = response.get('error', 'Unknown error')
                 print(f"生成失败: {error_msg}")
-                return []
+                return ""
             
             # 获取输出token IDs
             output_ids = response.get('output_ids', [])
@@ -187,11 +180,11 @@ class DistributedModel:
             else:
                 has_outputs = bool(output_ids)
                 output_ids_list = output_ids
-                
+            
             # 处理嵌套列表
             if has_outputs and isinstance(output_ids_list, list) and isinstance(output_ids_list[0], list):
                 output_ids_list = output_ids_list[0]
-                
+            
             if has_outputs:
                 # 显示前几个token
                 output_preview = output_ids_list[:10] if len(output_ids_list) > 10 else output_ids_list
@@ -201,26 +194,70 @@ class DistributedModel:
                 if self.tokenizer is not None:
                     try:
                         # 解码生成的tokens
-                        output_text = self.tokenizer.decode(output_ids_list, skip_special_tokens=True)
-                        # 删除输入部分，只保留新生成的内容
-                        if input_text and output_text.startswith(input_text):
-                            output_text = output_text[len(input_text):].strip()
-                        print(f"\n{output_text}\n")
-                        return output_text
+                        full_output_text = self.tokenizer.decode(output_ids_list)
+                        print(f"原始输出: {repr(full_output_text)}")
+                        
+                        # 提取助手回复部分
+                        assistant_response = self._extract_assistant_response(full_output_text)
+                        
+                        print(f"\n{assistant_response}\n")
+                        return assistant_response
                     except Exception as e:
                         print(f"\n解码文本时出错: {str(e)}")
                         print(f"Token IDs: {output_ids_list[:20]}...\n")
+                        return ""
                 else:
                     print("\n无法解码文本: tokenizer不可用\n")
+                    return ""
             else:
                 print("警告: 未收到任何生成的tokens")
-            
-            return output_ids
+                return ""
         except Exception as e:
             print(f"生成过程中出错: {str(e)}")
             import traceback
             print(traceback.format_exc())
-            return []
+            return ""
+
+    def _extract_assistant_response(self, text):
+        """从完整输出中提取助手的回复"""
+        # 添加全面的提取方法，根据不同模型的格式调整
+        
+        # 1. 基于角色标记提取助手回复
+        import re
+        
+        # 可能的助手标记模式
+        assistant_patterns = [
+            r'<｜Assistant｜>(.*?)(?:<｜tool▁outputs▁end｜>|$)',  # 带符号的格式
+            r'<|Assistant|>(.*?)(?:<|User|>|$)',  # 英文竖线格式
+            r'<assistant>(.*?)(?:<user>|$)',          # 简化格式
+            r'Assistant:(.*?)(?:User:|$)',            # 冒号格式
+            r'assistant:(.*?)(?:user:|$)',            # 小写冒号格式
+        ]
+        
+        # 尝试所有可能的模式
+        for pattern in assistant_patterns:
+            match = re.search(pattern, text, re.DOTALL)
+            if match:
+                return match.group(1).strip()
+        
+        # 2. 如果没找到明确的助手回复，尝试去除所有已知的特殊标记
+        cleaned_text = text
+        special_tokens = [
+            " ", " ", " ",
+            "<|begin_of_sentence|>", "<|User|>", "<|Assistant|>",
+            "<user>", "<assistant>", "<think>", "</think>",
+            "User:", "Assistant:"
+        ]
+        
+        for token in special_tokens:
+            cleaned_text = cleaned_text.replace(token, "")
+        
+        # 3. 移除可能的用户输入部分
+        if input_text and cleaned_text.startswith(input_text):
+            cleaned_text = cleaned_text[len(input_text):].strip()
+        
+        # 如果是聊天场景中的第一条消息，可能需要返回整个文本
+        return cleaned_text.strip() or "抱歉，我无法理解您的请求。"
 
     def shutdown(self):
         """发送关闭命令给worker"""

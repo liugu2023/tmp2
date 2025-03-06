@@ -7526,6 +7526,106 @@ _**User**_
 
 _**Assistant**_
 
+<think>
+您提出了一个重要的问题。在当前的实现中，代码确实包含了两个步骤的加载过程：
+
+1. 首先在主进程中，通过SharedModelComponents加载了embeddings和lm_head到共享内存
+2. 然后在每个worker进程中，再次尝试加载所有层，并将特定的层分配到每个GPU上
+
+这确实有些冗余和低效，理想情况下，我们应该直接将特定的层从模型文件加载到对应的设备上，而不需要先完整加载再分配。让我思考一下如何优化这个过程。
+</think>
+
+# 优化模型加载流程
+
+您指出了一个重要问题：当前的实现在CPU上完成加载后又在GPU上重新加载，这个过程不够高效。我们可以优化模型加载流程，通过在worker.py中进行如下修改：
+
+```python:ktransformers/worker.py
+def load_model(self, model_path: str, gguf_path: str):
+    # 如果有共享组件，使用共享组件
+    if self.shared_components:
+        logger.info("Using shared model components...")
+        config = self.shared_components['config']
+        self.tokenizer = AutoTokenizer.from_pretrained(self.shared_components['tokenizer_path'], trust_remote_code=True)
+    else:
+        # 否则正常加载
+        logger.info("Loading tokenizer...")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        
+        logger.info("Loading model config...")
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    
+    torch.set_default_dtype(config.torch_dtype)
+    
+    # 计算每个进程应该处理的层
+    total_layers = config.num_hidden_layers
+    layers_per_process = total_layers // self.num_workers
+    start_layer = self.worker_id * layers_per_process
+    end_layer = start_layer + layers_per_process if self.worker_id < self.num_workers - 1 else total_layers
+    
+    # 内存计算部分保持不变...
+    
+    # 设置GPU ID
+    gpu_id = 0 if self.worker_id < 4 else 1
+    
+    # 只加载本worker需要的层，并直接加载到对应的GPU设备上
+    logger.info(f"Worker {self.worker_id} 直接加载层 {start_layer}-{end_layer-1} 到 GPU:{gpu_id}")
+    
+    # 创建一个精确的设备映射，只把特定层映射到当前GPU
+    device_map = {'model.embed_tokens': 'cpu', 'lm_head': 'cpu', 'model.norm': 'cpu'}
+    for i in range(total_layers):
+        if i >= start_layer and i < end_layer:
+            # 当前worker负责的层映射到GPU
+            device_map[f'model.layers.{i}'] = f'cuda:{gpu_id}'
+        else:
+            # 其他层不加载，使用meta设备
+            device_map[f'model.layers.{i}'] = 'meta'
+    
+    # 直接使用设备映射加载模型
+    try:
+        logger.info("加载部分模型到指定设备...")
+        logger.info(f"设备映射: {device_map}")
+        
+        # 使用低CPU内存模式和指定的设备映射加载模型
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            config=config,
+            device_map=device_map,
+            torch_dtype=torch.float16,
+            low_cpu_mem_usage=True,
+            trust_remote_code=True
+        )
+        
+        # 替换为共享的embedding和lm_head
+        if self.shared_components:
+            self.model.model.embed_tokens = self.shared_components['embed_tokens']
+            self.model.lm_head = self.shared_components['lm_head']
+        
+        logger.info(f"Worker {self.worker_id} 成功加载层 {start_layer}-{end_layer-1}")
+        
+    except Exception as e:
+        logger.error(f"加载模型时出错: {str(e)}")
+        raise
+```
+
+这种实现方式有以下优点：
+
+1. 直接使用设备映射一次性加载模型，避免了多次加载
+2. 只将每个worker需要的层加载到对应的GPU上，其他层使用meta设备（不实际加载）
+3. 保留共享embed_tokens和lm_head的好处，避免多次复制嵌入层
+4. 简化了代码，减少了潜在的错误
+
+这种方式更高效，因为我们直接告诉Hugging Face Transformers库将特定层加载到特定设备，而不是先加载到CPU然后再转移到GPU。
+
+---
+
+_**User**_
+
+把设备映射的输出关掉，太浪费地方了
+
+---
+
+_**Assistant**_
+
 
 
 ---

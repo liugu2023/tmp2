@@ -194,7 +194,8 @@ class ModelWorker:
         # 直接使用设备映射加载模型
         try:
             logger.info("加载部分模型到指定设备...")
-            logger.info(f"设备映射: {device_map}")
+            # 不再输出完整的设备映射，只输出数量
+            logger.info(f"设备映射: 总共 {len(device_map)} 个键，其中 {sum(1 for v in device_map.values() if 'cuda' in str(v))} 个映射到GPU")
             
             # 使用低CPU内存模式和指定的设备映射加载模型
             self.model = AutoModelForCausalLM.from_pretrained(

@@ -123,11 +123,13 @@ class DistributedModel:
             print(f"通信错误: {str(e)}")
             return {'status': 'error', 'error': str(e)}
 
-    def generate(self, input_text=None, **kwargs):
+    def generate(self, input_ids=None, attention_mask=None, input_text=None, **kwargs):
         """生成文本
         
         Args:
-            input_text: 用户输入文本，如果为None则直接使用input_ids和attention_mask
+            input_ids: 输入token IDs (兼容旧版API)
+            attention_mask: 注意力掩码 (兼容旧版API)
+            input_text: 用户输入文本，如果提供则优先使用
             **kwargs: 生成参数
         """
         try:
@@ -147,13 +149,14 @@ class DistributedModel:
                 input_ids = input_tensor
                 attention_mask = torch.ones_like(input_tensor)
             else:
-                # 使用直接提供的input_ids和attention_mask
-                input_ids = kwargs.pop('input_ids', None)
-                attention_mask = kwargs.pop('attention_mask', None)
-                
+                # 确保input_ids已提供
                 if input_ids is None:
                     print("错误: 未提供输入文本或input_ids")
                     return []
+                
+                # 如果没有提供attention_mask，创建全1掩码
+                if attention_mask is None:
+                    attention_mask = torch.ones_like(input_ids) if isinstance(input_ids, torch.Tensor) else [1] * len(input_ids)
             
             # 准备请求数据
             generate_data = {

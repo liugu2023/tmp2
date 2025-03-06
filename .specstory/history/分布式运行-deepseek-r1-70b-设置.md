@@ -14925,6 +14925,250 @@ _**User**_
 
 _**Assistant**_
 
+<think>
+让我对比一下我的`local_chat.py`代码和原始的`local_chat_base.py`。主要区别：
+
+1. 我们的`local_chat.py`是用于与分布式服务器通信的客户端，而`local_chat_base.py`是一个直接在本地加载和运行模型的完整实现。
+
+2. 原版的流程：
+   - 加载模型和tokenizer
+   - 直接将用户输入转换为tokens
+   - 使用模型生成输出
+   - 流式输出结果
+
+3. 分布式版本的流程：
+   - 连接到远程服务器
+   - 将用户输入发送到服务器
+   - 接收服务器生成的tokens
+   - 使用tokenizer解码输出
+
+主要问题似乎是生成的输出格式不匹配预期。原始实现中有一些关键部分，如`tokenizer.apply_chat_template`和使用streamer，而我们的实现中没有这些。
+
+一个重要的差异是原版使用`apply_chat_template`来格式化输入消息，而我们的代码可能没有正确处理消息格式。
+
+我需要更新`local_chat.py`以更好地处理输入输出格式。
+</think>
+
+分析完两个文件后，我发现关键差异在于处理输入和输出的方式。原版的`local_chat_base.py`使用模型特定的聊天模板和一个完整的生成流程，而我们的代码需要调整以匹配这种方式：
+
+```python:ktransformers/local_chat.py
+import zmq
+import torch
+import logging
+import sys
+import os
+import re
+from transformers import AutoTokenizer
+import time
+from typing import Dict, List
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class DistributedModel:
+    """分布式模型客户端类"""
+    
+    def __init__(self, server_address):
+        """初始化分布式模型客户端
+        
+        Args:
+            server_address: 中央服务器地址，如 "10.21.22.206:29400"
+        """
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.REQ)
+        self.socket.connect(f"tcp://{server_address}")
+        self.distributed = True
+        
+        # 初始化tokenizer属性
+        self.tokenizer = None
+        
+        logger.info(f"Connected to central server at {server_address}")
+    
+    def load_model(self, model_path: str, gguf_path: str = None) -> bool:
+        """加载模型"""
+        print(f"正在加载模型: {model_path}")
+        if gguf_path:
+            print(f"使用GGUF模型: {gguf_path}")
+        
+        # 确保路径不为空字符串
+        if not model_path or model_path.strip() == '':
+            print("错误: 模型路径不能为空")
+            return False
+        
+        # 打印详细的请求内容，用于调试
+        request_data = {
+            'model_path': model_path,
+            'gguf_path': gguf_path
+        }
+        print(f"发送加载模型请求: {request_data}")
+        
+        response = self._send_command('load_model', request_data)
+        
+        # 检查response是否是字典
+        if isinstance(response, bool):
+            success = response
+            error = "未知错误" if not success else None
+        else:
+            success = response.get('status') == 'success'
+            error = response.get('error')
+        
+        if not success:
+            print(f"模型加载失败: {error}")
+            return False
+        
+        # 在成功加载模型后，初始化tokenizer
+        try:
+            from transformers import AutoTokenizer
+            self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+            print(f"Tokenizer loaded from {model_path}")
+        except Exception as e:
+            print(f"无法加载tokenizer: {e}")
+            print("将使用默认输出显示")
+            self.tokenizer = None
+        
+        print("模型加载成功!")
+        return True
+    
+    def _send_command(self, command: str, data: Dict = None) -> Dict:
+        """发送命令到服务器并接收响应"""
+        if data is None:
+            data = {}
+        
+        message = {
+            'command': command,
+            'data': data
+        }
+        
+        try:
+            self.socket.send_pyobj(message)
+            response = self.socket.recv_pyobj()
+            
+            # 确保返回字典
+            if not isinstance(response, dict):
+                return {'status': 'success' if response else 'error', 'value': response}
+            
+            return response
+        except Exception as e:
+            print(f"通信错误: {str(e)}")
+            return {'status': 'error', 'error': str(e)}
+
+    def generate(self, input_text=None, **kwargs):
+        """生成文本
+        
+        Args:
+            input_text: 用户输入文本，如果为None则直接使用input_ids和attention_mask
+            **kwargs: 生成参数
+        """
+        try:
+            # 如果提供了输入文本，则创建消息并转换为tokens
+            if input_text is not None:
+                if self.tokenizer is None:
+                    print("错误: Tokenizer不可用")
+                    return []
+                
+                # 创建消息格式，匹配原始实现
+                messages = [{"role": "user", "content": input_text}]
+                # 应用聊天模板处理消息
+                input_tensor = self.tokenizer.apply_chat_template(
+                    messages, add_generation_prompt=True, return_tensors="pt"
+                )
+                
+                input_ids = input_tensor
+                attention_mask = torch.ones_like(input_tensor)
+            else:
+                # 使用直接提供的input_ids和attention_mask
+                input_ids = kwargs.pop('input_ids', None)
+                attention_mask = kwargs.pop('attention_mask', None)
+                
+                if input_ids is None:
+                    print("错误: 未提供输入文本或input_ids")
+                    return []
+            
+            # 准备请求数据
+            generate_data = {
+                'input_ids': input_ids.tolist() if isinstance(input_ids, torch.Tensor) else input_ids,
+                'attention_mask': attention_mask.tolist() if isinstance(attention_mask, torch.Tensor) else attention_mask
+            }
+            # 添加其他生成参数
+            generate_data.update(kwargs)
+            
+            # 发送生成请求
+            print("正在生成回复...")
+            response = self._send_command('generate', generate_data)
+            
+            if response.get('status') != 'success':
+                error_msg = response.get('error', 'Unknown error')
+                print(f"生成失败: {error_msg}")
+                return []
+            
+            # 获取输出token IDs
+            output_ids = response.get('output_ids', [])
+            
+            print("生成成功!")
+            
+            # 处理输出ID
+            if isinstance(output_ids, torch.Tensor):
+                has_outputs = len(output_ids) > 0
+                output_ids_list = output_ids.tolist() 
+            else:
+                has_outputs = bool(output_ids)
+                output_ids_list = output_ids
+                
+            # 处理嵌套列表
+            if has_outputs and isinstance(output_ids_list, list) and isinstance(output_ids_list[0], list):
+                output_ids_list = output_ids_list[0]
+                
+            if has_outputs:
+                # 显示前几个token
+                output_preview = output_ids_list[:10] if len(output_ids_list) > 10 else output_ids_list
+                print(f"生成的tokens: {output_preview}...")
+                
+                # 使用tokenizer解码
+                if self.tokenizer is not None:
+                    try:
+                        # 解码生成的tokens
+                        output_text = self.tokenizer.decode(output_ids_list, skip_special_tokens=True)
+                        # 删除输入部分，只保留新生成的内容
+                        if input_text and output_text.startswith(input_text):
+                            output_text = output_text[len(input_text):].strip()
+                        print(f"\n{output_text}\n")
+                        return output_text
+                    except Exception as e:
+                        print(f"\n解码文本时出错: {str(e)}")
+                        print(f"Token IDs: {output_ids_list[:20]}...\n")
+                else:
+                    print("\n无法解码文本: tokenizer不可用\n")
+            else:
+                print("警告: 未收到任何生成的tokens")
+            
+            return output_ids
+        except Exception as e:
+            print(f"生成过程中出错: {str(e)}")
+            import traceback
+            print(traceback.format_exc())
+            return []
+```
+
+主要改进：
+
+1. 添加了对`input_text`参数的支持，自动创建消息并应用聊天模板
+2. 使用`tokenizer.apply_chat_template()`处理消息格式，与原版保持一致
+3. 改进了输出处理，使用`skip_special_tokens=True`移除特殊标记
+4. 删除了过于复杂的后处理函数，转为使用tokenizer的自带功能
+5. 添加了更多的错误处理和类型检查
+
+这个版本应该能更好地模拟原始的聊天体验，特别是正确处理输入格式和解码输出。
+
+---
+
+_**User**_
+
+ERROR:__main__:Error: DistributedModel.generate() takes from 1 to 2 positional arguments but 3 were given
+
+---
+
+_**Assistant**_
+
 
 
 ---

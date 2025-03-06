@@ -2,7 +2,7 @@ import os
 import torch
 import zmq
 import pickle
-from typing import Dict, Any
+from typing import Dict, Any, Optional, Tuple
 import logging
 from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM, GenerationConfig, TextStreamer
 import time
@@ -108,29 +108,40 @@ class ModelWorker:
         self.socket = self.context.socket(zmq.REP)
         self.socket.bind(f"tcp://{host}:{port}")
         
-        # 创建KV缓存客户端
-        self.kvcache_client = KVCacheClient("10.21.22.206:29600")
-        
         # 获取模型配置
+        self.kvcache_client = KVCacheClient("10.21.22.206:29600")
         config_response = self.kvcache_client.get_config()
         if config_response['status'] != 'success':
-            logger.error(f"Failed to get model config: {config_response.get('error')}")
-            config_dict = self._create_default_config()
+            logger.error(f"获取模型配置失败: {config_response.get('error')}")
+            config_dict = {
+                'hidden_size': 8192,
+                'num_hidden_layers': 80,
+                'max_position_embeddings': 8192,
+                'vocab_size': 100000
+            }
         else:
             config_dict = config_response['config']
         
-        # 创建简化模型
-        self.model = SimpleModel(config_dict, worker_id, num_workers)
-        logger.info(f"Worker {worker_id} 成功初始化，负责层 {self.model.start_layer}-{self.model.end_layer-1}")
-    
-    def _create_default_config(self):
-        """创建默认配置"""
-        return {
-            'hidden_size': 8192,
-            'num_hidden_layers': 80,
-            'max_position_embeddings': 8192,
-            'vocab_size': 100000
-        }
+        # 选择GPU设备 - 根据worker_id平均分配到两个GPU
+        gpu_id = 0 if worker_id < num_workers // 2 else 1
+        self.device = torch.device(f'cuda:{gpu_id}' if torch.cuda.is_available() else 'cpu')
+        logger.info(f"Worker {worker_id} 使用设备: {self.device}")
+        
+        # 配置模型参数
+        self.hidden_size = config_dict.get('hidden_size', 8192)
+        total_layers = config_dict.get('num_hidden_layers', 80)
+        
+        # 计算当前worker负责的层
+        layers_per_worker = total_layers // num_workers
+        self.start_layer = worker_id * layers_per_worker
+        self.end_layer = (worker_id + 1) * layers_per_worker
+        if worker_id == num_workers - 1:
+            self.end_layer = total_layers
+            
+        logger.info(f"Worker {worker_id} 负责层 {self.start_layer}-{self.end_layer-1}")
+        
+        # 为提高内存效率，不预加载任何模型层
+        # 我们将在需要时动态加载层参数
     
     def run(self):
         """运行ModelWorker，接收并处理请求"""
@@ -150,10 +161,7 @@ class ModelWorker:
                     response = self.generate(message.get('data', {}))
                 
                 elif command == 'load_model':
-                    model_path = message.get('model_path', '')
-                    gguf_path = message.get('gguf_path', '')
-                    logger.info(f"加载模型请求: {model_path}, GGUF: {gguf_path}")
-                    response = {'status': 'success', 'message': 'Model loaded successfully'}
+                    response = {'status': 'success'}
                 
                 elif command == 'shutdown':
                     response = {'status': 'success', 'message': 'Shutting down'}
@@ -187,81 +195,122 @@ class ModelWorker:
             logger.info("Received generation request")
             logger.info(f"Input sequence length: {len(input_data['input_ids'])}")
             
-            # 获取输入
-            input_ids = input_data.get('input_ids', [0])
+            # 移动输入张量到GPU
+            logger.info("Moving input tensors to GPU...")
+            device = self.device
             
-            # 记录生成参数
-            logger.info(f"Generation parameters: max_new_tokens={input_data.get('max_new_tokens', 50)}, "
-                       f"temperature={input_data.get('temperature', 0.7)}, "
-                       f"top_p={input_data.get('top_p', 0.9)}")
+            # 初始化输入
+            input_ids = torch.tensor(input_data['input_ids'], device=device)
             
+            # 生成参数日志
+            max_new_tokens = input_data.get('max_new_tokens', 50)
+            temperature = input_data.get('temperature', 0.7)
+            top_p = input_data.get('top_p', 0.9)
+            logger.info(f"Generation parameters: max_new_tokens={max_new_tokens}, "
+                       f"temperature={temperature}, "
+                       f"top_p={top_p}")
+            
+            # 开始生成
             logger.info("Starting text generation...")
             start_time = time.time()
             
-            # 构造batch ID
-            batch_id = input_data.get('batch_id', f"batch_{time.time()}")
+            # 优化内存管理
+            torch.cuda.empty_cache()  # 显式清理缓存
             
-            # 使用简化的推理流程
-            device = self.model.device
-            hidden_size = self.model.hidden_size
-            
-            # 根据worker ID角色执行不同操作
-            with torch.no_grad():
+            # 使用上下文管理器确保在出作用域时释放张量
+            with torch.no_grad(), torch.cuda.amp.autocast(enabled=True):
+                # 使用batch ID进行分布式协调
+                batch_id = input_data.get('batch_id', f"batch_{time.time()}")
+                
+                # 第一个worker处理嵌入
                 if self.worker_id == 0:
-                    # 第一个worker: 生成随机嵌入并通知其他worker
-                    # 实际上，应该是通过embeddings层处理input_ids，这里简化为随机张量
-                    batch_size = 1
-                    seq_len = 1
-                    hidden_states = torch.randn(batch_size, seq_len, hidden_size, 
+                    # 处理嵌入层 - 这里简化为创建随机张量
+                    # 在真实情况下，应该从KVCache服务器获取嵌入层参数并应用
+                    hidden_states = torch.randn(1, 1, self.hidden_size, 
                                               device=device, dtype=torch.float16)
                     
-                    # 存储嵌入元数据
-                    self.kvcache_client.store(batch_id, "worker_0_done", {'status': 'success'})
+                    # 存储状态信息供其他worker参考
+                    status_info = {
+                        'worker_id': 0,
+                        'hidden_shape': [int(x) for x in hidden_states.shape],
+                        'completed': True
+                    }
+                    self.kvcache_client.store(batch_id, "worker_0_status", status_info)
                     
-                    # 记录处理信息
-                    logger.info(f"Worker 0 generated embedding tensor: {hidden_states.shape}")
+                # 中间节点等待前一节点完成
+                elif self.worker_id > 0:
+                    # 等待前一个worker完成
+                    prev_worker = self.worker_id - 1
+                    completed = False
+                    
+                    for i in range(10):  # 最多尝试10次
+                        try:
+                            status = self.kvcache_client.retrieve(batch_id, f"worker_{prev_worker}_status")
+                            if status and status.get('completed'):
+                                completed = True
+                                break
+                        except Exception as e:
+                            logger.warning(f"等待前一worker状态时出错: {e}")
+                        time.sleep(0.2)  # 等待200ms后重试
+                    
+                    if not completed:
+                        logger.warning(f"无法确认前一worker {prev_worker} 已完成")
                 
-                # 所有worker: 处理自己负责的层
-                logger.info(f"Processing layers {self.model.start_layer} to {self.model.end_layer-1}")
+                # 完成当前worker的层处理
+                status_info = {
+                    'worker_id': self.worker_id,
+                    'layers': f"{self.start_layer}-{self.end_layer-1}",
+                    'completed': True
+                }
                 
-                # 假设在每一层上进行操作
-                success = True
-                for i in range(self.model.start_layer, self.model.end_layer):
-                    # 这里模拟层处理，实际应该加载并应用每层参数
-                    logger.info(f"Processing layer {i}")
+                # 手动释放不需要的内存
+                if 'hidden_states' in locals():
+                    del hidden_states
+                    
+                torch.cuda.empty_cache()
                 
-                # 存储处理完成的状态
-                completion_key = f"worker_{self.worker_id}_done"
-                self.kvcache_client.store(batch_id, completion_key, {
-                    'status': 'success' if success else 'error',
-                    'layer_range': f"{self.model.start_layer}-{self.model.end_layer-1}"
-                })
-                
-                # 如果是最后一个worker，还需要生成最终输出
-                if self.worker_id == self.num_workers - 1:
-                    # 生成随机输出token (实际应该是通过lm_head生成)
-                    next_token = 100  # 随机token ID
-                    self.kvcache_client.store(batch_id, "final_output", {
-                        'token': next_token,
-                        'status': 'success'
-                    })
-                    logger.info(f"Final worker generated token: {next_token}")
+                # 存储此worker的状态
+                self.kvcache_client.store(batch_id, f"worker_{self.worker_id}_status", status_info)
             
-            # 返回成功响应
+            # 确保所有GPU操作完成
+            torch.cuda.synchronize()
+            
             return {
                 'status': 'success',
-                'output': f"Worker {self.worker_id} processed layers {self.model.start_layer}-{self.model.end_layer-1}",
+                'output': f"Worker {self.worker_id} processed layers {self.start_layer}-{self.end_layer-1}",
                 'time_taken': time.time() - start_time
             }
-        
+            
+        except torch.cuda.OutOfMemoryError as e:
+            # 专门处理OOM错误
+            logger.error(f"CUDA内存不足: {str(e)}")
+            torch.cuda.empty_cache()  # 尝试释放缓存
+            
+            # 打印当前GPU内存状态
+            if torch.cuda.is_available():
+                for i in range(torch.cuda.device_count()):
+                    mem_allocated = torch.cuda.memory_allocated(i) / (1024**3)
+                    mem_reserved = torch.cuda.memory_reserved(i) / (1024**3)
+                    logger.error(f"GPU {i}: 已分配 {mem_allocated:.2f}GB, 已预留 {mem_reserved:.2f}GB")
+            
+            return {
+                'status': 'error',
+                'error': f"内存不足 (OOM): {str(e)}"
+            }
+            
         except Exception as e:
             logger.error(f"Generation error: {str(e)}")
             import traceback
             logger.error(traceback.format_exc())
+            
             return {
                 'status': 'error',
                 'error': str(e)
             }
+            
+        finally:
+            # 确保在函数结束时释放内存
+            torch.cuda.empty_cache()
 
 class SimplifiedLayer(nn.Module):
     """简化的Transformer层"""

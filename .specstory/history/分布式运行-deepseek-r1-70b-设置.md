@@ -13844,6 +13844,87 @@ def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
                 if self.worker_id == self.num_workers - 1:
                     self._store_data(batch_id, "final_output", output_token_ids)
             
+            except Exception as e:
+                logger.error(f"处理层时发生错误: {str(e)}")
+                import traceback
+                logger.error(traceback.format_exc())
+                raise
+        
+        # 确保所有GPU操作完成
+        torch.cuda.synchronize()
+        
+        # 返回成功响应，添加output_ids字段
+        return {
+            'status': 'success',
+            'message': f"Worker {self.worker_id} processed layers {self.start_layer}-{self.end_layer-1}",
+            'time_taken': time.time() - start_time,
+            # 关键是添加这个字段并确保它包含实际的token IDs
+            'output_ids': output_token_ids if self.worker_id == self.num_workers - 1 else input_ids
+        }
+```
+
+现在让我们修改 `local_chat.py` 中的 `generate` 方法，确保正确显示输出：
+
+```python:ktransformers/local_chat.py
+def generate(self, input_ids, attention_mask, **kwargs):
+    """生成文本"""
+    try:
+        # 准备请求数据
+        generate_data = {
+            'input_ids': input_ids,
+            'attention_mask': attention_mask
+        }
+        # 添加其他生成参数
+        generate_data.update(kwargs)
+        
+        # 发送生成请求
+        response = self._send_command('generate', generate_data)
+        
+        if response.get('status') != 'success':
+            error_msg = response.get('error', 'Unknown error')
+            print(f"生成失败: {error_msg}")
+            return []
+        
+        # 获取输出token IDs
+        output_ids = response.get('output_ids', [])
+        
+        print("生成成功!")
+        if output_ids:
+            print(f"生成的tokens: {output_ids[:10]}...")
+            if self.tokenizer:
+                # 解码tokens为文本
+                output_text = self.tokenizer.decode(output_ids)
+                print(f"\n生成的文本:\n{output_text}\n")
+        else:
+            print("警告: 未收到任何生成的tokens")
+        
+        return output_ids
+    
+    except Exception as e:
+        print(f"生成过程中出错: {str(e)}")
+        import traceback
+        print(traceback.format_exc())
+        return []
+```
+
+这些修改应该能解决两个问题：
+
+1. 修复了torch.cuda.amp.autocast的弃用警告
+2. 改进了token输出和文本显示
+
+确保所有worker都正确返回tokens，最后一个worker特别添加了新生成的tokens，而客户端会显示最终的tokens和解码后的文本。
+
+---
+
+_**User**_
+
+模型加载失败: KV缓存服务器加载模型失败: Incorrect path_or_model_id: ''. Please provide either the path to a local folder or the repo_id of a model on the Hub.
+
+---
+
+_**Assistant**_
+
+
 
 ---
 

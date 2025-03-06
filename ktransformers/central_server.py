@@ -239,8 +239,18 @@ class CentralServer:
             logger.info(f"Received command: {command}")
             
             if command == 'load_model':
-                model_path = message.get('model_path', '')
+                # 从message直接获取参数，而不是使用message.get
+                # 这样如果缺少必要参数，会立即抛出KeyError
+                model_path = message['model_path']
                 gguf_path = message.get('gguf_path', '')
+                
+                # 验证model_path不为空
+                if not model_path:
+                    return {'status': 'error', 'error': '模型路径不能为空'}
+                
+                # 打印接收到的路径，以便调试
+                logger.info(f"从客户端收到路径 - model_path: '{model_path}', gguf_path: '{gguf_path}'")
+                
                 return self.load_model_on_workers(model_path, gguf_path)
             elif command == 'generate':
                 return self.generate(message.get('data', {}))
@@ -255,6 +265,10 @@ class CentralServer:
                     'status': 'error',
                     'error': f'Unknown command: {command}'
                 }
+        except KeyError as e:
+            # 处理缺少必要参数的情况
+            logger.error(f"消息缺少必要参数: {str(e)}")
+            return {'status': 'error', 'error': f'缺少必要参数: {str(e)}'}
         except Exception as e:
             logger.error(f"Error processing message: {str(e)}")
             import traceback

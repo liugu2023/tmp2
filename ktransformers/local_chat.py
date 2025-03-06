@@ -41,18 +41,29 @@ class DistributedModel:
         self.socket.connect(f"tcp://{server_address}")
         logger.info(f"Connected to central server at {server_address}")
         
-    def load_model(self, model_path: str, gguf_path: str):
-        message = {
-            'command': 'load_model',
-            'model_path': model_path,
-            'gguf_path': gguf_path
-        }
-        logger.info("Requesting model load from central server...")
-        self.socket.send_pyobj(message)
-        response = self.socket.recv_pyobj()
-        if response['status'] != 'success':
-            raise Exception(f"Failed to load model: {response.get('error')}")
-        logger.info("Model loaded successfully on all workers")
+    def load_model(self, model_path: str, gguf_path: str = None) -> bool:
+        """加载模型"""
+        if self.distributed:
+            # 向中央服务器发送加载请求
+            logger.info("Requesting model load from central server...")
+            self.socket.send_pyobj({
+                'command': 'load_model',
+                'model_path': model_path,
+                'gguf_path': gguf_path
+            })
+            response = self.socket.recv_pyobj()
+            
+            if response['status'] != 'success':
+                # 注意这里要处理error可能为None的情况
+                error_msg = response.get('error')
+                raise Exception(f"Failed to load model: {error_msg or 'Unknown error'}")
+            
+            logger.info("Model loaded successfully")
+            return True
+        else:
+            # 本地加载模型
+            self.model, self.tokenizer = load_model_and_tokenizer(model_path, gguf_path)
+            return True
 
     def generate(self, input_ids, attention_mask, **kwargs):
         try:

@@ -180,6 +180,41 @@ class CentralServer:
             }
             self.active_batches[batch_id]['completed'] = True
     
+    def process_client_message(self, message: Dict[str, Any]) -> Dict[str, Any]:
+        """处理客户端消息"""
+        command = message.get('command', '')
+        logger.info(f"Received command: {command}")
+        
+        try:
+            if command == 'load_model':
+                model_path = message.get('model_path', '')
+                gguf_path = message.get('gguf_path', '')
+                success = self.load_model_on_workers(model_path, gguf_path)
+                return {
+                    'status': 'success' if success else 'error',
+                    'error': None if success else 'Failed to load model on workers'
+                }
+            elif command == 'generate':
+                data = message.get('data', {})
+                result = self.generate(data)
+                return result
+            elif command == 'shutdown':
+                self.shutdown_workers()
+                return {'status': 'success'}
+            else:
+                return {
+                    'status': 'error',
+                    'error': f'Unknown command: {command}'
+                }
+        except Exception as e:
+            logger.error(f"Error processing message: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {
+                'status': 'error',
+                'error': str(e)
+            }
+    
     def run(self):
         """主服务循环"""
         logger.info("Central server is running and ready to accept requests")
@@ -188,48 +223,8 @@ class CentralServer:
             while True:
                 # 接收客户端请求
                 message = self.client_socket.recv_pyobj()
-                command = message.get('command')
-                
-                if command == 'load_model':
-                    success = self.load_model_on_workers(
-                        message['model_path'],
-                        message['gguf_path']
-                    )
-                    self.client_socket.send_pyobj({
-                        'status': 'success' if success else 'error'
-                    })
-                
-                elif command == 'generate':
-                    result = self.generate(message['data'])
-                    self.client_socket.send_pyobj(result)
-                
-                elif command == 'shutdown':
-                    logger.info("Shutting down central server and all workers")
-                    
-                    # 关闭所有worker
-                    for addr, socket in self.workers:
-                        try:
-                            socket.send_pyobj({'command': 'shutdown'})
-                            socket.recv_pyobj()
-                        except Exception as e:
-                            logger.error(f"Error shutting down worker {addr}: {str(e)}")
-                    
-                    # 关闭KV Cache服务器
-                    try:
-                        self.kvcache_socket.send_pyobj({'command': 'shutdown'})
-                        self.kvcache_socket.recv_pyobj()
-                    except Exception as e:
-                        logger.error(f"Error shutting down KV Cache server: {str(e)}")
-                    
-                    self.client_socket.send_pyobj({'status': 'shutdown'})
-                    break
-                
-                else:
-                    logger.error(f"Unknown command: {command}")
-                    self.client_socket.send_pyobj({
-                        'status': 'error',
-                        'error': f"Unknown command: {command}"
-                    })
+                result = self.process_client_message(message)
+                self.client_socket.send_pyobj(result)
         
         finally:
             logger.info("Cleaning up central server resources")

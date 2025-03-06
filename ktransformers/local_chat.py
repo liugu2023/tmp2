@@ -15,7 +15,7 @@ import locale
 import torch
 from transformers import AutoTokenizer
 import time
-from typing import Dict
+from typing import Dict, List
 import re
 
 logging.basicConfig(level=logging.INFO)
@@ -90,7 +90,7 @@ class DistributedModel:
         # 在成功加载模型后，初始化tokenizer
         try:
             from transformers import AutoTokenizer
-            self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+            self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
             print(f"Tokenizer loaded from {model_path}")
         except Exception as e:
             print(f"无法加载tokenizer: {e}")
@@ -123,18 +123,48 @@ class DistributedModel:
             print(f"通信错误: {str(e)}")
             return {'status': 'error', 'error': str(e)}
 
-    def generate(self, input_ids, attention_mask, **kwargs):
-        """生成文本"""
+    def generate(self, input_text=None, **kwargs):
+        """生成文本
+        
+        Args:
+            input_text: 用户输入文本，如果为None则直接使用input_ids和attention_mask
+            **kwargs: 生成参数
+        """
         try:
+            # 如果提供了输入文本，则创建消息并转换为tokens
+            if input_text is not None:
+                if self.tokenizer is None:
+                    print("错误: Tokenizer不可用")
+                    return []
+                
+                # 创建消息格式，匹配原始实现
+                messages = [{"role": "user", "content": input_text}]
+                # 应用聊天模板处理消息
+                input_tensor = self.tokenizer.apply_chat_template(
+                    messages, add_generation_prompt=True, return_tensors="pt"
+                )
+                
+                input_ids = input_tensor
+                attention_mask = torch.ones_like(input_tensor)
+            else:
+                # 使用直接提供的input_ids和attention_mask
+                input_ids = kwargs.pop('input_ids', None)
+                attention_mask = kwargs.pop('attention_mask', None)
+                
+                if input_ids is None:
+                    print("错误: 未提供输入文本或input_ids")
+                    return []
+            
             # 准备请求数据
             generate_data = {
-                'input_ids': input_ids,
-                'attention_mask': attention_mask
+                'input_ids': input_ids.tolist() if isinstance(input_ids, torch.Tensor) else input_ids,
+                'attention_mask': attention_mask.tolist() if isinstance(attention_mask, torch.Tensor) else attention_mask
             }
             # 添加其他生成参数
             generate_data.update(kwargs)
             
             # 发送生成请求
+            print("正在生成回复...")
             response = self._send_command('generate', generate_data)
             
             if response.get('status') != 'success':
@@ -146,56 +176,43 @@ class DistributedModel:
             output_ids = response.get('output_ids', [])
             
             print("生成成功!")
-            # 修复: 使用长度检查而不是直接用张量作为布尔值
+            
+            # 处理输出ID
             if isinstance(output_ids, torch.Tensor):
                 has_outputs = len(output_ids) > 0
+                output_ids_list = output_ids.tolist() 
             else:
                 has_outputs = bool(output_ids)
-            
-            if has_outputs:
-                # 确保输出为列表，以便切片操作安全
-                if isinstance(output_ids, torch.Tensor):
-                    # 修复: 确保转换为一维列表
-                    output_ids_list = output_ids.tolist()
-                    if isinstance(output_ids_list, list) and isinstance(output_ids_list[0], list):
-                        # 处理嵌套列表情况 [[id1, id2, ...]]
-                        output_ids_list = output_ids_list[0]
-                    output_preview = output_ids_list[:10]
-                else:
-                    # 处理已经是列表的情况
-                    output_ids_list = output_ids
-                    if isinstance(output_ids_list, list) and len(output_ids_list) > 0 and isinstance(output_ids_list[0], list):
-                        # 处理嵌套列表
-                        output_ids_list = output_ids_list[0]
-                    output_preview = output_ids_list[:10]
+                output_ids_list = output_ids
                 
+            # 处理嵌套列表
+            if has_outputs and isinstance(output_ids_list, list) and isinstance(output_ids_list[0], list):
+                output_ids_list = output_ids_list[0]
+                
+            if has_outputs:
+                # 显示前几个token
+                output_preview = output_ids_list[:10] if len(output_ids_list) > 10 else output_ids_list
                 print(f"生成的tokens: {output_preview}...")
                 
-                # 安全地检查tokenizer属性
-                tokenizer = getattr(self, 'tokenizer', None)
-                if tokenizer is not None:
+                # 使用tokenizer解码
+                if self.tokenizer is not None:
                     try:
-                        # 使用已展平的一维列表进行解码
-                        output_text = tokenizer.decode(output_ids_list)
-                        
-                        # 应用后处理
-                        cleaned_text = self._post_process_output(output_text)
-                        
-                        print(f"\n生成的文本:\n{cleaned_text}\n")
-                        
-                        # 打印原始文本(可选，用于调试)
-                        if '--debug' in sys.argv:
-                            print(f"\n原始生成文本:\n{output_text}\n")
+                        # 解码生成的tokens
+                        output_text = self.tokenizer.decode(output_ids_list, skip_special_tokens=True)
+                        # 删除输入部分，只保留新生成的内容
+                        if input_text and output_text.startswith(input_text):
+                            output_text = output_text[len(input_text):].strip()
+                        print(f"\n{output_text}\n")
+                        return output_text
                     except Exception as e:
                         print(f"\n解码文本时出错: {str(e)}")
-                        print(f"Token IDs: {output_ids_list}\n")
+                        print(f"Token IDs: {output_ids_list[:20]}...\n")
                 else:
                     print("\n无法解码文本: tokenizer不可用\n")
             else:
                 print("警告: 未收到任何生成的tokens")
             
             return output_ids
-        
         except Exception as e:
             print(f"生成过程中出错: {str(e)}")
             import traceback

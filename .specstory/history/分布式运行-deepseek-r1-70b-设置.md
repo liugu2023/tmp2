@@ -15992,7 +15992,181 @@ optimize_and_load_gguf(model, optimize_config_path, gguf_path, config)调用方�
 _**Assistant**_
 
 <think>
-看起来用户需要我们修复GGUF模型加载问题，但我们不能使用 optimize_and_load_
+看起来用户需要我们修复GGUF模型加载问题，但我们不能使用 optimize_and_load_gguf 方法，因为尝试导入 GGUFLoader 失败了。
+
+整体情况：
+1. 有报错：cannot import name 'GGUFLoader' from 'ktransformers.util.custom_gguf'
+2. 用户似乎需要支持 GGUF 模型加载功能，但缺少相关实现
+3. 用户提供了 local_chat_base.py 作为参考，其中可能包含正确的导入和使用方式
+
+我应该先看看 local_chat_base.py 中是如何导入和使用这些功能的，然后在 worker.py 中实现类似的导入和调用方式。
+</think>
+
+我看到了问题所在。需要正确导入和使用GGUF相关功能。让我们通过查看`local_chat_base.py`中的方法，实现正确的GGUF导入和加载：
+
+```python:ktransformers/worker.py
+def load_model(self, model_path: str, gguf_path: str) -> Dict[str, Any]:
+    """加载模型"""
+    try:
+        logger.info(f"开始加载模型: {model_path}")
+        
+        # 先验证路径
+        if not model_path:
+            logger.error("模型路径为空")
+            return {'status': 'error', 'error': '模型路径不能为空'}
+        
+        # 加载tokenizer
+        logger.info("加载tokenizer...")
+        try:
+            from transformers import AutoTokenizer
+            self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+            logger.info("Tokenizer加载成功")
+        except Exception as e:
+            logger.error(f"加载tokenizer出错: {str(e)}")
+            return {'status': 'error', 'error': f"加载tokenizer失败: {str(e)}"}
+        
+        # 加载模型配置
+        logger.info("加载模型配置...")
+        try:
+            from transformers import AutoConfig
+            self.config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+            # 设置默认数据类型
+            torch.set_default_dtype(self.config.torch_dtype)
+            logger.info(f"模型配置加载成功，类型: {self.config.model_type}")
+        except Exception as e:
+            logger.error(f"加载模型配置出错: {str(e)}")
+            return {'status': 'error', 'error': f"加载模型配置失败: {str(e)}"}
+        
+        # 加载模型
+        logger.info("加载模型权重...")
+        try:
+            # 检查自定义模型类型
+            # 与local_chat_base.py保持一致的自定义模型处理
+            custom_models = {
+                "DeepseekV2ForCausalLM": "DeepseekV2ForCausalLM",
+                "DeepseekV3ForCausalLM": "DeepseekV3ForCausalLM",
+                "Qwen2MoeForCausalLM": "Qwen2MoeForCausalLM",
+                "LlamaForCausalLM": "LlamaForCausalLM",
+                "MixtralForCausalLM": "MixtralForCausalLM",
+            }
+            
+            # 在元设备上创建模型框架
+            with torch.device("meta"):
+                from transformers import AutoModelForCausalLM
+                
+                if hasattr(self.config, 'architectures') and self.config.architectures[0] in custom_models:
+                    logger.info(f"使用自定义模型类: {self.config.architectures[0]}")
+                    
+                    # 从 local_chat_base.py 类似的导入方式
+                    from ktransformers.models.modeling_deepseek import DeepseekV2ForCausalLM
+                    from ktransformers.models.modeling_qwen2_moe import Qwen2MoeForCausalLM
+                    from ktransformers.models.modeling_deepseek_v3 import DeepseekV3ForCausalLM
+                    from ktransformers.models.modeling_llama import LlamaForCausalLM
+                    from ktransformers.models.modeling_mixtral import MixtralForCausalLM
+                    
+                    custom_model_classes = {
+                        "DeepseekV2ForCausalLM": DeepseekV2ForCausalLM,
+                        "DeepseekV3ForCausalLM": DeepseekV3ForCausalLM,
+                        "Qwen2MoeForCausalLM": Qwen2MoeForCausalLM,
+                        "LlamaForCausalLM": LlamaForCausalLM,
+                        "MixtralForCausalLM": MixtralForCausalLM,
+                    }
+                    
+                    # 设置注意力实现方式
+                    if "Qwen2Moe" in self.config.architectures[0]:
+                        self.config._attn_implementation = "flash_attention_2"
+                    if "Llama" in self.config.architectures[0]:
+                        self.config._attn_implementation = "eager"
+                    if "Mixtral" in self.config.architectures[0]:
+                        self.config._attn_implementation = "flash_attention_2"
+                        
+                    self.model = custom_model_classes[self.config.architectures[0]](self.config)
+                else:
+                    logger.info("使用标准AutoModelForCausalLM")
+                    self.model = AutoModelForCausalLM.from_config(
+                        self.config, trust_remote_code=True, attn_implementation="flash_attention_2"
+                    )
+            
+            # 获取优化规则路径
+            # 仿照local_chat_base.py的处理方式
+            from ktransformers.optimize.optimize import optimize_and_load_gguf
+            
+            ktransformer_rules_dir = (
+                os.path.dirname(os.path.abspath(__file__)) + "/../ktransformers/optimize/optimize_rules/"
+            )
+            default_optimize_rules = {
+                "DeepseekV2ForCausalLM": ktransformer_rules_dir + "DeepSeek-V2-Chat.yaml",
+                "DeepseekV3ForCausalLM": ktransformer_rules_dir + "DeepSeek-V3-Chat.yaml",
+                "Qwen2MoeForCausalLM": ktransformer_rules_dir + "Qwen2-57B-A14B-Instruct.yaml",
+                "LlamaForCausalLM": ktransformer_rules_dir + "Internlm2_5-7b-Chat-1m.yaml",
+                "MixtralForCausalLM": ktransformer_rules_dir + "Mixtral.yaml",
+            }
+            
+            optimize_config_path = None
+            if hasattr(self.config, 'architectures') and self.config.architectures[0] in default_optimize_rules:
+                logger.info(f"使用默认优化规则: {self.config.architectures[0]}")
+                optimize_config_path = default_optimize_rules[self.config.architectures[0]]
+            
+            # 使用optimize_and_load_gguf加载GGUF模型
+            logger.info(f"使用optimize_and_load_gguf加载模型: {gguf_path}")
+            optimize_and_load_gguf(self.model, optimize_config_path, gguf_path, self.config)
+                
+            # 设置为评估模式
+            self.model.eval()
+            logger.info("模型加载成功，设置为评估模式")
+            
+            # 加载生成配置
+            try:
+                from transformers import GenerationConfig
+                self.model.generation_config = GenerationConfig.from_pretrained(model_path)
+                logger.info("生成配置加载成功")
+            except Exception as e:
+                logger.warning(f"无法加载生成配置，使用默认配置: {str(e)}")
+                # 创建默认生成配置
+                from transformers import GenerationConfig
+                gen_config = GenerationConfig(
+                    temperature=0.7,
+                    top_p=0.9,
+                    do_sample=True
+                )
+                self.model.generation_config = gen_config
+                
+            # 确保pad_token_id设置
+            if self.model.generation_config.pad_token_id is None:
+                self.model.generation_config.pad_token_id = self.model.generation_config.eos_token_id
+                
+            logger.info("模型和相关配置加载完成")
+            return {'status': 'success', 'message': '模型加载成功'}
+            
+        except Exception as e:
+            logger.error(f"加载模型出错: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {'status': 'error', 'error': f"加载模型失败: {str(e)}"}
+            
+    except Exception as e:
+        logger.error(f"模型加载过程中出现未知错误: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return {'status': 'error', 'error': f"未知错误: {str(e)}"}
+```
+
+
+这个实现：
+
+1. 参考`local_chat_base.py`中的模型加载方式
+2. 包括了自定义模型类型的处理
+3. 正确设置注意力实现方式
+4. 使用相同的优化规则路径和默认规则
+5. 完整的错误处理和日志记录
+
+这应该与`local_chat_base.py`中的实现保持一致，解决GGUF导入和加载问题。
+
+---
+
+_**User**_
+
+Injecting model as ktransformers.operators.models . KLlamaModel卡到这一步了，请注意，这个函数我确认已经实现
 
 ---
 

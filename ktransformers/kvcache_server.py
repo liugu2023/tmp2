@@ -9,7 +9,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class KVCacheServer:
-    def __init__(self, port: int = 29600, max_retries: int = 5):
+    def __init__(self, port: int = 29600, max_retries: int = 5, model_path: str = None, gguf_path: str = None):
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.REP)
         
@@ -35,6 +35,15 @@ class KVCacheServer:
         # {batch_id: {layer_id: {'k': tensor, 'v': tensor}}}
         self.cache = {}
         logger.info(f"KV Cache Server started on port {port}")
+        
+        # 如果提供了模型路径，初始化模型加载器
+        self.model_loader = None
+        if model_path:
+            from ktransformers.model_loader import ModelLoader
+            logger.info(f"初始化模型加载器，模型路径: {model_path}")
+            self.model_loader = ModelLoader(model_path, gguf_path)
+            self.model_loader.load_model()
+            logger.info("模型加载器初始化完成")
     
     def run(self):
         while True:
@@ -92,6 +101,57 @@ class KVCacheServer:
                     logger.info("Shutting down KV Cache Server...")
                     self.socket.send_pyobj({'status': 'success'})
                     break
+                
+                # 添加模型参数相关命令
+                elif command == 'get_config':
+                    if self.model_loader:
+                        self.socket.send_pyobj({
+                            'status': 'success',
+                            'config': self.model_loader.get_config()
+                        })
+                    else:
+                        self.socket.send_pyobj({
+                            'status': 'error',
+                            'error': 'Model loader not initialized'
+                        })
+                        
+                elif command == 'get_tokenizer':
+                    if self.model_loader:
+                        self.socket.send_pyobj({
+                            'status': 'success',
+                            'tokenizer': self.model_loader.get_tokenizer()
+                        })
+                    else:
+                        self.socket.send_pyobj({
+                            'status': 'error',
+                            'error': 'Model loader not initialized'
+                        })
+                        
+                elif command == 'get_layer_params':
+                    layer_index = message['layer_index']
+                    if self.model_loader:
+                        params = self.model_loader.get_layer_params(layer_index)
+                        self.socket.send_pyobj({
+                            'status': 'success' if params is not None else 'error',
+                            'params': params
+                        })
+                    else:
+                        self.socket.send_pyobj({
+                            'status': 'error',
+                            'error': 'Model loader not initialized'
+                        })
+                        
+                elif command == 'get_shared_params':
+                    if self.model_loader:
+                        self.socket.send_pyobj({
+                            'status': 'success',
+                            'params': self.model_loader.get_shared_params()
+                        })
+                    else:
+                        self.socket.send_pyobj({
+                            'status': 'error',
+                            'error': 'Model loader not initialized'
+                        })
                 
             except Exception as e:
                 logger.error(f"Error in KV Cache Server: {str(e)}")

@@ -7626,6 +7626,243 @@ _**User**_
 
 _**Assistant**_
 
+<think>
+您的请求是要关闭设备映射的输出，因为它太占日志空间了。这是一个很好的建议，因为设备映射日志在层数多的情况下会非常冗长。
+
+我应该修改代码，删除或者简化设备映射的日志输出，只保留必要的信息。
+</think>
+
+```python:ktransformers/worker.py
+# 直接使用设备映射加载模型
+try:
+    logger.info("加载部分模型到指定设备...")
+    # 不再输出完整的设备映射，只输出数量
+    logger.info(f"设备映射: 总共 {len(device_map)} 个键，其中 {sum(1 for v in device_map.values() if 'cuda' in str(v))} 个映射到GPU")
+    
+    # 使用低CPU内存模式和指定的设备映射加载模型
+    self.model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        config=config,
+        device_map=device_map,
+        torch_dtype=torch.float16,
+        low_cpu_mem_usage=True,
+        trust_remote_code=True
+    )
+```
+
+这个修改会使日志更简洁，只显示设备映射的键总数和实际映射到GPU的数量，而不是打印整个详细的映射表。这样可以大大减少日志输出的行数，同时保留关键信息。
+
+---
+
+_**User**_
+
+(ds) root@compute06:/archive/liugu/ds/ktransformers# ./start_service.sh
+Starting services on compute06 (206)...
+检查并终止占用端口的进程...
+正在终止使用端口 29600 的进程 (PID: 72591)...
+Starting KV Cache Server...
+Starting Model Sharder...
+INFO:__main__:KV Cache Server 成功绑定到端口 29600
+INFO:__main__:KV Cache Server started on port 29600
+INFO:__main__:Loading shared model components...
+INFO:__main__:Loading model config...
+INFO:__main__:Loading embedding and lm_head weights...
+INFO:__main__:Created shared embedding layer with dim=8192, vocab_size=128256
+INFO:__main__:Shared model components loaded and ready
+INFO:__main__:Started 8 worker processes
+INFO:ktransformers.worker:Worker 7 using GPU 1
+INFO:ktransformers.worker:Worker 4 using GPU 0
+INFO:ktransformers.worker:Worker 0 using GPU 0
+INFO:ktransformers.worker:Worker 4 started at 10.21.22.206:29504, listening on all interfaces
+INFO:ktransformers.worker:Worker 7 started at 10.21.22.206:29507, listening on all interfaces
+INFO:ktransformers.worker:Worker 2 using GPU 0
+INFO:ktransformers.worker:Using shared model components...
+INFO:ktransformers.worker:Using shared model components...
+INFO:ktransformers.worker:Worker 5 using GPU 1
+INFO:ktransformers.worker:Worker 1 using GPU 1
+INFO:ktransformers.worker:Worker 3 using GPU 1
+INFO:ktransformers.worker:Worker 6 using GPU 0
+INFO:ktransformers.worker:Worker 0 started at 10.21.22.206:29500, listening on all interfaces
+INFO:ktransformers.worker:Using shared model components...
+INFO:ktransformers.worker:Worker 2 started at 10.21.22.206:29502, listening on all interfaces
+INFO:ktransformers.worker:Using shared model components...
+INFO:ktransformers.worker:Worker 5 started at 10.21.22.206:29505, listening on all interfaces
+INFO:ktransformers.worker:Using shared model components...
+INFO:ktransformers.worker:Worker 1 started at 10.21.22.206:29501, listening on all interfaces
+INFO:ktransformers.worker:Worker 3 started at 10.21.22.206:29503, listening on all interfaces
+INFO:ktransformers.worker:Using shared model components...
+INFO:ktransformers.worker:Using shared model components...
+INFO:ktransformers.worker:Worker 6 started at 10.21.22.206:29506, listening on all interfaces
+INFO:ktransformers.worker:Using shared model components...
+INFO:ktransformers.worker:Worker 6 memory calculation:
+INFO:ktransformers.worker:- Hidden size: 8192
+INFO:ktransformers.worker:- Context length: 8192
+INFO:ktransformers.worker:- KV cache per layer: 0.25 GB
+INFO:ktransformers.worker:- Layer parameters: 3.25 GB per layer
+INFO:ktransformers.worker:- Handling 10 layers: from 60 to 69
+INFO:ktransformers.worker:- Estimated KV cache: 2.50 GB
+INFO:ktransformers.worker:- Estimated model parameters: 32.50 GB
+INFO:ktransformers.worker:- Estimated workspace: 1.00 GB
+INFO:ktransformers.worker:- Total GPU memory budget: 37 GB
+INFO:ktransformers.worker:Worker 6 直接加载层 60-69 到 GPU:1
+INFO:ktransformers.worker:加载部分模型到指定设备...
+INFO:ktransformers.worker:设备映射: 总共 83 个键，其中 10 个映射到GPU
+INFO:ktransformers.worker:Worker 5 memory calculation:
+INFO:ktransformers.worker:- Hidden size: 8192
+INFO:ktransformers.worker:- Context length: 8192
+INFO:ktransformers.worker:- KV cache per layer: 0.25 GB
+INFO:ktransformers.worker:- Layer parameters: 3.25 GB per layer
+INFO:ktransformers.worker:- Handling 10 layers: from 50 to 59
+INFO:ktransformers.worker:- Estimated KV cache: 2.50 GB
+INFO:ktransformers.worker:- Estimated model parameters: 32.50 GB
+INFO:ktransformers.worker:- Estimated workspace: 1.00 GB
+INFO:ktransformers.worker:- Total GPU memory budget: 37 GB
+INFO:ktransformers.worker:Worker 5 直接加载层 50-59 到 GPU:1
+INFO:ktransformers.worker:加载部分模型到指定设备...
+INFO:ktransformers.worker:设备映射: 总共 83 个键，其中 10 个映射到GPU
+INFO:ktransformers.worker:Worker 2 memory calculation:
+INFO:ktransformers.worker:- Hidden size: 8192
+INFO:ktransformers.worker:- Context length: 8192
+INFO:ktransformers.worker:- KV cache per layer: 0.25 GB
+INFO:ktransformers.worker:- Layer parameters: 3.25 GB per layer
+INFO:ktransformers.worker:- Handling 10 layers: from 20 to 29
+INFO:ktransformers.worker:- Estimated KV cache: 2.50 GB
+INFO:ktransformers.worker:- Estimated model parameters: 32.50 GB
+INFO:ktransformers.worker:- Estimated workspace: 1.00 GB
+INFO:ktransformers.worker:- Total GPU memory budget: 37 GB
+INFO:ktransformers.worker:Worker 2 直接加载层 20-29 到 GPU:0
+INFO:ktransformers.worker:加载部分模型到指定设备...
+INFO:ktransformers.worker:设备映射: 总共 83 个键，其中 10 个映射到GPU
+INFO:ktransformers.worker:Worker 1 memory calculation:
+INFO:ktransformers.worker:- Hidden size: 8192
+INFO:ktransformers.worker:- Context length: 8192
+INFO:ktransformers.worker:- KV cache per layer: 0.25 GB
+INFO:ktransformers.worker:- Layer parameters: 3.25 GB per layer
+INFO:ktransformers.worker:- Handling 10 layers: from 10 to 19
+INFO:ktransformers.worker:- Estimated KV cache: 2.50 GB
+INFO:ktransformers.worker:- Estimated model parameters: 32.50 GB
+INFO:ktransformers.worker:- Estimated workspace: 1.00 GB
+INFO:ktransformers.worker:- Total GPU memory budget: 37 GB
+INFO:ktransformers.worker:Worker 1 直接加载层 10-19 到 GPU:0
+INFO:ktransformers.worker:加载部分模型到指定设备...
+INFO:ktransformers.worker:Worker 0 memory calculation:
+INFO:ktransformers.worker:设备映射: 总共 83 个键，其中 10 个映射到GPU
+INFO:ktransformers.worker:- Hidden size: 8192
+INFO:ktransformers.worker:- Context length: 8192
+INFO:ktransformers.worker:- KV cache per layer: 0.25 GB
+INFO:ktransformers.worker:- Layer parameters: 3.25 GB per layer
+INFO:ktransformers.worker:- Handling 10 layers: from 0 to 9
+INFO:ktransformers.worker:- Estimated KV cache: 2.50 GB
+INFO:ktransformers.worker:- Estimated model parameters: 32.50 GB
+INFO:ktransformers.worker:- Estimated workspace: 1.00 GB
+INFO:ktransformers.worker:- Total GPU memory budget: 37 GB
+INFO:ktransformers.worker:Worker 0 直接加载层 0-9 到 GPU:0
+INFO:ktransformers.worker:加载部分模型到指定设备...
+INFO:ktransformers.worker:设备映射: 总共 83 个键，其中 10 个映射到GPU
+INFO:ktransformers.worker:Worker 7 memory calculation:
+INFO:ktransformers.worker:- Hidden size: 8192
+INFO:ktransformers.worker:- Context length: 8192
+INFO:ktransformers.worker:- KV cache per layer: 0.25 GB
+INFO:ktransformers.worker:- Layer parameters: 3.25 GB per layer
+INFO:ktransformers.worker:- Handling 10 layers: from 70 to 79
+INFO:ktransformers.worker:- Estimated KV cache: 2.50 GB
+INFO:ktransformers.worker:- Estimated model parameters: 32.50 GB
+INFO:ktransformers.worker:- Estimated workspace: 1.00 GB
+INFO:ktransformers.worker:- Total GPU memory budget: 37 GB
+INFO:ktransformers.worker:Worker 7 直接加载层 70-79 到 GPU:1
+INFO:ktransformers.worker:加载部分模型到指定设备...
+INFO:ktransformers.worker:设备映射: 总共 83 个键，其中 10 个映射到GPU
+INFO:ktransformers.worker:Worker 3 memory calculation:
+INFO:ktransformers.worker:- Hidden size: 8192
+INFO:ktransformers.worker:- Context length: 8192
+INFO:ktransformers.worker:- KV cache per layer: 0.25 GB
+INFO:ktransformers.worker:- Layer parameters: 3.25 GB per layer
+INFO:ktransformers.worker:- Handling 10 layers: from 30 to 39
+INFO:ktransformers.worker:- Estimated KV cache: 2.50 GB
+INFO:ktransformers.worker:- Estimated model parameters: 32.50 GB
+INFO:ktransformers.worker:- Estimated workspace: 1.00 GB
+INFO:ktransformers.worker:- Total GPU memory budget: 37 GB
+INFO:ktransformers.worker:Worker 3 直接加载层 30-39 到 GPU:0
+INFO:ktransformers.worker:加载部分模型到指定设备...
+INFO:ktransformers.worker:设备映射: 总共 83 个键，其中 10 个映射到GPU
+INFO:ktransformers.worker:Worker 4 memory calculation:
+INFO:ktransformers.worker:- Hidden size: 8192
+INFO:ktransformers.worker:- Context length: 8192
+INFO:ktransformers.worker:- KV cache per layer: 0.25 GB
+INFO:ktransformers.worker:- Layer parameters: 3.25 GB per layer
+INFO:ktransformers.worker:- Handling 10 layers: from 40 to 49
+INFO:ktransformers.worker:- Estimated KV cache: 2.50 GB
+INFO:ktransformers.worker:- Estimated model parameters: 32.50 GB
+INFO:ktransformers.worker:- Estimated workspace: 1.00 GB
+INFO:ktransformers.worker:- Total GPU memory budget: 37 GB
+INFO:ktransformers.worker:Worker 4 直接加载层 40-49 到 GPU:1
+INFO:ktransformers.worker:加载部分模型到指定设备...
+INFO:ktransformers.worker:设备映射: 总共 83 个键，其中 10 个映射到GPU
+Loading checkpoint shards:   6%|██▎                                    | 1/17 [00:30<08:07, 30.48s/it]
+ERROR:ktransformers.worker:加载模型时出错: CUDA out of memory. Tried to allocate 448.00 MiB. GPU 0 has a total capacity of 15.89 GiB of which 21.88 MiB is free. Including non-PyTorch memory, this process has 12.21 GiB memory in use. Process 72949 has 3.66 GiB memory in use. Of the allocated memory 11.59 GiB is allocated by PyTorch, and 1.77 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+Process Process-1:
+Loading checkpoint shards:  18%|██████▉                                | 3/17 [00:30<02:22, 10.17s/it]
+ERROR:ktransformers.worker:加载模型时出错: CUDA out of memory. Tried to allocate 128.00 MiB. GPU 0 has a total capacity of 15.89 GiB of which 21.88 MiB is free. Process 72948 has 12.21 GiB memory in use. Including non-PyTorch memory, this process has 3.66 GiB memory in use. Of the allocated memory 3.05 GiB is allocated by PyTorch, and 1.94 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+Process Process-2:
+Traceback (most recent call last):
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/archive/liugu/ds/ktransformers/ktransformers/model_sharder.py", line 154, in start_worker
+    worker.load_model(model_path, gguf_path)
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 201, in load_model
+    self.model = AutoModelForCausalLM.from_pretrained(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/models/auto/auto_factory.py", line 564, in from_pretrained
+    return model_class.from_pretrained(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/modeling_utils.py", line 3916, in from_pretrained
+    ) = cls._load_pretrained_model(
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/modeling_utils.py", line 4390, in _load_pretrained_model
+    new_error_msgs, offload_index, state_dict_index = _load_state_dict_into_meta_model(
+                                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/modeling_utils.py", line 936, in _load_state_dict_into_meta_model
+    set_module_tensor_to_device(model, param_name, param_device, **set_module_kwargs)
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/accelerate/utils/modeling.py", line 330, in set_module_tensor_to_device
+    new_value = value.to(device)
+                ^^^^^^^^^^^^^^^^
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 448.00 MiB. GPU 0 has a total capacity of 15.89 GiB of which 21.88 MiB is free. Including non-PyTorch memory, this process has 12.21 GiB memory in use. Process 72949 has 3.66 GiB memory in use. Of the allocated memory 11.59 GiB is allocated by PyTorch, and 1.77 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+Traceback (most recent call last):
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/archive/liugu/ds/ktransformers/ktransformers/model_sharder.py", line 154, in start_worker
+    worker.load_model(model_path, gguf_path)
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 201, in load_model
+    self.model = AutoModelForCausalLM.from_pretrained(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/models/auto/auto_factory.py", line 564, in from_pretrained
+    return model_class.from_pretrained(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/modeling_utils.py", line 3916, in from_pretrained
+    ) = cls._load_pretrained_model(
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/modeling_utils.py", line 4390, in _load_pretrained_model
+    new_error_msgs, offload_index, state_dict_index = _load_state_dict_into_meta_model(
+                                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/modeling_utils.py", line 936, in _load_state_dict_into_meta_model
+    set_module_tensor_to_device(model, param_name, param_device, **set_module_kwargs)
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/accelerate/utils/modeling.py", line 330, in set_module_tensor_to_device
+    new_value = value.to(device)
+                ^^^^^^^^^^^^^^^^
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 128.00 MiB. GPU 0 has a total capacity of 15.89 GiB of which 21.88 MiB is free. Process 72948 has 12.21 GiB memory in use. Including non-PyTorch memory, this process has 3.66 GiB memory in use. Of the allocated memory 3.05 GiB is allocated by PyTorch, and 1.94 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+^CINFO:__main__:Keyboard interrupt received, terminating workers...
+INFO:__main__:Cleaning up shared resources...
+(ds) root@compute06:/archive/liugu/ds/ktransformers# /usr/lib/python3.11/multiprocessing/resource_tracker.py:224: UserWarning: resource_tracker: There appear to be 6 leaked semaphore objects to clean up at shutdown
+  warnings.warn('resource_tracker: There appear to be %d '为什么每个进程都要分配一个，不应该只有KVcache进程分配吗，其余进程直接从KVcache进程中获取所需参数就好了
+
+---
+
+_**Assistant**_
+
 
 
 ---

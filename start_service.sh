@@ -27,18 +27,24 @@ if [ "$(hostname)" = "compute06" ]; then
         kill_port_process $port  # Worker进程端口
     done
     
-    # 启动 KV Cache 服务器
-    echo "Starting KV Cache Server..."
-    python -m ktransformers.kvcache_server --port 29600 &
-    sleep 2  # 等待KV Cache服务器启动
-    
-    # 启动模型分片服务
-    echo "Starting Model Sharder..."
-    python -m ktransformers.model_sharder \
+    # 启动 KV Cache 服务器，并传入模型路径
+    echo "Starting KV Cache Server with model loader..."
+    python -m ktransformers.kvcache_server \
+        --port 29600 \
         --model_path $MODEL_PATH \
-        --gguf_path $GGUF_PATH \
-        --base_port 29500 \
-        --num_workers 8
+        --gguf_path $GGUF_PATH &
+    sleep 5  # 等待KV Cache服务器和模型加载器启动
+    
+    # 启动worker进程，它们将从KV Cache服务器获取模型参数
+    echo "Starting Worker processes..."
+    for i in $(seq 0 7); do
+        worker_port=$((29500 + i))
+        echo "Starting Worker $i on port $worker_port..."
+        python -m ktransformers.worker \
+            --worker_address=10.21.22.206:$worker_port \
+            --worker_id=$i \
+            --num_workers=8 &
+    done
 
 # 在login上运行的命令
 elif [ "$(hostname)" = "login" ]; then

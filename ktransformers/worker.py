@@ -121,20 +121,26 @@ class ModelWorker:
         logger.info(f"Worker {worker_id} started at {address}, listening on all interfaces")
 
     def load_model(self, model_path: str, gguf_path: str):
-        # 如果有共享组件，使用共享组件
-        if self.shared_components:
-            logger.info("Using shared model components...")
-            config = self.shared_components['config']
-            self.tokenizer = AutoTokenizer.from_pretrained(self.shared_components['tokenizer_path'], trust_remote_code=True)
-        else:
-            # 否则正常加载
-            logger.info("Loading tokenizer...")
-            self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-            
-            logger.info("Loading model config...")
-            config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        # 创建KVCache客户端
+        self.kvcache_client = KVCacheClient(f"10.21.22.206:29600")
         
-        torch.set_default_dtype(config.torch_dtype)
+        # 获取模型配置
+        logger.info("从KVCache服务器获取模型配置")
+        response = self.kvcache_client.get_config()
+        if response['status'] != 'success':
+            logger.error("获取模型配置失败")
+            raise RuntimeError("Failed to get model config")
+        
+        config = response['config']
+        
+        # 获取tokenizer
+        logger.info("从KVCache服务器获取tokenizer")
+        response = self.kvcache_client.get_tokenizer()
+        if response['status'] != 'success':
+            logger.error("获取tokenizer失败")
+            raise RuntimeError("Failed to get tokenizer")
+        
+        self.tokenizer = response['tokenizer']
         
         # 计算每个进程应该处理的层
         total_layers = config.num_hidden_layers
@@ -178,60 +184,27 @@ class ModelWorker:
         # 设置GPU ID
         gpu_id = 0 if self.worker_id < 4 else 1
         
-        # 只加载本worker需要的层，并直接加载到对应的GPU设备上
-        logger.info(f"Worker {self.worker_id} 直接加载层 {start_layer}-{end_layer-1} 到 GPU:{gpu_id}")
+        # 获取共享参数(嵌入层、LM头等)
+        logger.info("从KVCache服务器获取共享参数")
+        response = self.kvcache_client.get_shared_params()
+        if response['status'] != 'success':
+            logger.error("获取共享参数失败")
+            raise RuntimeError("Failed to get shared parameters")
         
-        # 创建一个精确的设备映射，只把特定层映射到当前GPU
-        device_map = {'model.embed_tokens': 'cpu', 'lm_head': 'cpu', 'model.norm': 'cpu'}
-        for i in range(total_layers):
-            if i >= start_layer and i < end_layer:
-                # 当前worker负责的层映射到GPU
-                device_map[f'model.layers.{i}'] = f'cuda:{gpu_id}'
-            else:
-                # 其他层不加载，使用meta设备
-                device_map[f'model.layers.{i}'] = 'meta'
+        shared_params = response['params']
         
-        # 直接使用设备映射加载模型
-        try:
-            logger.info("加载部分模型到指定设备...")
-            # 不再输出完整的设备映射，只输出数量
-            logger.info(f"设备映射: 总共 {len(device_map)} 个键，其中 {sum(1 for v in device_map.values() if 'cuda' in str(v))} 个映射到GPU")
+        # 获取此worker负责的层参数
+        for i in range(start_layer, end_layer):
+            logger.info(f"从KVCache服务器获取层 {i} 参数")
+            response = self.kvcache_client.get_layer_params(i)
+            if response['status'] != 'success':
+                logger.error(f"获取层 {i} 参数失败")
+                continue
             
-            # 使用低CPU内存模式和指定的设备映射加载模型
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model_path,
-                config=config,
-                device_map=device_map,
-                torch_dtype=torch.float16,
-                low_cpu_mem_usage=True,
-                trust_remote_code=True
-            )
-            
-            # 替换为共享的embedding和lm_head
-            if self.shared_components:
-                self.model.model.embed_tokens = self.shared_components['embed_tokens']
-                self.model.lm_head = self.shared_components['lm_head']
-            
-            logger.info(f"Worker {self.worker_id} 成功加载层 {start_layer}-{end_layer-1}")
-            
-        except Exception as e:
-            logger.error(f"加载模型时出错: {str(e)}")
-            raise
+            # 应用层参数到模型
+            # ...
         
-        # 设置生成配置
-        try:
-            self.model.generation_config = GenerationConfig.from_pretrained(model_path)
-        except Exception as e:
-            logger.warning(f"Generation config can't auto create, making default. Message: {e}")
-            self.model.generation_config = GenerationConfig(
-                temperature=0.6,
-                top_p=0.9,
-                do_sample=True
-            )
-        if self.model.generation_config.pad_token_id is None:
-            self.model.generation_config.pad_token_id = self.model.generation_config.eos_token_id
-            
-        logger.info("Model loaded successfully")
+        logger.info(f"Worker {self.worker_id} 成功加载层 {start_layer}-{end_layer-1}")
 
     # 修改 CustomStreamer 类定义
     class CustomStreamer(TextStreamer):

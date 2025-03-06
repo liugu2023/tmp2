@@ -9227,6 +9227,98 @@ TypeError: int() argument must be a string, a bytes-like object or a real number
 
 ---
 
+_**Assistant**_
+
+
+
+看起来问题出在配置的 `eos_token_id` 是一个列表而不是单个值。让我们修改 model_loader.py 中的配置处理代码来处理这种情况：
+
+```python:ktransformers/model_loader.py
+def load_model(self):
+    """加载模型配置和tokenizer"""
+    logger.info(f"加载模型配置和tokenizer: {self.model_path}")
+    
+    # 加载配置并转换为字典
+    config = AutoConfig.from_pretrained(self.model_path, trust_remote_code=True)
+    
+    # 处理token_id可能是列表的情况
+    def safe_int_convert(value):
+        if isinstance(value, (list, tuple)):
+            return int(value[0]) if value else None
+        return int(value) if value is not None else None
+    
+    # 将配置转换为可序列化的字典，确保所有值都是基本类型
+    self.config = {
+        'architectures': list(config.architectures),  # 确保是列表
+        'model_type': str(config.model_type),  # 确保是字符串
+        'num_hidden_layers': int(config.num_hidden_layers),  # 确保是整数
+        'hidden_size': int(config.hidden_size),  # 确保是整数
+        'intermediate_size': int(getattr(config, 'intermediate_size', 4 * config.hidden_size)),  # 确保是整数
+        'num_attention_heads': int(config.num_attention_heads),  # 确保是整数
+        'max_position_embeddings': int(config.max_position_embeddings),  # 确保是整数
+        'torch_dtype': str(config.torch_dtype),  # 转换为字符串
+        'pad_token_id': safe_int_convert(config.pad_token_id),
+        'bos_token_id': safe_int_convert(config.bos_token_id),
+        'eos_token_id': safe_int_convert(config.eos_token_id),
+        'vocab_size': int(config.vocab_size)  # 确保是整数
+    }
+    
+    # 加载tokenizer
+    self.tokenizer = AutoTokenizer.from_pretrained(self.model_path, trust_remote_code=True)
+    
+    # 加载嵌入层和规范化层
+    logger.info("加载嵌入层和lm_head")
+    self._load_shared_layers()
+    
+    logger.info("模型加载器初始化完成")
+    return True
+```
+
+这个修改：
+
+1. 添加了一个 `safe_int_convert` 辅助函数来处理可能是列表的值
+2. 使用这个函数来安全地转换所有的 token_id 值
+3. 如果值是列表，取第一个元素；如果是 None，保持为 None
+
+这样应该能够正确处理 token_id 是列表的情况。请更新代码并重试。
+
+---
+
+_**User**_
+
+INFO:__main__:Generation parameters: max_new_tokens=50, temperature=0.7, top_p=0.9
+INFO:__main__:Starting text generation...
+ERROR:__main__:Generation error: 'SimpleModel' object has no attribute 'model'
+INFO:__main__:Generation parameters: max_new_tokens=50, temperature=0.7, top_p=0.9
+INFO:__main__:Starting text generation...
+ERROR:__main__:Generation error: 'SimpleModel' object has no attribute 'model'
+INFO:__main__:Generation parameters: max_new_tokens=50, temperature=0.7, top_p=0.9
+INFO:__main__:Starting text generation...
+ERROR:__main__:Generation error: 'SimpleModel' object has no attribute 'model'
+INFO:__main__:Generation parameters: max_new_tokens=50, temperature=0.7, top_p=0.9
+INFO:__main__:Starting text generation...
+INFO:__main__:Generation parameters: max_new_tokens=50, temperature=0.7, top_p=0.9
+INFO:__main__:Starting text generation...
+ERROR:__main__:Generation error: 'SimpleModel' object has no attribute 'model'
+ERROR:__main__:Generation error: 'SimpleModel' object has no attribute 'model'
+INFO:__main__:Generation parameters: max_new_tokens=50, temperature=0.7, top_p=0.9
+INFO:__main__:Starting text generation...
+ERROR:__main__:Generation error: 'SimpleModel' object has no attribute 'model'
+INFO:__main__:Generation parameters: max_new_tokens=50, temperature=0.7, top_p=0.9
+INFO:__main__:Starting text generation...
+ERROR:__main__:Generation error: 'SimpleModel' object has no attribute 'model'
+INFO:__main__:Generation parameters: max_new_tokens=50, temperature=0.7, top_p=0.9
+INFO:__main__:Starting text generation...
+ERROR:__main__:Generation error: 'SimpleModel' object has no attribute 'model'
+
+---
+
+_**Assistant**_
+
+
+
+---
+
 
 
 ---

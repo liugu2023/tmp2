@@ -10739,6 +10739,197 @@ _**Assistant**_
 
 
 
+
+
+看起来有两个问题需要修复：
+
+1. KVCacheClient.retrieve() 参数重复
+2. 张量数据类型不匹配（Long vs Half）
+
+让我们修复这些问题：
+
+```python:ktransformers/worker.py
+def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        logger.info("Received generation request")
+        logger.info(f"Input sequence length: {len(input_data['input_ids'])}")
+        
+        # 创建输入张量并设置正确的数据类型
+        logger.info("Moving input tensors to GPU...")
+        device = self.model.device
+        dtype = torch.float16  # 使用与模型相同的数据类型
+        
+        # 确保输入张量使用正确的数据类型
+        input_ids = torch.tensor(input_data['input_ids'], device=device)
+        attention_mask = torch.tensor(input_data['attention_mask'], device=device)
+        
+        # 生成参数日志
+        max_new_tokens = input_data.get('max_new_tokens', 512)
+        temperature = input_data.get('temperature', 0.6)
+        top_p = input_data.get('top_p', 0.9)
+        logger.info(f"Generation parameters: max_new_tokens={max_new_tokens}, "
+                   f"temperature={temperature}, "
+                   f"top_p={top_p}")
+        
+        # 生成文本
+        logger.info("Starting text generation...")
+        start_time = time.time()
+        
+        # 创建 KV Cache 客户端
+        kvcache_client = KVCacheClient("10.21.22.206:29600")
+        
+        # 生成唯一的 batch ID
+        batch_id = f"{time.time()}_{self.worker_id}"
+        
+        with torch.no_grad(), torch.amp.autocast('cuda'):
+            hidden_states = input_ids  # 初始化隐藏状态
+            
+            # 如果是第一个worker，需要处理词嵌入
+            if self.worker_id == 0:
+                if self.model.embed_tokens is not None:
+                    # 将输入转换为正确的数据类型
+                    hidden_states = self.model.embed_tokens(hidden_states).to(dtype)
+                    # 存储嵌入结果供其他worker使用
+                    cpu_hidden_states = hidden_states.cpu().tolist()
+                    kvcache_client.store(batch_id, "embeddings", cpu_hidden_states)
+                    logger.info("Stored embeddings for other workers")
+            else:
+                # 其他worker需要等待并获取嵌入结果
+                for _ in range(10):  # 最多尝试10次
+                    result = kvcache_client.retrieve(batch_id, "embeddings")
+                    if result is not None:
+                        # 将列表转换回张量，并设置正确的设备和数据类型
+                        hidden_states = torch.tensor(result, device=device, dtype=dtype)
+                        logger.info("Retrieved embeddings from first worker")
+                        break
+                    time.sleep(0.1)
+                
+                if hidden_states is None:
+                    raise RuntimeError("Failed to retrieve embeddings from first worker")
+            
+            # 处理当前worker负责的层
+            for layer_idx in range(self.model.start_layer, self.model.end_layer):
+                # 确保输入在正确的设备和数据类型上
+                hidden_states = hidden_states.to(device).to(dtype)
+                # 获取当前层
+                layer = self.model.layers[layer_idx - self.model.start_layer].to(device)
+                # 处理这一层
+                hidden_states = layer(hidden_states)
+                # 存储结果
+                cpu_hidden_states = hidden_states.cpu().tolist()
+                kvcache_client.store(batch_id, f"layer_{layer_idx}", cpu_hidden_states)
+                logger.info(f"Processed and stored layer {layer_idx}")
+            
+            # 如果是最后一个worker，需要处理norm和lm_head
+            if self.worker_id == self.num_workers - 1:
+                if self.model.norm is not None:
+                    hidden_states = self.model.norm(hidden_states.to(device).to(dtype))
+                if self.model.lm_head is not None:
+                    hidden_states = self.model.lm_head(hidden_states)
+                # 存储最终结果
+                cpu_hidden_states = hidden_states.cpu().tolist()
+                kvcache_client.store(batch_id, "final", cpu_hidden_states)
+                logger.info("Stored final output")
+            
+            # 等待最终结果
+            if self.worker_id != self.num_workers - 1:
+                for _ in range(10):  # 最多尝试10次
+                    result = kvcache_client.retrieve(batch_id, "final")
+                    if result is not None:
+                        hidden_states = torch.tensor(result, device=device, dtype=dtype)
+                        logger.info("Retrieved final output")
+                        break
+                    time.sleep(0.1)
+                
+                if hidden_states is None:
+                    raise RuntimeError("Failed to retrieve final output from last worker")
+            
+            # 生成完成后清理缓存
+            kvcache_client.clear(batch_id)
+            
+            # 确保输出在CPU上，以便序列化
+            hidden_states = hidden_states.cpu()
+            
+            # 返回结果
+            return {
+                'status': 'success',
+                'output': hidden_states.tolist(),
+                'time_taken': time.time() - start_time
+            }
+            
+    except Exception as e:
+        logger.error(f"Generation error: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return {
+            'status': 'error',
+            'error': str(e)
+        }
+```
+
+
+主要修改：
+
+1. 移除了 KVCacheClient.retrieve() 的多余参数
+2. 统一使用 torch.float16 数据类型
+3. 在所有张量操作中确保数据类型一致
+4. 在存储和检索时简化了 API 调用
+
+请更新代码并重试。这应该能解决数据类型不匹配和参数重复的问题。
+
+---
+
+_**User**_
+
+INFO:__main__:Generation parameters: max_new_tokens=50, temperature=0.7, top_p=0.9
+INFO:__main__:Starting text generation...
+INFO:__main__:Generation parameters: max_new_tokens=50, temperature=0.7, top_p=0.9
+INFO:__main__:Starting text generation...
+ERROR:__main__:Generation error: KVCacheClient.retrieve() missing 1 required positional argument: 'device'
+ERROR:__main__:Generation error: KVCacheClient.retrieve() missing 1 required positional argument: 'device'
+ERROR:__main__:Traceback (most recent call last):
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 421, in generate
+    result = kvcache_client.retrieve(batch_id, "embeddings")
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: KVCacheClient.retrieve() missing 1 required positional argument: 'device'
+
+ERROR:__main__:Traceback (most recent call last):
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 421, in generate
+    result = kvcache_client.retrieve(batch_id, "embeddings")
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: KVCacheClient.retrieve() missing 1 required positional argument: 'device'
+
+INFO:__main__:Generation parameters: max_new_tokens=50, temperature=0.7, top_p=0.9
+INFO:__main__:Starting text generation...
+ERROR:__main__:Generation error: KVCacheClient.retrieve() missing 1 required positional argument: 'device'
+ERROR:__main__:Traceback (most recent call last):
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 421, in generate
+    result = kvcache_client.retrieve(batch_id, "embeddings")
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: KVCacheClient.retrieve() missing 1 required positional argument: 'device'
+
+ERROR:__main__:Generation error: mat1 and mat2 shapes cannot be multiplied (1x6 and 8192x8192)
+ERROR:__main__:Traceback (most recent call last):
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 439, in generate
+    hidden_states = layer(hidden_states)
+                    ^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/torch/nn/modules/linear.py", line 125, in forward
+    return F.linear(input, self.weight, self.bias)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: mat1 and mat2 shapes cannot be multiplied (1x6 and 8192x8192)
+
+---
+
+_**Assistant**_
+
+
+
 ---
 
 

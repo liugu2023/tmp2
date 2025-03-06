@@ -404,25 +404,24 @@ class ModelWorker:
             batch_id = f"{time.time()}_{self.worker_id}"
             
             with torch.no_grad(), torch.amp.autocast('cuda'):
-                hidden_states = input_ids  # 初始化隐藏状态
-                
                 # 如果是第一个worker，需要处理词嵌入
                 if self.worker_id == 0:
                     if self.model.embed_tokens is not None:
                         # 将输入转换为正确的数据类型
-                        hidden_states = self.model.embed_tokens(hidden_states).to(dtype)
+                        hidden_states = self.model.embed_tokens(input_ids)
+                        hidden_states = hidden_states.to(dtype)
                         # 存储嵌入结果供其他worker使用
-                        cpu_hidden_states = hidden_states.cpu().tolist()
+                        cpu_hidden_states = hidden_states.cpu().numpy()  # 使用numpy而不是tolist
                         kvcache_client.store(batch_id, "embeddings", cpu_hidden_states)
-                        logger.info("Stored embeddings for other workers")
+                        logger.info(f"Stored embeddings with shape {hidden_states.shape}")
                 else:
                     # 其他worker需要等待并获取嵌入结果
                     for _ in range(10):  # 最多尝试10次
-                        result = kvcache_client.retrieve(batch_id, "embeddings")
+                        result = kvcache_client.retrieve(batch_id, "embeddings", device=device)
                         if result is not None:
-                            # 将列表转换回张量，并设置正确的设备和数据类型
-                            hidden_states = torch.tensor(result, device=device, dtype=dtype)
-                            logger.info("Retrieved embeddings from first worker")
+                            # 将numpy数组转换回张量，并设置正确的设备和数据类型
+                            hidden_states = torch.from_numpy(result).to(device=device, dtype=dtype)
+                            logger.info(f"Retrieved embeddings with shape {hidden_states.shape}")
                             break
                         time.sleep(0.1)
                     
@@ -435,12 +434,14 @@ class ModelWorker:
                     hidden_states = hidden_states.to(device).to(dtype)
                     # 获取当前层
                     layer = self.model.layers[layer_idx - self.model.start_layer].to(device)
+                    # 记录形状以便调试
+                    logger.info(f"Layer {layer_idx} input shape: {hidden_states.shape}")
                     # 处理这一层
                     hidden_states = layer(hidden_states)
                     # 存储结果
-                    cpu_hidden_states = hidden_states.cpu().tolist()
+                    cpu_hidden_states = hidden_states.cpu().numpy()
                     kvcache_client.store(batch_id, f"layer_{layer_idx}", cpu_hidden_states)
-                    logger.info(f"Processed and stored layer {layer_idx}")
+                    logger.info(f"Processed and stored layer {layer_idx} with shape {hidden_states.shape}")
                 
                 # 如果是最后一个worker，需要处理norm和lm_head
                 if self.worker_id == self.num_workers - 1:
@@ -449,17 +450,17 @@ class ModelWorker:
                     if self.model.lm_head is not None:
                         hidden_states = self.model.lm_head(hidden_states)
                     # 存储最终结果
-                    cpu_hidden_states = hidden_states.cpu().tolist()
+                    cpu_hidden_states = hidden_states.cpu().numpy()
                     kvcache_client.store(batch_id, "final", cpu_hidden_states)
-                    logger.info("Stored final output")
+                    logger.info(f"Stored final output with shape {hidden_states.shape}")
                 
                 # 等待最终结果
                 if self.worker_id != self.num_workers - 1:
                     for _ in range(10):  # 最多尝试10次
-                        result = kvcache_client.retrieve(batch_id, "final")
+                        result = kvcache_client.retrieve(batch_id, "final", device=device)
                         if result is not None:
-                            hidden_states = torch.tensor(result, device=device, dtype=dtype)
-                            logger.info("Retrieved final output")
+                            hidden_states = torch.from_numpy(result).to(device=device, dtype=dtype)
+                            logger.info(f"Retrieved final output with shape {hidden_states.shape}")
                             break
                         time.sleep(0.1)
                     
@@ -470,7 +471,7 @@ class ModelWorker:
                 kvcache_client.clear(batch_id)
                 
                 # 确保输出在CPU上，以便序列化
-                hidden_states = hidden_states.cpu()
+                hidden_states = hidden_states.cpu().numpy()
                 
                 # 返回结果
                 return {

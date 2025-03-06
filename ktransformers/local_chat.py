@@ -124,11 +124,26 @@ class DistributedModel:
             output_ids = response.get('output_ids', [])
             
             print("生成成功!")
-            if output_ids:
-                print(f"生成的tokens: {output_ids[:10]}...")
+            # 修复: 使用长度检查而不是直接用张量作为布尔值
+            if isinstance(output_ids, torch.Tensor):
+                has_outputs = len(output_ids) > 0
+            else:
+                has_outputs = bool(output_ids)
+            
+            if has_outputs:
+                # 确保输出为列表，以便切片操作安全
+                if isinstance(output_ids, torch.Tensor):
+                    output_preview = output_ids[:10].tolist()
+                else:
+                    output_preview = output_ids[:10]
+                
+                print(f"生成的tokens: {output_preview}...")
                 if self.tokenizer:
-                    # 解码tokens为文本
-                    output_text = self.tokenizer.decode(output_ids)
+                    # 确保在解码前张量已转换为列表
+                    if isinstance(output_ids, torch.Tensor):
+                        output_text = self.tokenizer.decode(output_ids.tolist())
+                    else:
+                        output_text = self.tokenizer.decode(output_ids)
                     print(f"\n生成的文本:\n{output_text}\n")
             else:
                 print("警告: 未收到任何生成的tokens")

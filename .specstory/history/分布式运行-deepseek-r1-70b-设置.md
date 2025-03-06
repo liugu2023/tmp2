@@ -14119,6 +14119,130 @@ AttributeError: 'Tensor' object has no attribute 'copy'
 
 _**Assistant**_
 
+<think>
+看起来错误很明确：尝试对PyTorch张量调用.copy()方法，但PyTorch张量没有这个方法。张量使用.clone()方法来复制，而不是.copy()。
+
+我需要修改worker.py中的那一行代码，将input_ids.copy()替换为正确的tensor克隆方法：input_ids.clone().detach()或者input_ids.tolist()（如果需要Python列表）。
+</think>
+
+我们需要修复 PyTorch 张量没有 `copy()` 方法的问题，应该使用 `.clone()` 或 `.tolist()` 替代：
+
+```python:ktransformers/worker.py
+def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+    """处理生成请求"""
+    try:
+        logger.info("Received generation request")
+        
+        # 检查输入格式
+        if 'input_ids' not in input_data:
+            logger.warning("输入数据中未找到'input_ids'，使用默认值")
+            input_ids = [0]  # 使用默认值
+        else:
+            input_ids = input_data['input_ids']
+            
+        logger.info(f"Input sequence length: {len(input_ids)}")
+        
+        # 移动输入张量到GPU
+        logger.info("Moving input tensors to GPU...")
+        device = self.device
+        
+        # 初始化输入
+        input_tensor = torch.tensor(input_ids, device=device)
+        
+        # 生成参数日志
+        max_new_tokens = input_data.get('max_new_tokens', 50)
+        temperature = input_data.get('temperature', 0.7)
+        top_p = input_data.get('top_p', 0.9)
+        logger.info(f"Generation parameters: max_new_tokens={max_new_tokens}, "
+                   f"temperature={temperature}, "
+                   f"top_p={top_p}")
+        
+        # 开始生成
+        logger.info("Starting text generation...")
+        start_time = time.time()
+        
+        # 优化内存管理
+        torch.cuda.empty_cache()  # 显式清理缓存
+        
+        # 使用上下文管理器确保在出作用域时释放张量
+        with torch.no_grad(), torch.amp.autocast('cuda', enabled=True):
+            # 使用batch ID进行分布式协调
+            batch_id = input_data.get('batch_id', f"batch_{time.time()}")
+            
+            try:
+                # 模拟处理 - 每个worker只处理自己的层
+                for layer_idx in range(self.start_layer, self.end_layer):
+                    logger.info(f"处理层 {layer_idx}")
+                    # 在实际实现中，这里应该加载并应用层参数
+                    time.sleep(0.01)  # 简单模拟处理时间
+                
+                # 模拟生成输出tokens
+                # 修复: 使用 .tolist() 而不是 .copy() (张量没有copy方法)
+                if isinstance(input_ids, torch.Tensor):
+                    output_token_ids = input_ids.tolist()  # 转换为Python列表
+                else:
+                    output_token_ids = list(input_ids)  # 创建输入的副本
+                
+                # 最后一个worker生成最终token
+                if self.worker_id == self.num_workers - 1:
+                    # 模拟生成更多的tokens
+                    for i in range(min(max_new_tokens, 10)):  # 最多生成10个tokens用于测试
+                        new_token = 100 + i  # 使用简单的逻辑生成新token
+                        output_token_ids.append(new_token)
+                    logger.info(f"最终生成的tokens: {output_token_ids}")
+                
+                # 存储处理状态
+                worker_status = f"Worker {self.worker_id} completed layers {self.start_layer}-{self.end_layer-1}"
+                self._store_data(batch_id, f"worker_{self.worker_id}_status", worker_status)
+                logger.info(f"已存储状态: {worker_status}")
+                
+                # 如果是最后一个worker，存储最终输出
+                if self.worker_id == self.num_workers - 1:
+                    self._store_data(batch_id, "final_output", output_token_ids)
+            
+            except Exception as e:
+                logger.error(f"处理层时发生错误: {str(e)}")
+                import traceback
+                logger.error(traceback.format_exc())
+                raise
+        
+        # 确保所有GPU操作完成
+        torch.cuda.synchronize()
+        
+        # 返回成功响应，添加output_ids字段
+        return {
+            'status': 'success',
+            'message': f"Worker {self.worker_id} processed layers {self.start_layer}-{self.end_layer-1}",
+            'time_taken': time.time() - start_time,
+            'output_ids': output_token_ids if self.worker_id == self.num_workers - 1 else input_ids
+        }
+```
+
+主要修改：
+
+1. 将 `output_token_ids = input_ids.copy()` 改为使用条件判断
+2. 如果 `input_ids` 是 PyTorch 张量，使用 `.tolist()` 转换为 Python 列表
+3. 否则使用 `list(input_ids)` 创建一个普通列表的副本
+4. 保持了其余代码逻辑不变
+
+这样就解决了张量没有 `copy()` 方法的问题。
+
+---
+
+_**User**_
+
+生成过程中出错: Boolean value of Tensor with more than one value is ambiguous
+Traceback (most recent call last):
+  File "/archive/liugu/ds/ktransformers/ktransformers/local_chat.py", line 127, in generate
+    if output_ids:
+RuntimeError: Boolean value of Tensor with more than one value is ambiguous
+
+INFO:__main__:Generation completed successfully
+
+---
+
+_**Assistant**_
+
 
 
 ---

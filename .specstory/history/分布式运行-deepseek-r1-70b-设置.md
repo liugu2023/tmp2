@@ -13924,7 +13924,277 @@ _**User**_
 
 _**Assistant**_
 
+<think>
+这个错误表明KV缓存服务器尝试加载模型时路径为空字符串("")，这显然是不正确的。我们需要检查为什么model_path参数会变成空字符串。
 
+问题很可能出在参数传递过程中。让我们看一下调用流程：
+
+1. 客户端(local_chat.py)调用load_model方法
+2. 该方法发送load_model命令到中央服务器(central_server.py)
+3. 中央服务器调用load_model_on_workers方法
+4. 该方法首先尝试在KV缓存服务器上加载模型
+5. KV缓存服务器尝试加载模型但路径为空
+
+从错误信息看，问题出在KV缓存服务器接收到的model_path是空字符串。我们需要检查几个可能的问题：
+
+1. local_chat.py传递的model_path是否正确
+2. central_server.py是否正确传递参数
+3. kvcache_server.py是否正确解析参数
+
+我们应该修复这个问题，确保model_path被正确传递。
+</think>
+
+这个错误表明KV缓存服务器在尝试加载模型时收到了空字符串作为路径。让我们修复`local_chat.py`、`central_server.py`和`kvcache_server.py`中的相关部分，确保模型路径正确传递：
+
+```python:ktransformers/local_chat.py
+def load_model(self, model_path: str, gguf_path: str = None) -> bool:
+    """加载模型"""
+    print(f"正在加载模型: {model_path}")
+    if gguf_path:
+        print(f"使用GGUF模型: {gguf_path}")
+    
+    # 确保model_path不为空
+    if not model_path:
+        print("错误: 模型路径不能为空")
+        return False
+    
+    # 确保路径存在
+    if not os.path.exists(model_path):
+        print(f"警告: 模型路径不存在: {model_path}")
+        # 在开发环境中，我们可能依赖的是远程模型，所以继续执行
+    
+    # 发送加载请求到服务器
+    response = self._send_command('load_model', {
+        'model_path': model_path,
+        'gguf_path': gguf_path if gguf_path else ""
+    })
+    
+    # 检查response是否是字典
+    if isinstance(response, bool):
+        success = response
+        error = "未知错误" if not success else None
+    else:
+        success = response.get('status') == 'success'
+        error = response.get('error')
+    
+    if not success:
+        print(f"模型加载失败: {error}")
+        return False
+    
+    print("模型加载成功!")
+    return True
+```
+
+```python:ktransformers/kvcache_server.py
+def load_model(self, model_path, gguf_path=None):
+    """加载模型"""
+    try:
+        logger.info(f"请求加载模型: {model_path}, GGUF: {gguf_path}")
+        
+        # 验证路径
+        if not model_path:
+            logger.error("模型路径为空")
+            return {'status': 'error', 'error': '模型路径不能为空'}
+        
+        # 打印当前工作目录，以便调试
+        logger.info(f"当前工作目录: {os.getcwd()}")
+        
+        # 加载模型
+        self.model_loader = ModelLoader(model_path, gguf_path)
+        self.model_config = self.model_loader.get_config()
+        
+        logger.info("模型加载成功")
+        return {'status': 'success'}
+    except Exception as e:
+        logger.error(f"加载模型时出错: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return {'status': 'error', 'error': str(e)}
+```
+
+```python:ktransformers/central_server.py
+def process_client_message(self, message: Dict[str, Any]) -> Dict[str, Any]:
+    """处理客户端消息"""
+    try:
+        command = message.get('command', '')
+        logger.info(f"Received command: {command}")
+        
+        if command == 'load_model':
+            # 从message直接获取参数，而不是使用message.get
+            # 这样如果缺少必要参数，会立即抛出KeyError
+            model_path = message['model_path']
+            gguf_path = message.get('gguf_path', '')
+            
+            # 验证model_path不为空
+            if not model_path:
+                return {'status': 'error', 'error': '模型路径不能为空'}
+            
+            # 打印接收到的路径，以便调试
+            logger.info(f"从客户端收到路径 - model_path: '{model_path}', gguf_path: '{gguf_path}'")
+            
+            return self.load_model_on_workers(model_path, gguf_path)
+        elif command == 'generate':
+            return self.generate(message.get('data', {}))
+        elif command == 'shutdown':
+            # 关闭所有worker进程
+            result = self.shutdown_workers()
+            return {'status': 'success' if result else 'error', 'message': 'Shutdown complete'}
+        elif command == 'ping':
+            return {'status': 'success', 'message': 'pong'}
+        else:
+            return {
+                'status': 'error',
+                'error': f'Unknown command: {command}'
+            }
+    except KeyError as e:
+        # 处理缺少必要参数的情况
+        logger.error(f"消息缺少必要参数: {str(e)}")
+        return {'status': 'error', 'error': f'缺少必要参数: {str(e)}'}
+    except Exception as e:
+        logger.error(f"Error processing message: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return {
+            'status': 'error',
+            'error': str(e)
+        }
+```
+
+这些修改应该能解决空模型路径的问题：
+
+1. 在`local_chat.py`中验证模型路径非空并检查路径是否存在
+2. 在`central_server.py`中直接访问message字典获取model_path，确保非空
+3. 在`kvcache_server.py`中添加额外的路径验证和调试信息
+
+请检查在命令行中启动服务时提供的模型路径是否正确，并确保在环境变量中设置了正确的MODEL_PATH。
+
+---
+
+_**User**_
+
+(ds) liugu@login:~/ds/ktransformers$ PYTHONPATH=/archive/liugu/ds/ktransformers python -m ktransformers.local_chat     --model_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/     --gguf_path /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/     --server_address "localhost:29400"     --max_new_tokens 50
+INFO:__main__:Running in distributed mode
+INFO:__main__:Connected to central server at localhost:29400
+正在加载模型: /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/
+使用GGUF模型: /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/
+模型加载失败: 缺少必要参数: 'model_path'
+
+---
+
+_**Assistant**_
+
+<think>
+这个错误显示"缺少必要参数: 'model_path'"，但是我们确实在命令行中提供了model_path参数。让我检查一下为什么central_server.py在处理"load_model"命令时找不到"model_path"参数。
+
+问题可能在于`local_chat.py`中的`_send_command`方法在构建消息格式时出现了问题。查看这部分代码，注意我们是如何构建消息的：
+
+```python
+def _send_command(self, command: str, data: Dict = None) -> Dict:
+    """发送命令到服务器并接收响应"""
+    if data is None:
+        data = {}
+    
+    message = {
+        'command': command,
+        'data': data
+    }
+    
+    try:
+        self.socket.send_pyobj(message)
+        ...
+    except ...
+```
+
+但是，在_send_command中，我们将model_path放在了'data'字段内:
+```
+response = self._send_command('load_model', {
+    'model_path': model_path,
+    'gguf_path': gguf_path if gguf_path else ""
+})
+```
+
+而在central_server.py中，我们直接从message中获取model_path:
+```python
+model_path = message['model_path']  # 直接从message获取，不是从message['data']获取
+```
+
+所以central_server.py在查找message['model_path']时失败，因为它实际上在message['data']['model_path']中。
+</think>
+
+看起来这里有一个参数传递不匹配的问题。在`local_chat.py`中，我们把参数放在了`data`字段内，但在`central_server.py`中，我们尝试直接从消息顶层获取这些参数。让我们修复这个问题：
+
+```python:ktransformers/local_chat.py
+def _send_command(self, command: str, data: Dict = None) -> Dict:
+    """发送命令到服务器并接收响应"""
+    if data is None:
+        data = {}
+    
+    # 构建消息 - 对于load_model命令，把参数放在顶层而不是data字段
+    if command == 'load_model':
+        message = {
+            'command': command,
+            'model_path': data.get('model_path', ''),
+            'gguf_path': data.get('gguf_path', '')
+        }
+    else:
+        # 其他命令保持原有结构
+        message = {
+            'command': command,
+            'data': data
+        }
+    
+    try:
+        self.socket.send_pyobj(message)
+        response = self.socket.recv_pyobj()
+        
+        # 确保返回字典
+        if not isinstance(response, dict):
+            return {'status': 'success' if response else 'error', 'value': response}
+        
+        return response
+    except Exception as e:
+        print(f"通信错误: {str(e)}")
+        return {'status': 'error', 'error': str(e)}
+```
+
+或者，我们也可以修改`central_server.py`来正确处理消息格式：
+
+```python:ktransformers/central_server.py
+def process_client_message(self, message: Dict[str, Any]) -> Dict[str, Any]:
+    """处理客户端消息"""
+    try:
+        command = message.get('command', '')
+        logger.info(f"Received command: {command}")
+        
+        if command == 'load_model':
+            # 检查参数是在顶层还是在data字段中
+            if 'model_path' in message:
+                model_path = message['model_path']
+            elif 'data' in message and 'model_path' in message['data']:
+                model_path = message['data']['model_path']
+            else:
+                return {'status': 'error', 'error': '缺少模型路径参数'}
+                
+            # 同样检查gguf_path
+            if 'gguf_path' in message:
+                gguf_path = message['gguf_path']
+            elif 'data' in message and 'gguf_path' in message['data']:
+                gguf_path = message['data'].get('gguf_path', '')
+            else:
+                gguf_path = ''
+            
+            # 验证model_path不为空
+            if not model_path:
+                return {'status': 'error', 'error': '模型路径不能为空'}
+            
+            # 打印接收到的路径，以便调试
+            logger.info(f"从客户端收到路径 - model_path: '{model_path}', gguf_path: '{gguf_path}'")
+            
+            return self.load_model_on_workers(model_path, gguf_path)
+        # 其他命令处理保持不变...
+```
+
+这两个修改方案中，任何一个都可以解决参数传递不匹配的问题。我建议选择第二种方案，因为它能兼容不同格式的消息，提高系统的健壮性。
 
 ---
 

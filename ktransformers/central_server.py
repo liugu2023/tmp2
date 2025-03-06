@@ -239,10 +239,21 @@ class CentralServer:
             logger.info(f"Received command: {command}")
             
             if command == 'load_model':
-                # 从message直接获取参数，而不是使用message.get
-                # 这样如果缺少必要参数，会立即抛出KeyError
-                model_path = message['model_path']
-                gguf_path = message.get('gguf_path', '')
+                # 检查参数是在顶层还是在data字段中
+                if 'model_path' in message:
+                    model_path = message['model_path']
+                elif 'data' in message and 'model_path' in message['data']:
+                    model_path = message['data']['model_path']
+                else:
+                    return {'status': 'error', 'error': '缺少模型路径参数'}
+                
+                # 同样检查gguf_path
+                if 'gguf_path' in message:
+                    gguf_path = message['gguf_path']
+                elif 'data' in message and 'gguf_path' in message['data']:
+                    gguf_path = message['data'].get('gguf_path', '')
+                else:
+                    gguf_path = ''
                 
                 # 验证model_path不为空
                 if not model_path:

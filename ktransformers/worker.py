@@ -192,37 +192,54 @@ class ModelWorker:
     def _store_data(self, batch_id, key, data):
         """使用KVCacheClient存储数据的辅助方法，处理参数兼容性"""
         try:
-            # 将字典转换为JSON字符串，然后转换为张量
-            if isinstance(data, dict):
+            # 将数据转换为可序列化的格式
+            if isinstance(data, torch.Tensor):
+                # 张量直接存储
+                data_tensor = data.cpu()
+            elif isinstance(data, dict):
+                # 对于字典，使用JSON字符串
                 import json
                 data_str = json.dumps(data)
-                data_bytes = data_str.encode('utf-8')
-                # 创建一个包含字节数据的张量
-                data_tensor = torch.tensor([ord(b) for b in data_str], 
-                                          dtype=torch.uint8, device='cpu')
-            elif isinstance(data, (str, int, float, bool)):
-                # 处理基本类型
-                data_str = str(data)
-                data_tensor = torch.tensor([ord(c) for c in data_str], 
-                                          dtype=torch.uint8, device='cpu')
-            elif isinstance(data, torch.Tensor):
-                # 如果已经是张量，确保在CPU上
-                data_tensor = data.cpu()
-            else:
-                # 其他类型，尝试转换
+                data_tensor = torch.tensor([ord(c) for c in data_str], dtype=torch.int32, device='cpu')
+            elif isinstance(data, (list, tuple)):
+                # 对于列表或元组，直接转换为张量
                 try:
                     data_tensor = torch.tensor(data, device='cpu')
                 except:
-                    # 无法转换为张量，将其转为字符串
-                    data_str = str(data)
-                    data_tensor = torch.tensor([ord(c) for c in data_str], 
-                                              dtype=torch.uint8, device='cpu')
+                    # 如果无法直接转换，将其转为JSON字符串
+                    import json
+                    data_str = json.dumps(data)
+                    data_tensor = torch.tensor([ord(c) for c in data_str], dtype=torch.int32, device='cpu')
+            elif isinstance(data, str):
+                # 字符串转换为ASCII码序列
+                data_tensor = torch.tensor([ord(c) for c in data], dtype=torch.int32, device='cpu')
+            else:
+                # 其他类型转为字符串
+                data_str = str(data)
+                data_tensor = torch.tensor([ord(c) for c in data_str], dtype=torch.int32, device='cpu')
             
-            # 创建一个空的张量作为v参数，或使用相同的数据
-            empty_tensor = torch.zeros(1, dtype=torch.float32, device='cpu')
+            # 使用dummy值作为v参数，简化兼容性
+            dummy_tensor = torch.zeros(1, dtype=torch.float32, device='cpu')
             
-            # 存储数据
-            self.kvcache_client.store(batch_id, key, data_tensor, empty_tensor)
+            # 添加标记表示数据类型
+            metadata = {
+                'type': str(type(data).__name__),
+                'is_tensor': isinstance(data, torch.Tensor),
+                'is_dict': isinstance(data, dict),
+                'is_list': isinstance(data, list),
+                'is_string': isinstance(data, str)
+            }
+            
+            # 创建metadata张量
+            import json
+            metadata_str = json.dumps(metadata)
+            metadata_tensor = torch.tensor([ord(c) for c in metadata_str], dtype=torch.int32, device='cpu')
+            
+            # 存储元数据和数据
+            key_meta = f"{key}_metadata"
+            self.kvcache_client.store(batch_id, key_meta, metadata_tensor, dummy_tensor)
+            self.kvcache_client.store(batch_id, key, data_tensor, dummy_tensor)
+            
             return True
         except Exception as e:
             logger.error(f"存储数据时出错: {str(e)}")
@@ -234,30 +251,51 @@ class ModelWorker:
     def _retrieve_data(self, batch_id, key, device='cpu'):
         """使用KVCacheClient检索数据的辅助方法，处理参数兼容性"""
         try:
-            result = self.kvcache_client.retrieve(batch_id, key, device=device)
+            # 先尝试检索元数据
+            key_meta = f"{key}_metadata"
+            metadata_tensor = self.kvcache_client.retrieve(batch_id, key_meta, device=device)
             
-            # 如果结果是元组，取第一个元素
-            if isinstance(result, tuple) and len(result) == 2:
-                result = result[0]
+            # 检索实际数据
+            data_tensor = self.kvcache_client.retrieve(batch_id, key, device=device)
             
-            # 如果是张量且元素类型是uint8，尝试将其解析为字符串/字典
-            if isinstance(result, torch.Tensor) and result.dtype == torch.uint8:
+            # 如果元数据不存在或检索失败
+            if metadata_tensor is None:
+                # 尝试直接返回数据
+                return data_tensor
+            
+            # 解析元数据
+            if isinstance(metadata_tensor, torch.Tensor):
                 try:
-                    # 尝试将字节转换回字符串
-                    result_str = ''.join(chr(int(b)) for b in result.flatten().tolist())
-                    
-                    # 尝试将字符串解析为JSON（字典）
-                    try:
-                        import json
-                        return json.loads(result_str)
-                    except:
-                        # 不是有效的JSON，返回字符串
-                        return result_str
+                    metadata_str = ''.join(chr(int(i)) for i in metadata_tensor.tolist())
+                    import json
+                    metadata = json.loads(metadata_str)
                 except:
-                    # 无法转换，返回原始张量
-                    pass
+                    # 无法解析元数据，返回原始数据
+                    return data_tensor
+            else:
+                # 元数据不是张量，直接返回数据
+                return data_tensor
             
-            return result
+            # 根据数据类型重建原始数据
+            if metadata.get('is_tensor'):
+                # 是张量，直接返回
+                return data_tensor
+            elif metadata.get('is_string'):
+                # 字符串类型，将整数转回字符
+                return ''.join(chr(int(i)) for i in data_tensor.tolist())
+            elif metadata.get('is_dict') or metadata.get('is_list'):
+                # 字典或列表，解析JSON
+                try:
+                    data_str = ''.join(chr(int(i)) for i in data_tensor.tolist())
+                    import json
+                    return json.loads(data_str)
+                except:
+                    # JSON解析失败，返回原始字符串
+                    return data_str
+            else:
+                # 无法识别的类型或解析失败，返回原始数据
+                return data_tensor
+            
         except Exception as e:
             logger.error(f"检索数据时出错: {str(e)}")
             import traceback

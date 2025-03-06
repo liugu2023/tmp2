@@ -14243,6 +14243,96 @@ INFO:__main__:Generation completed successfully
 
 _**Assistant**_
 
+<think>
+这个错误表明在检查 `output_ids` 是否为真时，遇到了 PyTorch 张量包含多个值的情况，这在布尔上下文中是模糊的。我们需要修复 `local_chat.py` 中的代码，确保在使用布尔判断前检查 `output_ids` 的类型。
+
+错误发生在：
+```python
+if output_ids:  # 这里出错，因为output_ids可能是一个多值张量
+```
+
+我们需要修改代码，使用 `len(output_ids) > 0` 或者在使用之前检查是否是张量并转换为列表。
+</think>
+
+我们需要修复 `local_chat.py` 中的错误，张量不能直接用于布尔判断：
+
+```python:ktransformers/local_chat.py
+def generate(self, input_ids, attention_mask, **kwargs):
+    """生成文本"""
+    try:
+        # 准备请求数据
+        generate_data = {
+            'input_ids': input_ids,
+            'attention_mask': attention_mask
+        }
+        # 添加其他生成参数
+        generate_data.update(kwargs)
+        
+        # 发送生成请求
+        response = self._send_command('generate', generate_data)
+        
+        if response.get('status') != 'success':
+            error_msg = response.get('error', 'Unknown error')
+            print(f"生成失败: {error_msg}")
+            return []
+        
+        # 获取输出token IDs
+        output_ids = response.get('output_ids', [])
+        
+        print("生成成功!")
+        # 修复: 使用长度检查而不是直接用张量作为布尔值
+        if isinstance(output_ids, torch.Tensor):
+            has_outputs = len(output_ids) > 0
+        else:
+            has_outputs = bool(output_ids)
+            
+        if has_outputs:
+            # 确保输出为列表，以便切片操作安全
+            if isinstance(output_ids, torch.Tensor):
+                output_preview = output_ids[:10].tolist()
+            else:
+                output_preview = output_ids[:10]
+                
+            print(f"生成的tokens: {output_preview}...")
+            if self.tokenizer:
+                # 确保在解码前张量已转换为列表
+                if isinstance(output_ids, torch.Tensor):
+                    output_text = self.tokenizer.decode(output_ids.tolist())
+                else:
+                    output_text = self.tokenizer.decode(output_ids)
+                print(f"\n生成的文本:\n{output_text}\n")
+        else:
+            print("警告: 未收到任何生成的tokens")
+        
+        return output_ids
+    
+    except Exception as e:
+        print(f"生成过程中出错: {str(e)}")
+        import traceback
+        print(traceback.format_exc())
+        return []
+```
+
+这些修改：
+
+1. 将直接的布尔检查 `if output_ids:` 替换为更安全的长度检查
+2. 对张量类型进行特别处理，使用 `len(output_ids) > 0` 判断
+3. 确保在切片和解码前正确处理张量类型
+4. 添加类型检查和转换，防止在操作张量时出现歧义
+
+这样修改后，代码可以安全地处理无论是张量还是列表类型的输出。
+
+---
+
+_**User**_
+
+ERROR:__main__:Error: 'utf-8' codec can't decode bytes in position 0-1: invalid continuation byte
+INFO:__main__:Sending shutdown command to worker...
+
+---
+
+_**Assistant**_
+
 
 
 ---

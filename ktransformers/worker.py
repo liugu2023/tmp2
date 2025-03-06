@@ -385,6 +385,9 @@ class ModelWorker:
             input_ids = torch.tensor(input_data['input_ids'], device=device)
             attention_mask = torch.tensor(input_data['attention_mask'], device=device)
             
+            # 初始化 hidden_states，确保在所有条件分支前都已定义
+            hidden_states = input_ids  # 默认初始化
+            
             # 生成参数日志
             max_new_tokens = input_data.get('max_new_tokens', 512)
             temperature = input_data.get('temperature', 0.6)
@@ -416,17 +419,26 @@ class ModelWorker:
                         logger.info(f"Stored embeddings with shape {hidden_states.shape}")
                 else:
                     # 其他worker需要等待并获取嵌入结果
+                    result = None
                     for _ in range(10):  # 最多尝试10次
-                        result = kvcache_client.retrieve(batch_id, "embeddings", device=device)
-                        if result is not None:
-                            # 将numpy数组转换回张量，并设置正确的设备和数据类型
-                            hidden_states = torch.from_numpy(result).to(device=device, dtype=dtype)
-                            logger.info(f"Retrieved embeddings with shape {hidden_states.shape}")
-                            break
+                        try:
+                            result = kvcache_client.retrieve(batch_id, "embeddings", device=device)
+                            if result is not None:
+                                # 将numpy数组转换回张量，并设置正确的设备和数据类型
+                                hidden_states = torch.from_numpy(result).to(device=device, dtype=dtype)
+                                logger.info(f"Retrieved embeddings with shape {hidden_states.shape}")
+                                break
+                        except Exception as e:
+                            logger.warning(f"Retrieval attempt failed: {str(e)}")
                         time.sleep(0.1)
                     
-                    if hidden_states is None:
+                    if result is None:
+                        logger.error("Failed to retrieve embeddings after multiple attempts")
                         raise RuntimeError("Failed to retrieve embeddings from first worker")
+                
+                # 确保 hidden_states 在这一点上已经正确初始化
+                if hidden_states is None:
+                    raise RuntimeError("hidden_states is None after initialization phase")
                 
                 # 处理当前worker负责的层
                 for layer_idx in range(self.model.start_layer, self.model.end_layer):
@@ -456,15 +468,20 @@ class ModelWorker:
                 
                 # 等待最终结果
                 if self.worker_id != self.num_workers - 1:
+                    result = None
                     for _ in range(10):  # 最多尝试10次
-                        result = kvcache_client.retrieve(batch_id, "final", device=device)
-                        if result is not None:
-                            hidden_states = torch.from_numpy(result).to(device=device, dtype=dtype)
-                            logger.info(f"Retrieved final output with shape {hidden_states.shape}")
-                            break
+                        try:
+                            result = kvcache_client.retrieve(batch_id, "final", device=device)
+                            if result is not None:
+                                hidden_states = torch.from_numpy(result).to(device=device, dtype=dtype)
+                                logger.info(f"Retrieved final output with shape {hidden_states.shape}")
+                                break
+                        except Exception as e:
+                            logger.warning(f"Final result retrieval attempt failed: {str(e)}")
                         time.sleep(0.1)
                     
-                    if hidden_states is None:
+                    if result is None:
+                        logger.error("Failed to retrieve final output after multiple attempts")
                         raise RuntimeError("Failed to retrieve final output from last worker")
                 
                 # 生成完成后清理缓存

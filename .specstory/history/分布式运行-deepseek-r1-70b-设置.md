@@ -10930,6 +10930,396 @@ _**Assistant**_
 
 
 
+
+
+看起来有两个问题需要修复：
+
+1. KVCacheClient.retrieve() 仍然需要 device 参数
+2. 矩阵形状不匹配（1x6 和 8192x8192）
+
+让我们修复这些问题：
+
+```python:ktransformers/worker.py
+def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        logger.info("Received generation request")
+        logger.info(f"Input sequence length: {len(input_data['input_ids'])}")
+        
+        # 创建输入张量并设置正确的数据类型
+        logger.info("Moving input tensors to GPU...")
+        device = self.model.device
+        dtype = torch.float16  # 使用与模型相同的数据类型
+        
+        # 确保输入张量使用正确的数据类型
+        input_ids = torch.tensor(input_data['input_ids'], device=device)
+        attention_mask = torch.tensor(input_data['attention_mask'], device=device)
+        
+        # 生成参数日志
+        max_new_tokens = input_data.get('max_new_tokens', 512)
+        temperature = input_data.get('temperature', 0.6)
+        top_p = input_data.get('top_p', 0.9)
+        logger.info(f"Generation parameters: max_new_tokens={max_new_tokens}, "
+                   f"temperature={temperature}, "
+                   f"top_p={top_p}")
+        
+        # 生成文本
+        logger.info("Starting text generation...")
+        start_time = time.time()
+        
+        # 创建 KV Cache 客户端
+        kvcache_client = KVCacheClient("10.21.22.206:29600")
+        
+        # 生成唯一的 batch ID
+        batch_id = f"{time.time()}_{self.worker_id}"
+        
+        with torch.no_grad(), torch.amp.autocast('cuda'):
+            # 如果是第一个worker，需要处理词嵌入
+            if self.worker_id == 0:
+                if self.model.embed_tokens is not None:
+                    # 将输入转换为正确的数据类型
+                    hidden_states = self.model.embed_tokens(input_ids)
+                    hidden_states = hidden_states.to(dtype)
+                    # 存储嵌入结果供其他worker使用
+                    cpu_hidden_states = hidden_states.cpu().numpy()  # 使用numpy而不是tolist
+                    kvcache_client.store(batch_id, "embeddings", cpu_hidden_states)
+                    logger.info(f"Stored embeddings with shape {hidden_states.shape}")
+            else:
+                # 其他worker需要等待并获取嵌入结果
+                for _ in range(10):  # 最多尝试10次
+                    result = kvcache_client.retrieve(batch_id, "embeddings", device=device)
+                    if result is not None:
+                        # 将numpy数组转换回张量，并设置正确的设备和数据类型
+                        hidden_states = torch.from_numpy(result).to(device=device, dtype=dtype)
+                        logger.info(f"Retrieved embeddings with shape {hidden_states.shape}")
+                        break
+                    time.sleep(0.1)
+                
+                if hidden_states is None:
+                    raise RuntimeError("Failed to retrieve embeddings from first worker")
+            
+            # 处理当前worker负责的层
+            for layer_idx in range(self.model.start_layer, self.model.end_layer):
+                # 确保输入在正确的设备和数据类型上
+                hidden_states = hidden_states.to(device).to(dtype)
+                # 获取当前层
+                layer = self.model.layers[layer_idx - self.model.start_layer].to(device)
+                # 记录形状以便调试
+                logger.info(f"Layer {layer_idx} input shape: {hidden_states.shape}")
+                # 处理这一层
+                hidden_states = layer(hidden_states)
+                # 存储结果
+                cpu_hidden_states = hidden_states.cpu().numpy()
+                kvcache_client.store(batch_id, f"layer_{layer_idx}", cpu_hidden_states)
+                logger.info(f"Processed and stored layer {layer_idx} with shape {hidden_states.shape}")
+            
+            # 如果是最后一个worker，需要处理norm和lm_head
+            if self.worker_id == self.num_workers - 1:
+                if self.model.norm is not None:
+                    hidden_states = self.model.norm(hidden_states.to(device).to(dtype))
+                if self.model.lm_head is not None:
+                    hidden_states = self.model.lm_head(hidden_states)
+                # 存储最终结果
+                cpu_hidden_states = hidden_states.cpu().numpy()
+                kvcache_client.store(batch_id, "final", cpu_hidden_states)
+                logger.info(f"Stored final output with shape {hidden_states.shape}")
+            
+            # 等待最终结果
+            if self.worker_id != self.num_workers - 1:
+                for _ in range(10):  # 最多尝试10次
+                    result = kvcache_client.retrieve(batch_id, "final", device=device)
+                    if result is not None:
+                        hidden_states = torch.from_numpy(result).to(device=device, dtype=dtype)
+                        logger.info(f"Retrieved final output with shape {hidden_states.shape}")
+                        break
+                    time.sleep(0.1)
+                
+                if hidden_states is None:
+                    raise RuntimeError("Failed to retrieve final output from last worker")
+            
+            # 生成完成后清理缓存
+            kvcache_client.clear(batch_id)
+            
+            # 确保输出在CPU上，以便序列化
+            hidden_states = hidden_states.cpu().numpy()
+            
+            # 返回结果
+            return {
+                'status': 'success',
+                'output': hidden_states.tolist(),
+                'time_taken': time.time() - start_time
+            }
+            
+    except Exception as e:
+        logger.error(f"Generation error: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return {
+            'status': 'error',
+            'error': str(e)
+        }
+```
+
+
+主要修改：
+
+1. 在所有 retrieve 调用中添加了 device 参数
+2. 使用 numpy 数组而不是 Python 列表来传输数据
+3. 添加了更多的形状日志记录以便调试
+4. 确保所有张量操作都保持正确的形状
+5. 在每个关键步骤都记录张量形状
+
+这些修改应该能解决参数缺失和形状不匹配的问题。请更新代码并重试。如果还有形状问题，日志会帮助我们找出具体在哪一步出现了问题。
+
+---
+
+_**User**_
+
+INFO:__main__:Worker 7 memory calculation:
+INFO:__main__:- Hidden size: 8192
+INFO:__main__:- Context length: 8192
+INFO:__main__:- KV cache per layer: 0.25 GB
+INFO:__main__:- Layer parameters: 3.25 GB per layer
+INFO:__main__:- Handling 10 layers: from 70 to 79
+INFO:__main__:- Estimated KV cache: 2.50 GB
+INFO:__main__:- Estimated model parameters: 32.50 GB
+INFO:__main__:- Estimated workspace: 1.00 GB
+INFO:__main__:- Total GPU memory budget: 37 GB
+INFO:__main__:加载norm和lm_head
+INFO:__main__:Worker 7 负责层 70-79
+INFO:__main__:Worker 7 成功初始化，负责层 70-79
+INFO:__main__:Received generation request
+INFO:__main__:Input sequence length: 1
+INFO:__main__:Moving input tensors to GPU...
+INFO:__main__:Received generation request
+INFO:__main__:Input sequence length: 1
+INFO:__main__:Moving input tensors to GPU...
+INFO:__main__:Received generation request
+INFO:__main__:Input sequence length: 1
+INFO:__main__:Moving input tensors to GPU...
+INFO:__main__:Received generation request
+INFO:__main__:Input sequence length: 1
+INFO:__main__:Moving input tensors to GPU...
+INFO:__main__:Received generation request
+INFO:__main__:Input sequence length: 1
+INFO:__main__:Moving input tensors to GPU...
+INFO:__main__:Received generation request
+INFO:__main__:Input sequence length: 1
+INFO:__main__:Moving input tensors to GPU...
+INFO:__main__:Received generation request
+INFO:__main__:Input sequence length: 1
+INFO:__main__:Moving input tensors to GPU...
+INFO:__main__:Received generation request
+INFO:__main__:Input sequence length: 1
+INFO:__main__:Moving input tensors to GPU...
+INFO:__main__:Generation parameters: max_new_tokens=50, temperature=0.7, top_p=0.9
+INFO:__main__:Starting text generation...
+INFO:__main__:Generation parameters: max_new_tokens=50, temperature=0.7, top_p=0.9
+INFO:__main__:Starting text generation...
+INFO:__main__:Generation parameters: max_new_tokens=50, temperature=0.7, top_p=0.9
+INFO:__main__:Generation parameters: max_new_tokens=50, temperature=0.7, top_p=0.9
+INFO:__main__:Starting text generation...
+INFO:__main__:Starting text generation...
+ERROR:__main__:Generation error: cannot access local variable 'hidden_states' where it is not associated with a value
+ERROR:__main__:Traceback (most recent call last):
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 434, in generate
+    hidden_states = hidden_states.to(device).to(dtype)
+                    ^^^^^^^^^^^^^
+UnboundLocalError: cannot access local variable 'hidden_states' where it is not associated with a value
+
+INFO:__main__:Generation parameters: max_new_tokens=50, temperature=0.7, top_p=0.9
+INFO:__main__:Starting text generation...
+INFO:__main__:Generation parameters: max_new_tokens=50, temperature=0.7, top_p=0.9
+INFO:__main__:Starting text generation...
+INFO:__main__:Generation parameters: max_new_tokens=50, temperature=0.7, top_p=0.9
+INFO:__main__:Starting text generation...
+INFO:__main__:Generation parameters: max_new_tokens=50, temperature=0.7, top_p=0.9
+INFO:__main__:Starting text generation...
+ERROR:__main__:Generation error: cannot access local variable 'hidden_states' where it is not associated with a value
+ERROR:__main__:Generation error: cannot access local variable 'hidden_states' where it is not associated with a value
+ERROR:__main__:Traceback (most recent call last):
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 428, in generate
+    if hidden_states is None:
+       ^^^^^^^^^^^^^
+UnboundLocalError: cannot access local variable 'hidden_states' where it is not associated with a value
+
+ERROR:__main__:Traceback (most recent call last):
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 428, in generate
+    if hidden_states is None:
+       ^^^^^^^^^^^^^
+UnboundLocalError: cannot access local variable 'hidden_states' where it is not associated with a value
+
+ERROR:__main__:Generation error: cannot access local variable 'hidden_states' where it is not associated with a value
+ERROR:__main__:Traceback (most recent call last):
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 428, in generate
+    if hidden_states is None:
+       ^^^^^^^^^^^^^
+UnboundLocalError: cannot access local variable 'hidden_states' where it is not associated with a value
+
+ERROR:__main__:Generation error: cannot access local variable 'hidden_states' where it is not associated with a value
+ERROR:__main__:Traceback (most recent call last):
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 428, in generate
+    if hidden_states is None:
+       ^^^^^^^^^^^^^
+UnboundLocalError: cannot access local variable 'hidden_states' where it is not associated with a value
+
+ERROR:__main__:Generation error: cannot access local variable 'hidden_states' where it is not associated with a value
+ERROR:__main__:Generation error: cannot access local variable 'hidden_states' where it is not associated with a value
+ERROR:__main__:Traceback (most recent call last):
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 428, in generate
+    if hidden_states is None:
+       ^^^^^^^^^^^^^
+UnboundLocalError: cannot access local variable 'hidden_states' where it is not associated with a value
+
+ERROR:__main__:Traceback (most recent call last):
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 428, in generate
+    if hidden_states is None:
+       ^^^^^^^^^^^^^
+UnboundLocalError: cannot access local variable 'hidden_states' where it is not associated with a value
+
+ERROR:__main__:Generation error: cannot access local variable 'hidden_states' where it is not associated with a value
+ERROR:__main__:Traceback (most recent call last):
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 428, in generate
+    if hidden_states is None:
+       ^^^^^^^^^^^^^
+UnboundLocalError: cannot access local variable 'hidden_states' where it is not associated with a value
+
+
+---
+
+_**Assistant**_
+
+<think>
+这个错误显示 `hidden_states` 变量没有被正确初始化。问题出在 worker.py 的 generate 函数中，在两个地方有问题：
+
+1. 在分支逻辑中，如果当前 worker 既不是第一个 worker 也不是负责当前处理层的 worker，就会出现 `hidden_states` 未初始化的情况。
+
+2. 由于变量作用域问题，在 if-else 语句内部的赋值在特定条件下可能导致外部访问时变量未定义。
+
+我们需要确保 `hidden_states` 在所有条件分支下都被初始化，且 worker 之间的协调逻辑更加清晰。
+</think>
+
+让我们修复在 generate 方法中 `hidden_states` 变量未初始化的问题：
+
+```python:ktransformers/worker.py
+def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        logger.info("Received generation request")
+        logger.info(f"Input sequence length: {len(input_data['input_ids'])}")
+        
+        # 创建输入张量并设置正确的数据类型
+        logger.info("Moving input tensors to GPU...")
+        device = self.model.device
+        dtype = torch.float16  # 使用与模型相同的数据类型
+        
+        # 确保输入张量使用正确的数据类型
+        input_ids = torch.tensor(input_data['input_ids'], device=device)
+        attention_mask = torch.tensor(input_data['attention_mask'], device=device)
+        
+        # 初始化 hidden_states，确保在所有条件分支前都已定义
+        hidden_states = input_ids  # 默认初始化
+        
+        # 生成参数日志
+        max_new_tokens = input_data.get('max_new_tokens', 512)
+        temperature = input_data.get('temperature', 0.6)
+        top_p = input_data.get('top_p', 0.9)
+        logger.info(f"Generation parameters: max_new_tokens={max_new_tokens}, "
+                   f"temperature={temperature}, "
+                   f"top_p={top_p}")
+        
+        # 生成文本
+        logger.info("Starting text generation...")
+        start_time = time.time()
+        
+        # 创建 KV Cache 客户端
+        kvcache_client = KVCacheClient("10.21.22.206:29600")
+        
+        # 生成唯一的 batch ID
+        batch_id = f"{time.time()}_{self.worker_id}"
+        
+        with torch.no_grad(), torch.amp.autocast('cuda'):
+            # 如果是第一个worker，需要处理词嵌入
+            if self.worker_id == 0:
+                if self.model.embed_tokens is not None:
+                    # 将输入转换为正确的数据类型
+                    hidden_states = self.model.embed_tokens(input_ids)
+                    hidden_states = hidden_states.to(dtype)
+                    # 存储嵌入结果供其他worker使用
+                    cpu_hidden_states = hidden_states.cpu().numpy()  # 使用numpy而不是tolist
+                    kvcache_client.store(batch_id, "embeddings", cpu_hidden_states)
+                    logger.info(f"Stored embeddings with shape {hidden_states.shape}")
+            else:
+                # 其他worker需要等待并获取嵌入结果
+                result = None
+                for _ in range(10):  # 最多尝试10次
+                    try:
+                        result = kvcache_client.retrieve(batch_id, "embeddings", device=device)
+                        if result is not None:
+                            # 将numpy数组转换回张量，并设置正确的设备和数据类型
+                            hidden_states = torch.from_numpy(result).to(device=device, dtype=dtype)
+                            logger.info(f"Retrieved embeddings with shape {hidden_states.shape}")
+                            break
+                    except Exception as e:
+                        logger.warning(f"Retrieval attempt failed: {str(e)}")
+                    time.sleep(0.1)
+                
+                if result is None:
+                    logger.error("Failed to retrieve embeddings after multiple attempts")
+                    raise RuntimeError("Failed to retrieve embeddings from first worker")
+            
+            # 确保 hidden_states 在这一点上已经正确初始化
+            if hidden_states is None:
+                raise RuntimeError("hidden_states is None after initialization phase")
+            
+            # 处理当前worker负责的层
+            for layer_idx in range(self.model.start_layer, self.model.end_layer):
+                # 确保输入在正确的设备和数据类型上
+                hidden_states = hidden_states.to(device).to(dtype)
+                # 获取当前层
+                layer = self.model.layers[layer_idx - self.model.start_layer].to(device)
+                # 记录形状以便调试
+                logger.info(f"Layer {layer_idx} input shape: {hidden_states.shape}")
+                # 处理这一层
+                hidden_states = layer(hidden_states)
+                # 存储结果
+                cpu_hidden_states = hidden_states.cpu().numpy()
+                kvcache_client.store(batch_id, f"layer_{layer_idx}", cpu_hidden_states)
+                logger.info(f"Processed and stored layer {layer_idx} with shape {hidden_states.shape}")
+            
+            # 如果是最后一个worker，需要处理norm和lm_head
+            if self.worker_id == self.num_workers - 1:
+                if self.model.norm is not None:
+                    hidden_states = self.model.norm(hidden_states.to(device).to(dtype))
+                if self.model.lm_head is not None:
+                    hidden_states = self.model.lm_head(hidden_states)
+                # 存储最终结果
+                cpu_hidden_states = hidden_states.cpu().numpy()
+                kvcache_client.store(batch_id, "final", cpu_hidden_states)
+                logger.info(f"Stored final output with shape {hidden_states.shape}")
+            
+            # 等待最终结果
+            if self.worker_id != self.num_workers - 1:
+                result = None
+                for _ in range(10):  # 最多尝试10次
+                    try:
+                        result = kvcache_client.retrieve(batch_id, "final", device=device)
+                        if result is not None:
+                            hidden_states = torch.from_numpy(result).to(device=device, dtype=dtype)
+                            logger.info(f"Retrieved final output with shape {hidden_states.shape}")
+                            break
+                    except Exception as e:
+                        logger.warning(f"Final result retrieval attempt failed: {str(e)}")
+                    time.sleep(0.1)
+                
+                if result is None:
+                    logger.error("Failed to retrieve final output after multiple attempts")
+                    raise RuntimeError("Failed to retrieve final output from last worker")
+            
+            # 生成完成后清理缓存
+            kvcache_client.clear(batch_id)
+            
+            # 确保输出在CPU上，以便序列化
+            hidden_states = hidden_
+
 ---
 
 

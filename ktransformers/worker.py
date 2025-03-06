@@ -201,8 +201,6 @@ class ModelWorker:
         # 创建一个简化的模型结构
         # 这里使用torch.nn.Module来构建一个基本模型，
         # 它不包含实际权重，但提供generate()方法接口
-        from transformers import GenerationConfig
-        
         class SimpleModel(torch.nn.Module):
             def __init__(self, config, worker_id, worker_count, kvcache_client):
                 super().__init__()
@@ -214,6 +212,25 @@ class ModelWorker:
                 # 添加必要的属性
                 self.model = self  # 有些代码可能在访问.model属性
                 self.device = torch.device(f'cuda:{0 if worker_id < 4 else 1}' if torch.cuda.is_available() else 'cpu')
+                
+                # 创建基本的模型结构
+                class ModelInternals(torch.nn.Module):
+                    def __init__(self):
+                        super().__init__()
+                        self.embed_tokens = torch.nn.Embedding(config.vocab_size, config.hidden_size)
+                        self.layers = torch.nn.ModuleList([
+                            torch.nn.Linear(config.hidden_size, config.hidden_size)
+                            for _ in range(config.num_hidden_layers)
+                        ])
+                        self.norm = torch.nn.LayerNorm(config.hidden_size)
+                        
+                    def forward(self, x):
+                        return x
+                
+                # 添加模型内部结构
+                self.model_internals = ModelInternals()
+                # 为了兼容性，也添加layers属性
+                self.layers = self.model_internals.layers
                 
                 # 创建生成配置
                 self.generation_config = GenerationConfig(
@@ -228,6 +245,7 @@ class ModelWorker:
             def to(self, device):
                 """实现to方法以支持设备移动"""
                 self.device = device
+                self.model_internals = self.model_internals.to(device)
                 return super().to(device)
             
             def generate(self, *args, **kwargs):

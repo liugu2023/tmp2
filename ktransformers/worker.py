@@ -407,13 +407,19 @@ class ModelWorker:
                 if self.worker_id == 0:
                     if self.model.embed_tokens is not None:
                         hidden_states = self.model.embed_tokens(hidden_states)
-                    # 存储嵌入结果供其他worker使用
-                    kvcache_client.store(batch_id, "embeddings", hidden_states)
+                        # 存储嵌入结果供其他worker使用
+                        # 将张量移到CPU并转换为列表
+                        cpu_hidden_states = hidden_states.cpu().tolist()
+                        kvcache_client.store(batch_id, "embeddings", "value", cpu_hidden_states)
+                        logger.info("Stored embeddings for other workers")
                 else:
                     # 其他worker需要等待并获取嵌入结果
                     for _ in range(10):  # 最多尝试10次
-                        hidden_states = kvcache_client.retrieve(batch_id, "embeddings", device=device)
-                        if hidden_states is not None:
+                        result = kvcache_client.retrieve(batch_id, "embeddings", "value", device=device)
+                        if result is not None:
+                            # 将列表转换回张量
+                            hidden_states = torch.tensor(result, device=device)
+                            logger.info("Retrieved embeddings from first worker")
                             break
                         time.sleep(0.1)  # 等待100ms后重试
                     
@@ -429,7 +435,9 @@ class ModelWorker:
                     # 处理这一层
                     hidden_states = layer(hidden_states)
                     # 存储结果
-                    kvcache_client.store(batch_id, f"layer_{layer_idx}", hidden_states)
+                    cpu_hidden_states = hidden_states.cpu().tolist()
+                    kvcache_client.store(batch_id, f"layer_{layer_idx}", "value", cpu_hidden_states)
+                    logger.info(f"Processed and stored layer {layer_idx}")
                 
                 # 如果是最后一个worker，需要处理norm和lm_head
                 if self.worker_id == self.num_workers - 1:
@@ -438,13 +446,17 @@ class ModelWorker:
                     if self.model.lm_head is not None:
                         hidden_states = self.model.lm_head(hidden_states)
                     # 存储最终结果
-                    kvcache_client.store(batch_id, "final", hidden_states)
+                    cpu_hidden_states = hidden_states.cpu().tolist()
+                    kvcache_client.store(batch_id, "final", "value", cpu_hidden_states)
+                    logger.info("Stored final output")
                 
                 # 等待最终结果
                 if self.worker_id != self.num_workers - 1:
                     for _ in range(10):  # 最多尝试10次
-                        hidden_states = kvcache_client.retrieve(batch_id, "final", device=device)
-                        if hidden_states is not None:
+                        result = kvcache_client.retrieve(batch_id, "final", "value", device=device)
+                        if result is not None:
+                            hidden_states = torch.tensor(result, device=device)
+                            logger.info("Retrieved final output")
                             break
                         time.sleep(0.1)
                     

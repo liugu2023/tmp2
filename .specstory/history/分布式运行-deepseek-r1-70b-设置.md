@@ -10370,6 +10370,340 @@ _**Assistant**_
 
 
 
+看起来有两个主要问题：
+
+1. 无法从 KVCache 服务器检索层 0 的隐藏状态
+2. 设备不匹配问题仍然存在
+
+让我们修改 generate 方法的实现：
+
+```python:ktransformers/worker.py
+def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        logger.info("Received generation request")
+        logger.info(f"Input sequence length: {len(input_data['input_ids'])}")
+        
+        # 创建输入张量
+        logger.info("Moving input tensors to GPU...")
+        device = self.model.device  # 使用模型的设备
+        input_ids = torch.tensor(input_data['input_ids'], device=device)
+        attention_mask = torch.tensor(input_data['attention_mask'], device=device)
+        
+        # 生成参数日志
+        max_new_tokens = input_data.get('max_new_tokens', 512)
+        temperature = input_data.get('temperature', 0.6)
+        top_p = input_data.get('top_p', 0.9)
+        logger.info(f"Generation parameters: max_new_tokens={max_new_tokens}, "
+                   f"temperature={temperature}, "
+                   f"top_p={top_p}")
+        
+        # 生成文本
+        logger.info("Starting text generation...")
+        start_time = time.time()
+        
+        # 创建 KV Cache 客户端
+        kvcache_client = KVCacheClient("10.21.22.206:29600")
+        
+        # 生成唯一的 batch ID
+        batch_id = f"{time.time()}_{self.worker_id}"
+        
+        with torch.no_grad(), torch.amp.autocast('cuda'):
+            hidden_states = input_ids  # 初始化隐藏状态
+            
+            # 如果是第一个worker，需要处理词嵌入
+            if self.worker_id == 0:
+                if self.model.embed_tokens is not None:
+                    hidden_states = self.model.embed_tokens(hidden_states)
+                # 存储嵌入结果供其他worker使用
+                kvcache_client.store(batch_id, "embeddings", hidden_states)
+            else:
+                # 其他worker需要等待并获取嵌入结果
+                for _ in range(10):  # 最多尝试10次
+                    hidden_states = kvcache_client.retrieve(batch_id, "embeddings", device=device)
+                    if hidden_states is not None:
+                        break
+                    time.sleep(0.1)  # 等待100ms后重试
+                
+                if hidden_states is None:
+                    raise RuntimeError("Failed to retrieve embeddings from first worker")
+            
+            # 处理当前worker负责的层
+            for layer_idx in range(self.model.start_layer, self.model.end_layer):
+                # 确保输入在正确的设备上
+                hidden_states = hidden_states.to(device)
+                # 获取当前层
+                layer = self.model.layers[layer_idx - self.model.start_layer].to(device)
+                # 处理这一层
+                hidden_states = layer(hidden_states)
+                # 存储结果
+                kvcache_client.store(batch_id, f"layer_{layer_idx}", hidden_states)
+            
+            # 如果是最后一个worker，需要处理norm和lm_head
+            if self.worker_id == self.num_workers - 1:
+                if self.model.norm is not None:
+                    hidden_states = self.model.norm(hidden_states.to(device))
+                if self.model.lm_head is not None:
+                    hidden_states = self.model.lm_head(hidden_states)
+                # 存储最终结果
+                kvcache_client.store(batch_id, "final", hidden_states)
+            
+            # 等待最终结果
+            if self.worker_id != self.num_workers - 1:
+                for _ in range(10):  # 最多尝试10次
+                    hidden_states = kvcache_client.retrieve(batch_id, "final", device=device)
+                    if hidden_states is not None:
+                        break
+                    time.sleep(0.1)
+                
+                if hidden_states is None:
+                    raise RuntimeError("Failed to retrieve final output from last worker")
+            
+            # 生成完成后清理缓存
+            kvcache_client.clear(batch_id)
+            
+            # 确保输出在CPU上，以便序列化
+            hidden_states = hidden_states.cpu()
+            
+            # 返回结果
+            return {
+                'status': 'success',
+                'output': hidden_states.tolist(),
+                'time_taken': time.time() - start_time
+            }
+            
+    except Exception as e:
+        logger.error(f"Generation error: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return {
+            'status': 'error',
+            'error': str(e)
+        }
+```
+
+主要修改：
+
+1. 改进了worker间的协作方式：
+   - 第一个worker处理词嵌入并存储结果
+   - 其他worker等待并获取嵌入结果
+   - 每个worker只处理自己负责的层
+   - 最后一个worker处理norm和lm_head
+   - 其他worker等待最终结果
+
+2. 添加了重试机制：
+   - 在获取其他worker的结果时最多尝试10次
+   - 每次失败后等待100ms再重试
+
+3. 确保设备一致性：
+   - 在每次使用张量前确保它在正确的设备上
+   - 在每次使用层前确保它在正确的设备上
+
+4. 改进了错误处理和日志记录
+
+请更新代码并重试。这个实现应该能更好地处理worker间的协作和设备管理。
+
+---
+
+_**User**_
+
+INFO:__main__:Generation parameters: max_new_tokens=50, temperature=0.7, top_p=0.9
+INFO:__main__:Generation parameters: max_new_tokens=50, temperature=0.7, top_p=0.9
+INFO:__main__:Starting text generation...
+INFO:__main__:Starting text generation...
+INFO:__main__:Generation parameters: max_new_tokens=50, temperature=0.7, top_p=0.9
+INFO:__main__:Starting text generation...
+INFO:__main__:Generation parameters: max_new_tokens=50, temperature=0.7, top_p=0.9
+INFO:__main__:Starting text generation...
+ERROR:__main__:Generation error: KVCacheClient.store() missing 1 required positional argument: 'v'
+ERROR:__main__:Traceback (most recent call last):
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 411, in generate
+    kvcache_client.store(batch_id, "embeddings", hidden_states)
+TypeError: KVCacheClient.store() missing 1 required positional argument: 'v'
+
+INFO:__main__:Generation parameters: max_new_tokens=50, temperature=0.7, top_p=0.9
+INFO:__main__:Starting text generation...
+INFO:__main__:Generation parameters: max_new_tokens=50, temperature=0.7, top_p=0.9
+INFO:__main__:Starting text generation...
+INFO:__main__:Generation parameters: max_new_tokens=50, temperature=0.7, top_p=0.9
+INFO:__main__:Starting text generation...
+INFO:__main__:Generation parameters: max_new_tokens=50, temperature=0.7, top_p=0.9
+INFO:__main__:Starting text generation...
+ERROR:__main__:Generation error: Failed to retrieve embeddings from first worker
+ERROR:__main__:Generation error: Failed to retrieve embeddings from first worker
+ERROR:__main__:Traceback (most recent call last):
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 421, in generate
+    raise RuntimeError("Failed to retrieve embeddings from first worker")
+RuntimeError: Failed to retrieve embeddings from first worker
+
+ERROR:__main__:Traceback (most recent call last):
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 421, in generate
+    raise RuntimeError("Failed to retrieve embeddings from first worker")
+RuntimeError: Failed to retrieve embeddings from first worker
+
+ERROR:__main__:Generation error: Failed to retrieve embeddings from first worker
+ERROR:__main__:Traceback (most recent call last):
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 421, in generate
+    raise RuntimeError("Failed to retrieve embeddings from first worker")
+RuntimeError: Failed to retrieve embeddings from first worker
+
+ERROR:__main__:Generation error: Failed to retrieve embeddings from first worker
+ERROR:__main__:Traceback (most recent call last):
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 421, in generate
+    raise RuntimeError("Failed to retrieve embeddings from first worker")
+RuntimeError: Failed to retrieve embeddings from first worker
+
+ERROR:__main__:Generation error: Failed to retrieve embeddings from first worker
+ERROR:__main__:Traceback (most recent call last):
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 421, in generate                                                                       raise RuntimeError("Failed to retrieve embeddings from first worker")
+RuntimeError: Failed to retrieve embeddings from first worker
+
+ERROR:__main__:Generation error: Failed to retrieve embeddings from first worker
+ERROR:__main__:Traceback (most recent call last):                                                                                                           File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 421, in generate
+    raise RuntimeError("Failed to retrieve embeddings from first worker")
+RuntimeError: Failed to retrieve embeddings from first worker
+
+ERROR:__main__:Generation error: Failed to retrieve embeddings from first worker
+ERROR:__main__:Traceback (most recent call last):
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 421, in generate
+    raise RuntimeError("Failed to retrieve embeddings from first worker")
+RuntimeError: Failed to retrieve embeddings from first worker
+
+---
+
+_**Assistant**_
+
+
+
+
+
+看起来 KVCacheClient 的 store 方法需要一个额外的参数 'v'。让我们检查并修复这个问题：
+
+```python:ktransformers/worker.py
+def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        logger.info("Received generation request")
+        logger.info(f"Input sequence length: {len(input_data['input_ids'])}")
+        
+        # 创建输入张量
+        logger.info("Moving input tensors to GPU...")
+        device = self.model.device  # 使用模型的设备
+        input_ids = torch.tensor(input_data['input_ids'], device=device)
+        attention_mask = torch.tensor(input_data['attention_mask'], device=device)
+        
+        # 生成参数日志
+        max_new_tokens = input_data.get('max_new_tokens', 512)
+        temperature = input_data.get('temperature', 0.6)
+        top_p = input_data.get('top_p', 0.9)
+        logger.info(f"Generation parameters: max_new_tokens={max_new_tokens}, "
+                   f"temperature={temperature}, "
+                   f"top_p={top_p}")
+        
+        # 生成文本
+        logger.info("Starting text generation...")
+        start_time = time.time()
+        
+        # 创建 KV Cache 客户端
+        kvcache_client = KVCacheClient("10.21.22.206:29600")
+        
+        # 生成唯一的 batch ID
+        batch_id = f"{time.time()}_{self.worker_id}"
+        
+        with torch.no_grad(), torch.amp.autocast('cuda'):
+            hidden_states = input_ids  # 初始化隐藏状态
+            
+            # 如果是第一个worker，需要处理词嵌入
+            if self.worker_id == 0:
+                if self.model.embed_tokens is not None:
+                    hidden_states = self.model.embed_tokens(hidden_states)
+                    # 存储嵌入结果供其他worker使用
+                    # 将张量移到CPU并转换为列表
+                    cpu_hidden_states = hidden_states.cpu().tolist()
+                    kvcache_client.store(batch_id, "embeddings", "value", cpu_hidden_states)
+                    logger.info("Stored embeddings for other workers")
+            else:
+                # 其他worker需要等待并获取嵌入结果
+                for _ in range(10):  # 最多尝试10次
+                    result = kvcache_client.retrieve(batch_id, "embeddings", "value", device=device)
+                    if result is not None:
+                        # 将列表转换回张量
+                        hidden_states = torch.tensor(result, device=device)
+                        logger.info("Retrieved embeddings from first worker")
+                        break
+                    time.sleep(0.1)  # 等待100ms后重试
+                
+                if hidden_states is None:
+                    raise RuntimeError("Failed to retrieve embeddings from first worker")
+            
+            # 处理当前worker负责的层
+            for layer_idx in range(self.model.start_layer, self.model.end_layer):
+                # 确保输入在正确的设备上
+                hidden_states = hidden_states.to(device)
+                # 获取当前层
+                layer = self.model.layers[layer_idx - self.model.start_layer].to(device)
+                # 处理这一层
+                hidden_states = layer(hidden_states)
+                # 存储结果
+                cpu_hidden_states = hidden_states.cpu().tolist()
+                kvcache_client.store(batch_id, f"layer_{layer_idx}", "value", cpu_hidden_states)
+                logger.info(f"Processed and stored layer {layer_idx}")
+            
+            # 如果是最后一个worker，需要处理norm和lm_head
+            if self.worker_id == self.num_workers - 1:
+                if self.model.norm is not None:
+                    hidden_states = self.model.norm(hidden_states.to(device))
+                if self.model.lm_head is not None:
+                    hidden_states = self.model.lm_head(hidden_states)
+                # 存储最终结果
+                cpu_hidden_states = hidden_states.cpu().tolist()
+                kvcache_client.store(batch_id, "final", "value", cpu_hidden_states)
+                logger.info("Stored final output")
+            
+            # 等待最终结果
+            if self.worker_id != self.num_workers - 1:
+                for _ in range(10):  # 最多尝试10次
+                    result = kvcache_client.retrieve(batch_id, "final", "value", device=device)
+                    if result is not None:
+                        hidden_states = torch.tensor(result, device=device)
+                        logger.info("Retrieved final output")
+                        break
+                    time.sleep(0.1)
+                
+                if hidden_states is None:
+                    raise RuntimeError("Failed to retrieve final output from last worker")
+            
+            # 生成完成后清理缓存
+            kvcache_client.clear(batch_id)
+            
+            # 确保输出在CPU上，以便序列化
+            hidden_states = hidden_states.cpu()
+            
+            # 返回结果
+            return {
+                'status': 'success',
+                'output': hidden_states.tolist(),
+                'time_taken': time.time() - start_time
+            }
+            
+    except Exception as e:
+        logger.error(f"Generation error: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return {
+            'status': 'error',
+            'error': str(e)
+        }
+```
+
+主要修改：
+
+1. 在调用 store 方法时添加了 "value" 参数
+2. 在存储前将张量转换为 CPU 上的列表
+3. 在检索后将列表转换回张量
+4. 添加了更多的日志记录
+5. 在每个关键步骤都添加了设备转换
+
+这些修改应该能解决 KVCacheClient 的参数问题。请更新代码并重试。
+
 ---
 
 

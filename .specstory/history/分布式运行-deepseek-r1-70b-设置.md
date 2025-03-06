@@ -9010,6 +9010,134 @@ _**Assistant**_
 
 
 
+<think>
+啊，现在我明白了。错误出现在从KVCache服务器获取模型参数的过程中。问题可能在于：
+
+1. KVCache服务器在加载和返回模型配置时可能返回了一个不兼容的格式
+2. 配置对象可能在序列化/反序列化过程中出现问题
+
+让我们检查并修复这个问题。
+</think>
+
+让我们修改 model_loader.py 中的配置处理部分：
+
+```python:ktransformers/model_loader.py
+def load_model(self):
+    """加载模型配置和tokenizer"""
+    logger.info(f"加载模型配置和tokenizer: {self.model_path}")
+    
+    # 加载配置并转换为字典
+    config = AutoConfig.from_pretrained(self.model_path, trust_remote_code=True)
+    # 将配置转换为可序列化的字典
+    self.config = {
+        'architectures': config.architectures,
+        'model_type': config.model_type,
+        'num_hidden_layers': config.num_hidden_layers,
+        'hidden_size': config.hidden_size,
+        'intermediate_size': getattr(config, 'intermediate_size', 4 * config.hidden_size),
+        'num_attention_heads': config.num_attention_heads,
+        'max_position_embeddings': config.max_position_embeddings,
+        'torch_dtype': str(config.torch_dtype),
+        'pad_token_id': config.pad_token_id,
+        'bos_token_id': config.bos_token_id,
+        'eos_token_id': config.eos_token_id,
+        'vocab_size': config.vocab_size
+    }
+    
+    # 加载tokenizer
+    self.tokenizer = AutoTokenizer.from_pretrained(self.model_path, trust_remote_code=True)
+    
+    # 加载嵌入层和规范化层
+    logger.info("加载嵌入层和lm_head")
+    self._load_shared_layers()
+    
+    logger.info("模型加载器初始化完成")
+    return True
+```
+
+然后在 worker.py 中相应地修改配置处理：
+
+```python:ktransformers/worker.py
+def load_model(self, model_path: str, gguf_path: str):
+    # 创建KVCache客户端
+    self.kvcache_client = KVCacheClient(f"10.21.22.206:29600")
+    
+    # 获取模型配置
+    logger.info("从KVCache服务器获取模型配置")
+    response = self.kvcache_client.get_config()
+    if response['status'] != 'success':
+        logger.error("获取模型配置失败")
+        raise RuntimeError("Failed to get model config")
+    
+    # 从字典创建配置对象
+    config_dict = response['config']
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    # 更新配置
+    for key, value in config_dict.items():
+        if hasattr(config, key):
+            if key == 'torch_dtype':
+                # 处理torch_dtype
+                if value == 'torch.float16':
+                    setattr(config, key, torch.float16)
+                elif value == 'torch.float32':
+                    setattr(config, key, torch.float32)
+                else:
+                    setattr(config, key, torch.float32)  # 默认
+            else:
+                setattr(config, key, value)
+    
+    # ... 其余代码保持不变 ...
+```
+
+这个修改：
+
+1. 将配置对象转换为纯字典，避免序列化问题
+2. 在worker端重新构建配置对象
+3. 特别处理了torch_dtype等特殊属性
+
+这样应该能解决配置序列化和比较操作的问题。请更新这些文件并重试。
+
+---
+
+_**User**_
+
+INFO:__main__:从KVCache服务器获取模型配置
+INFO:__main__:从KVCache服务器获取tokenizer
+INFO:__main__:Worker 7 memory calculation:
+INFO:__main__:- Hidden size: 8192
+INFO:__main__:- Context length: 8192
+INFO:__main__:- KV cache per layer: 0.25 GB
+INFO:__main__:- Layer parameters: 3.25 GB per layer
+INFO:__main__:- Handling 10 layers: from 70 to 79
+INFO:__main__:- Estimated KV cache: 2.50 GB
+INFO:__main__:- Estimated model parameters: 32.50 GB
+INFO:__main__:- Estimated workspace: 1.00 GB
+INFO:__main__:- Total GPU memory budget: 37 GB
+ERROR:__main__:Error processing message: '<' not supported between instances of 'list' and 'int'问题依旧
+
+---
+
+_**Assistant**_
+
+我看到问题依然存在。让我仔细检查一下代码，特别是涉及到比较操作的部分。
+
+问题可能出在计算 `end_layer` 的地方。让我们修改 worker.py 中的这部分代码：
+
+```python:ktransformers/worker.py
+def load_model(self, model_path: str, gguf_path: str):
+    # ... 前面的代码保持不变 ...
+    
+    # 计算每个进程应该处理的层
+    total_layers = int(config_dict['num_hidden_layers'])  # 确保是整数
+    layers_per_process = total_layers // self.num_workers
+    start_layer = self.worker_id * layers_per_process
+    
+    # 修改这里的计算方式，避免使用条件表达式
+    if self.worker_id < self.num_workers - 1:
+        end_layer = start_layer + layers_per_process
+    else:
+        end_layer
+
 ---
 
 

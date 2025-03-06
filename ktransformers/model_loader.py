@@ -22,20 +22,20 @@ class ModelLoader:
         
         # 加载配置并转换为字典
         config = AutoConfig.from_pretrained(self.model_path, trust_remote_code=True)
-        # 将配置转换为可序列化的字典
+        # 将配置转换为可序列化的字典，确保所有值都是基本类型
         self.config = {
-            'architectures': config.architectures,
-            'model_type': config.model_type,
-            'num_hidden_layers': config.num_hidden_layers,
-            'hidden_size': config.hidden_size,
-            'intermediate_size': getattr(config, 'intermediate_size', 4 * config.hidden_size),
-            'num_attention_heads': config.num_attention_heads,
-            'max_position_embeddings': config.max_position_embeddings,
-            'torch_dtype': str(config.torch_dtype),
-            'pad_token_id': config.pad_token_id,
-            'bos_token_id': config.bos_token_id,
-            'eos_token_id': config.eos_token_id,
-            'vocab_size': config.vocab_size
+            'architectures': list(config.architectures),  # 确保是列表
+            'model_type': str(config.model_type),  # 确保是字符串
+            'num_hidden_layers': int(config.num_hidden_layers),  # 确保是整数
+            'hidden_size': int(config.hidden_size),  # 确保是整数
+            'intermediate_size': int(getattr(config, 'intermediate_size', 4 * config.hidden_size)),  # 确保是整数
+            'num_attention_heads': int(config.num_attention_heads),  # 确保是整数
+            'max_position_embeddings': int(config.max_position_embeddings),  # 确保是整数
+            'torch_dtype': str(config.torch_dtype),  # 转换为字符串
+            'pad_token_id': int(config.pad_token_id) if config.pad_token_id is not None else None,
+            'bos_token_id': int(config.bos_token_id) if config.bos_token_id is not None else None,
+            'eos_token_id': int(config.eos_token_id) if config.eos_token_id is not None else None,
+            'vocab_size': int(config.vocab_size)  # 确保是整数
         }
         
         # 加载tokenizer

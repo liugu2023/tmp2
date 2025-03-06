@@ -148,13 +148,22 @@ class ModelWorker:
         self.tokenizer = response['tokenizer']
         
         # 计算每个进程应该处理的层
-        total_layers = config.num_hidden_layers
+        total_layers = int(config_dict['num_hidden_layers'])  # 确保是整数
         layers_per_process = total_layers // self.num_workers
         start_layer = self.worker_id * layers_per_process
-        end_layer = start_layer + layers_per_process if self.worker_id < self.num_workers - 1 else total_layers
+        
+        # 修改这里的计算方式，避免使用条件表达式
+        if self.worker_id < self.num_workers - 1:
+            end_layer = start_layer + layers_per_process
+        else:
+            end_layer = total_layers
+        
+        # 确保所有数值都是整数
+        start_layer = int(start_layer)
+        end_layer = int(end_layer)
         
         # 动态计算所需显存
-        hidden_size = config.hidden_size
+        hidden_size = int(config_dict['hidden_size'])  # 确保是整数
         # 假设最大上下文长度为8K
         context_len = 8192
         # 每层KV Cache = 2 * hidden_size * context_len * dtype_size (float16=2B)
@@ -164,8 +173,8 @@ class ModelWorker:
         # 预估KV缓存显存
         total_kv_cache = kv_size_per_layer * my_layers
         # 每层模型参数估算 (单位: GB)
-        hidden_dim = config.hidden_size
-        intermediate_dim = config.intermediate_size if hasattr(config, 'intermediate_size') else 4 * hidden_dim
+        hidden_dim = hidden_size
+        intermediate_dim = int(config_dict.get('intermediate_size', 4 * hidden_dim))  # 确保是整数
         param_size_per_layer = (12 * hidden_dim * hidden_dim + 4 * hidden_dim * intermediate_dim) * 2 / (1024**3)
         base_model_size = param_size_per_layer * my_layers
         # 工作空间估算 (1GB)

@@ -154,21 +154,32 @@ class DistributedModel:
             if has_outputs:
                 # 确保输出为列表，以便切片操作安全
                 if isinstance(output_ids, torch.Tensor):
-                    output_preview = output_ids[:10].tolist()
+                    # 修复: 确保转换为一维列表
+                    output_ids_list = output_ids.tolist()
+                    if isinstance(output_ids_list, list) and isinstance(output_ids_list[0], list):
+                        # 处理嵌套列表情况 [[id1, id2, ...]]
+                        output_ids_list = output_ids_list[0]
+                    output_preview = output_ids_list[:10]
                 else:
-                    output_preview = output_ids[:10]
+                    # 处理已经是列表的情况
+                    output_ids_list = output_ids
+                    if isinstance(output_ids_list, list) and len(output_ids_list) > 0 and isinstance(output_ids_list[0], list):
+                        # 处理嵌套列表
+                        output_ids_list = output_ids_list[0]
+                    output_preview = output_ids_list[:10]
                 
                 print(f"生成的tokens: {output_preview}...")
                 
                 # 安全地检查tokenizer属性
                 tokenizer = getattr(self, 'tokenizer', None)
                 if tokenizer is not None:
-                    # 确保在解码前张量已转换为列表
-                    if isinstance(output_ids, torch.Tensor):
-                        output_text = tokenizer.decode(output_ids.tolist())
-                    else:
-                        output_text = tokenizer.decode(output_ids)
-                    print(f"\n生成的文本:\n{output_text}\n")
+                    try:
+                        # 使用已展平的一维列表进行解码
+                        output_text = tokenizer.decode(output_ids_list)
+                        print(f"\n生成的文本:\n{output_text}\n")
+                    except Exception as e:
+                        print(f"\n解码文本时出错: {str(e)}")
+                        print(f"Token IDs: {output_ids_list}\n")
                 else:
                     print("\n无法解码文本: tokenizer不可用\n")
             else:

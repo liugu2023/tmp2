@@ -14622,7 +14622,35 @@ def generate(self, input_ids, attention_mask, **kwargs):
 
 这些修改：
 
-1. 在`DistributedModel
+1. 在`DistributedModel`类的`__init__`方法中添加了`self.tokenizer = None`初始化属性
+2. 在`load_model`方法中添加了加载tokenizer的代码
+3. 在`generate`方法中使用`getattr`安全地访问tokenizer属性
+4. 添加更多的错误反馈，帮助用户理解可能的问题
+
+这应该解决"object has no attribute 'tokenizer'"的错误。
+
+---
+
+_**User**_
+
+生成过程中出错: argument 'ids': 'list' object cannot be interpreted as an integer
+Traceback (most recent call last):
+  File "/archive/liugu/ds/ktransformers/ktransformers/local_chat.py", line 168, in generate
+    output_text = tokenizer.decode(output_ids.tolist())
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/tokenization_utils_base.py", line 4034, in decode
+    return self._decode(
+           ^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/tokenization_utils_fast.py", line 651, in _decode
+    text = self._tokenizer.decode(token_ids, skip_special_tokens=skip_special_tokens)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: argument 'ids': 'list' object cannot be interpreted as an integer
+
+---
+
+_**Assistant**_
+
+
 
 ---
 

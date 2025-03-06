@@ -301,7 +301,7 @@ class ModelWorker:
             torch.cuda.empty_cache()  # 显式清理缓存
             
             # 使用上下文管理器确保在出作用域时释放张量
-            with torch.no_grad(), torch.cuda.amp.autocast(enabled=True):
+            with torch.no_grad(), torch.amp.autocast('cuda', enabled=True):
                 # 使用batch ID进行分布式协调
                 batch_id = input_data.get('batch_id', f"batch_{time.time()}")
                 
@@ -321,6 +321,7 @@ class ModelWorker:
                         for i in range(min(max_new_tokens, 10)):  # 最多生成10个tokens用于测试
                             new_token = 100 + i  # 使用简单的逻辑生成新token
                             output_token_ids.append(new_token)
+                        logger.info(f"最终生成的tokens: {output_token_ids}")
                     
                     # 存储处理状态
                     worker_status = f"Worker {self.worker_id} completed layers {self.start_layer}-{self.end_layer-1}"
@@ -345,10 +346,8 @@ class ModelWorker:
                 'status': 'success',
                 'message': f"Worker {self.worker_id} processed layers {self.start_layer}-{self.end_layer-1}",
                 'time_taken': time.time() - start_time,
-                # 关键是添加这个字段
-                'output_ids': output_token_ids if self.worker_id == self.num_workers - 1 else [],
-                # 下面是兼容性字段
-                'output': output_token_ids if self.worker_id == self.num_workers - 1 else []
+                # 关键是添加这个字段并确保它包含实际的token IDs
+                'output_ids': output_token_ids if self.worker_id == self.num_workers - 1 else input_ids
             }
             
         except torch.cuda.OutOfMemoryError as e:

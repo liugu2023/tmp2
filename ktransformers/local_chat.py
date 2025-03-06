@@ -93,50 +93,44 @@ class DistributedModel:
             return {'status': 'error', 'error': str(e)}
 
     def generate(self, input_ids, attention_mask, **kwargs):
+        """生成文本"""
         try:
-            logger.info("Preparing generation request...")
-            message = {
-                'command': 'generate',
-                'data': {
-                    'input_ids': input_ids.cpu().numpy().tolist(),
-                    'attention_mask': attention_mask.cpu().numpy().tolist(),
-                    **kwargs
-                }
+            # 准备请求数据
+            generate_data = {
+                'input_ids': input_ids,
+                'attention_mask': attention_mask
             }
+            # 添加其他生成参数
+            generate_data.update(kwargs)
             
-            logger.info("Starting generation...")
-            self.socket.send_pyobj(message)
+            # 发送生成请求
+            response = self._send_command('generate', generate_data)
             
-            # 接收流式响应
-            full_text = ""
-            while True:
-                response = self.socket.recv_pyobj()
-                
-                if response['status'] == 'error':
-                    raise Exception(f"Generation failed: {response.get('error')}")
-                
-                if response['status'] == 'streaming':
-                    # 打印新生成的文本部分
-                    new_text = response['text'][len(full_text):]
-                    if new_text:
-                        print(new_text, end='', flush=True)
-                    full_text = response['text']
-                    
-                    # 发送确认
-                    self.socket.send_pyobj({'status': 'received'})
-                    
-                    # 如果生成结束，退出循环
-                    if response.get('finished', False):
-                        print()  # 换行
-                        # 不要在这里 break，等待最终的 token IDs
-                
-                elif response['status'] == 'success':
-                    # 最终的完整响应
-                    return torch.tensor(response['output_ids'])
+            if response.get('status') != 'success':
+                error_msg = response.get('error', 'Unknown error')
+                print(f"生成失败: {error_msg}")
+                return []
+            
+            # 获取输出token IDs
+            output_ids = response.get('output_ids', [])
+            
+            print("生成成功!")
+            if output_ids:
+                print(f"生成的tokens: {output_ids[:10]}...")
+                if self.tokenizer:
+                    # 解码tokens为文本
+                    output_text = self.tokenizer.decode(output_ids)
+                    print(f"\n生成的文本:\n{output_text}\n")
+            else:
+                print("警告: 未收到任何生成的tokens")
+            
+            return output_ids
         
         except Exception as e:
-            logger.error(f"Error in generate: {str(e)}")
-            raise
+            print(f"生成过程中出错: {str(e)}")
+            import traceback
+            print(traceback.format_exc())
+            return []
 
     def shutdown(self):
         """发送关闭命令给worker"""

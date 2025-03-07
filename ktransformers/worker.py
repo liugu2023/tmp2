@@ -544,16 +544,21 @@ class KVCacheLayerProxy(torch.nn.Module):
             }
 
     def run(self):
-        logger.info("Worker ready to receive requests")
+        """运行worker主循环"""
+        logger.info(f"Worker {self.worker_id} ready to receive requests")
         try:
             while True:
                 try:
+                    # 接收请求
                     message = self.socket.recv_pyobj()
                     command = message.get('command')
+                    logger.info(f"Worker {self.worker_id} received {command} request")
                     
+                    # 处理不同类型的请求
                     if command == 'load_model':
-                        self.load_model(message['model_path'], message['gguf_path'])
-                        self.socket.send_pyobj({'status': 'success'})
+                        # 加载模型
+                        response = self.load_model(message['model_path'], message.get('gguf_path'))
+                        self.socket.send_pyobj(response)
                     
                     elif command == 'status':
                         # 返回模型状态
@@ -565,33 +570,45 @@ class KVCacheLayerProxy(torch.nn.Module):
                         self.socket.send_pyobj(status)
                     
                     elif command == 'generate':
+                        # 生成文本
                         result = self.generate(message['data'])
                         self.socket.send_pyobj(result)
                     
                     elif command == 'shutdown':
-                        logger.info("Received shutdown command")
-                        self.socket.send_pyobj({'status': 'shutdown'})
-                        # 清理资源
-                        if hasattr(self, 'model'):
-                            del self.model
-                        if hasattr(self, 'tokenizer'):
-                            del self.tokenizer
-                        torch.cuda.empty_cache()
-                        logger.info("Resources cleaned up")
+                        # 关闭worker
+                        logger.info(f"Worker {self.worker_id} shutting down")
+                        self.socket.send_pyobj({'status': 'success'})
                         break
                     
+                    else:
+                        # 未知命令
+                        logger.warning(f"Unknown command: {command}")
+                        self.socket.send_pyobj({
+                            'status': 'error',
+                            'error': f"Unknown command: {command}"
+                        })
+                
                 except Exception as e:
-                    logger.error(f"Error processing message: {str(e)}")
-                    self.socket.send_pyobj({'status': 'error', 'error': str(e)})
+                    logger.error(f"Error processing request: {str(e)}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+                    try:
+                        self.socket.send_pyobj({
+                            'status': 'error',
+                            'error': str(e)
+                        })
+                    except:
+                        pass
+        
         finally:
-            # 确保资源被清理
-            logger.info("Cleaning up worker resources...")
+            # 清理资源
+            logger.info(f"Worker {self.worker_id} shutting down")
             self.socket.close()
-            self.context.term()
             if hasattr(self, 'kvcache_socket') and self.kvcache_socket:
                 self.kvcache_socket.close()
-                self.kvcache_context.term()
-            logger.info("Worker shutdown complete")
+            if hasattr(self, 'embedding_socket') and self.embedding_socket:
+                self.embedding_socket.close()
+            torch.cuda.empty_cache()
 
 def main():
     import argparse

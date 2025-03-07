@@ -10743,11 +10743,76 @@ def run(self):
 
 另外，请检查worker.py文件是否包含了以下两个重要的辅助方法，这些是我们之前提到的按需加载模型的关键部分：
 
-```python
+```python:start.sh
 def setup_model_hooks(self):
     """设置钩子，在计算时动态移动层到GPU"""
     if not hasattr(self.model, 'model') or not hasattr(self.model.model, 'layers'):
-        logger
+        logger.warning("无法设置层管理钩子")
+        return
+        
+    layers = self.model.model.layers
+    
+    # 遍历所有我负责的层
+    for layer_id in self.my_layers:
+        if layer_id >= len(layers):
+            continue
+            
+        layer = layers[layer_id]
+        
+        # 保存原始forward方法
+        layer._original_forward = layer.forward
+        
+        # 创建新的forward方法
+        def make_hook(layer_idx, orig_forward):
+            def hook_fn(*args, **kwargs):
+                # 开始计算前移到GPU
+                logger.debug(f"Moving layer {layer_idx} to GPU {self.gpu_id}")
+                layer = self.model.model.layers[layer_idx]
+                layer.to(f"cuda:{self.gpu_id}")
+                
+                # 执行计算
+                output = orig_forward(*args, **kwargs)
+                
+                # 计算后立即移回CPU
+                logger.debug(f"Moving layer {layer_idx} back to CPU")
+                layer.to("cpu")
+                torch.cuda.empty_cache()  # 立即释放显存
+                
+                return output
+            return hook_fn
+            
+        # 替换forward方法
+        layer.forward = make_hook(layer_id, layer._original_forward)
+    
+    logger.info(f"Set up hooks for {len(self.my_layers)} layers")
+
+def setup_layer_proxies(self):
+    """设置代理层，处理不是我们负责的层"""
+    if not hasattr(self.model, 'model') or not hasattr(self.model.model, 'layers'):
+        logger.warning("无法设置层代理")
+        return
+        
+    layers = self.model.model.layers
+    
+    # 遍历所有层，为不是我负责的层创建代理
+    for i in range(len(layers)):
+        if i not in self.my_layers:
+            # 创建代理层
+            proxy_layer = KVCacheLayerProxy(self, i)
+            
+            # 替换原始层
+            layers[i] = proxy_layer
+            
+    logger.info(f"Set up proxies for {len(layers) - len(self.my_layers)} layers")
+```
+
+这些方法实现了动态层迁移和代理层机制，确保每个worker只计算它负责的层，其他层的结果从KV缓存服务器获取。
+
+---
+
+_**User**_
+
+ERROR:__main__:Error in generate_from_messages: Generation failed: 'ModelWorker' object has no attribute 'generate'
 
 ---
 

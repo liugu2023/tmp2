@@ -356,6 +356,73 @@ class ModelWorker:
                 
         logger.info(f"Set up proxies for {len(layers) - len(self.my_layers)} layers")
 
+    def run(self):
+        """运行worker主循环"""
+        logger.info(f"Worker {self.worker_id} ready to receive requests")
+        try:
+            while True:
+                try:
+                    # 接收请求
+                    message = self.socket.recv_pyobj()
+                    command = message.get('command')
+                    logger.info(f"Worker {self.worker_id} received {command} request")
+                    
+                    # 处理不同类型的请求
+                    if command == 'load_model':
+                        # 加载模型
+                        response = self.load_model(message['model_path'], message.get('gguf_path'))
+                        self.socket.send_pyobj(response)
+                    
+                    elif command == 'status':
+                        # 返回模型状态
+                        status = {
+                            'status': 'ready',
+                            'model_loaded': hasattr(self, 'model') and self.model is not None,
+                            'worker_id': self.worker_id
+                        }
+                        self.socket.send_pyobj(status)
+                    
+                    elif command == 'generate':
+                        # 生成文本
+                        result = self.generate(message['data'])
+                        self.socket.send_pyobj(result)
+                    
+                    elif command == 'shutdown':
+                        # 关闭worker
+                        logger.info(f"Worker {self.worker_id} shutting down")
+                        self.socket.send_pyobj({'status': 'success'})
+                        break
+                    
+                    else:
+                        # 未知命令
+                        logger.warning(f"Unknown command: {command}")
+                        self.socket.send_pyobj({
+                            'status': 'error',
+                            'error': f"Unknown command: {command}"
+                        })
+                
+                except Exception as e:
+                    logger.error(f"Error processing request: {str(e)}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+                    try:
+                        self.socket.send_pyobj({
+                            'status': 'error',
+                            'error': str(e)
+                        })
+                    except:
+                        pass
+        
+        finally:
+            # 清理资源
+            logger.info(f"Worker {self.worker_id} shutting down")
+            self.socket.close()
+            if hasattr(self, 'kvcache_socket') and self.kvcache_socket:
+                self.kvcache_socket.close()
+            if hasattr(self, 'embedding_socket') and self.embedding_socket:
+                self.embedding_socket.close()
+            torch.cuda.empty_cache()
+
 class KVCacheLayerProxy(torch.nn.Module):
     """代理层，从KV缓存服务器获取结果"""
     def __init__(self, worker, layer_id):
@@ -542,73 +609,6 @@ class KVCacheLayerProxy(torch.nn.Module):
                 'status': 'error',
                 'error': str(e)
             }
-
-    def run(self):
-        """运行worker主循环"""
-        logger.info(f"Worker {self.worker_id} ready to receive requests")
-        try:
-            while True:
-                try:
-                    # 接收请求
-                    message = self.socket.recv_pyobj()
-                    command = message.get('command')
-                    logger.info(f"Worker {self.worker_id} received {command} request")
-                    
-                    # 处理不同类型的请求
-                    if command == 'load_model':
-                        # 加载模型
-                        response = self.load_model(message['model_path'], message.get('gguf_path'))
-                        self.socket.send_pyobj(response)
-                    
-                    elif command == 'status':
-                        # 返回模型状态
-                        status = {
-                            'status': 'ready',
-                            'model_loaded': hasattr(self, 'model') and self.model is not None,
-                            'worker_id': self.worker_id
-                        }
-                        self.socket.send_pyobj(status)
-                    
-                    elif command == 'generate':
-                        # 生成文本
-                        result = self.generate(message['data'])
-                        self.socket.send_pyobj(result)
-                    
-                    elif command == 'shutdown':
-                        # 关闭worker
-                        logger.info(f"Worker {self.worker_id} shutting down")
-                        self.socket.send_pyobj({'status': 'success'})
-                        break
-                    
-                    else:
-                        # 未知命令
-                        logger.warning(f"Unknown command: {command}")
-                        self.socket.send_pyobj({
-                            'status': 'error',
-                            'error': f"Unknown command: {command}"
-                        })
-                
-                except Exception as e:
-                    logger.error(f"Error processing request: {str(e)}")
-                    import traceback
-                    logger.error(traceback.format_exc())
-                    try:
-                        self.socket.send_pyobj({
-                            'status': 'error',
-                            'error': str(e)
-                        })
-                    except:
-                        pass
-        
-        finally:
-            # 清理资源
-            logger.info(f"Worker {self.worker_id} shutting down")
-            self.socket.close()
-            if hasattr(self, 'kvcache_socket') and self.kvcache_socket:
-                self.kvcache_socket.close()
-            if hasattr(self, 'embedding_socket') and self.embedding_socket:
-                self.embedding_socket.close()
-            torch.cuda.empty_cache()
 
 def main():
     import argparse

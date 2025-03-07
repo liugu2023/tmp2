@@ -2,19 +2,14 @@ import os
 import torch
 import zmq
 import pickle
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple
 import logging
 from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM, GenerationConfig, TextStreamer
 import time
 import subprocess
 import multiprocessing
-from ktransformers.kvcache_client import KVCacheClient
-import torch.nn as nn
-import json
-import numpy as np
-import glob
-from ktransformers.optimize.optimize import optimize_and_load_gguf
-import tempfile
+import uuid
+import torch.nn.functional as F
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -33,7 +28,7 @@ def get_numa_nodes():
         logger.error(f"Error getting NUMA nodes: {e}")
         return [0]  # 默认返回节点0
 
-def start_worker_process(worker_id: int, base_port: int, num_workers: int):
+def start_worker_process(worker_id: int, base_port: int, num_workers: int, kvcache_address: str = None):
     """启动单个 worker 进程"""
     # 计算 NUMA 节点
     numa_nodes = get_numa_nodes()
@@ -55,6 +50,10 @@ def start_worker_process(worker_id: int, base_port: int, num_workers: int):
         f'--num_workers={num_workers}'
     ]
     
+    # 添加KV缓存服务器地址（如果有）
+    if kvcache_address:
+        cmd.append(f'--kvcache_address={kvcache_address}')
+    
     logger.info(f"Starting worker {worker_id} on NUMA node {node_id} with port {port}")
     subprocess.Popen(cmd)
 
@@ -63,15 +62,27 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--base_port', type=int, default=29500)
     parser.add_argument('--num_workers', type=int, default=8)
-    parser.add_argument('--worker_address', type=str, required=True,
-                        help='Worker address in format host:port')
-    parser.add_argument('--worker_id', type=int, default=0,
-                        help='Worker ID (0-7)')
+    parser.add_argument('--worker_address', type=str, required=False)
+    parser.add_argument('--worker_id', type=int, default=0)
+    parser.add_argument('--kvcache_address', type=str, default=None,
+                        help='Address of KV Cache Server (e.g., "10.21.22.206:29600")')
     args = parser.parse_args()
     
-    # 创建并运行worker
-    worker = ModelWorker(args.worker_address, args.worker_id, args.num_workers)
-    worker.run()
+    if args.worker_address:
+        # 单个 worker 进程模式
+        worker = ModelWorker(args.worker_address, args.worker_id, args.num_workers, args.kvcache_address)
+        worker.run()
+    else:
+        # 主进程模式，启动多个 worker
+        for worker_id in range(args.num_workers):
+            start_worker_process(worker_id, args.base_port, args.num_workers, args.kvcache_address)
+        
+        # 等待所有进程
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            logger.info("Shutting down all workers...")
 
 def load_model_and_tokenizer(model_path: str, gguf_path: str):
     logger.info("Loading tokenizer...")
@@ -93,482 +104,367 @@ def load_model_and_tokenizer(model_path: str, gguf_path: str):
     return model, tokenizer
 
 class ModelWorker:
-    def __init__(self, worker_address, worker_id, num_workers):
-        """初始化ModelWorker
-        Args:
-            worker_address: 本worker绑定的地址，如"10.21.22.206:29500"
-            worker_id: worker的ID，从0开始编号
-            num_workers: 总worker数量
-        """
-        # 解析worker地址
-        host, port = worker_address.split(':')
-        self.address = worker_address
+    def __init__(self, address: str, worker_id: int = 0, num_workers: int = 1, kvcache_address: str = None):
         self.worker_id = worker_id
         self.num_workers = num_workers
+        self.kvcache_address = kvcache_address
         
-        # 创建socket并绑定地址
+        # 如果提供了KV Cache服务器地址，则连接
+        if self.kvcache_address:
+            self.kvcache_context = zmq.Context()
+            self.kvcache_socket = self.kvcache_context.socket(zmq.REQ)
+            self.kvcache_socket.connect(f"tcp://{kvcache_address}")
+            logger.info(f"Worker {worker_id} connected to KV Cache Server at {kvcache_address}")
+        else:
+            self.kvcache_socket = None
+            logger.info(f"Worker {worker_id} running without KV Cache Server")
+        
+        # 设置 GPU 设备
+        if torch.cuda.is_available():
+            # 根据 worker_id 分配 GPU
+            gpu_id = 0 if worker_id < 4 else 1
+            torch.cuda.set_device(gpu_id)
+            logger.info(f"Worker {worker_id} using GPU {gpu_id}")
+        
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.REP)
-        self.socket.bind(f"tcp://{host}:{port}")
+        host, port = address.split(':')
+        self.socket.bind(f"tcp://0.0.0.0:{port}")
+        self.socket.setsockopt(zmq.RCVHWM, 0)
+        self.socket.setsockopt(zmq.SNDHWM, 0)
         
-        # 获取模型配置
-        self.kvcache_client = KVCacheClient("10.21.22.206:29600")
-        config_response = self.kvcache_client.get_config()
-        if config_response['status'] != 'success':
-            logger.error(f"获取模型配置失败: {config_response.get('error')}")
-            config_dict = {
-                'hidden_size': 8192,
-                'num_hidden_layers': 80,
-                'max_position_embeddings': 8192,
-                'vocab_size': 100000
-            }
-        else:
-            config_dict = config_response['config']
+        self.model = None
+        self.tokenizer = None
+        self.current_requests = {}  # 跟踪当前处理的请求
+        logger.info(f"Worker {worker_id} started at {address}, listening on all interfaces")
+
+    def load_model(self, model_path: str, gguf_path: str):
+        logger.info("Loading tokenizer...")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         
-        # 选择GPU设备 - 根据worker_id平均分配到两个GPU
-        gpu_id = 0 if worker_id < num_workers // 2 else 1
-        self.device = torch.device(f'cuda:{gpu_id}' if torch.cuda.is_available() else 'cpu')
-        logger.info(f"Worker {worker_id} 使用设备: {self.device}")
+        logger.info("Loading model config...")
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        torch.set_default_dtype(config.torch_dtype)
         
-        # 配置模型参数
-        self.hidden_size = config_dict.get('hidden_size', 8192)
-        total_layers = config_dict.get('num_hidden_layers', 80)
+        logger.info("Loading model...")
+        # 计算每个进程应该处理的层
+        total_layers = config.num_hidden_layers
+        layers_per_process = total_layers // self.num_workers
+        start_layer = self.worker_id * layers_per_process
+        end_layer = start_layer + layers_per_process if self.worker_id < self.num_workers - 1 else total_layers
         
-        # 计算当前worker负责的层
-        layers_per_worker = total_layers // num_workers
-        self.start_layer = worker_id * layers_per_worker
-        self.end_layer = (worker_id + 1) * layers_per_worker
-        if worker_id == num_workers - 1:
-            self.end_layer = total_layers
-            
-        logger.info(f"Worker {worker_id} 负责层 {self.start_layer}-{self.end_layer-1}")
+        # 设置内存分配
+        max_memory = {
+            0: "3GiB" if self.worker_id < 4 else None,    # 前4个进程使用 GPU 0，每个3GB
+            1: "3GiB" if self.worker_id >= 4 else None,   # 后4个进程使用 GPU 1，每个3GB
+            'cpu': "138GiB"  # CPU 内存
+        }
         
-        # 为提高内存效率，不预加载任何模型层
-        # 我们将在需要时动态加载层参数
-    
-    def run(self):
-        """运行ModelWorker，接收并处理请求"""
-        logger.info(f"ModelWorker {self.worker_id} 开始运行，监听地址: {self.address}")
+        # 设置设备映射
+        device_map = {
+            'model.embed_tokens': 'cpu',
+            'model.norm': 'cpu',
+            'lm_head': 'cpu'
+        }
         
-        while True:
-            try:
-                # 接收请求
-                message = self.socket.recv_pyobj()
-                command = message.get('command', '')
-                
-                # 处理请求
-                if command == 'ping':
-                    response = {'status': 'success', 'message': 'pong'}
-                
-                elif command == 'generate':
-                    response = self.generate(message.get('data', {}))
-                
-                elif command == 'load_model':
-                    response = self.load_model(message.get('model_path', ''), message.get('gguf_path', ''))
-                
-                elif command == 'shutdown':
-                    response = {'status': 'success', 'message': 'Shutting down'}
-                    self.socket.send_pyobj(response)
-                    break
-                
-                else:
-                    response = {'status': 'error', 'error': f'Unknown command: {command}'}
-                
-                # 发送响应
-                self.socket.send_pyobj(response)
-                
-            except Exception as e:
-                logger.error(f"Error in ModelWorker: {str(e)}")
-                import traceback
-                logger.error(traceback.format_exc())
-                # 尝试发送错误响应
-                try:
-                    self.socket.send_pyobj({'status': 'error', 'error': str(e)})
-                except:
-                    pass
+        # 分配层到对应的 GPU
+        gpu_id = 0 if self.worker_id < 4 else 1
+        for i in range(start_layer, end_layer):
+            device_map[f'model.layers.{i}'] = f'cuda:{gpu_id}'
         
-        # 清理资源
-        self.socket.close()
-        self.context.term()
-        logger.info(f"ModelWorker {self.worker_id} 已关闭")
-    
-    def _store_data(self, batch_id, key, data):
-        """使用KVCacheClient存储数据的辅助方法，处理参数兼容性"""
+        logger.info(f"Worker {self.worker_id} handling layers {start_layer} to {end_layer} on GPU {gpu_id}")
+        
+        model_kwargs = {
+            "device_map": device_map,
+            "max_memory": max_memory,
+            "torch_dtype": torch.float16,
+            "low_cpu_mem_usage": True  # 添加这个选项来减少内存使用
+        }
+        
+        logger.info("Applying optimization configurations...")
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            config=config,
+            trust_remote_code=True,
+            **model_kwargs
+        )
+        
+        # 输出配置信息
+        logger.info(f"Worker {self.worker_id} model configuration:")
+        logger.info(f"- Handling layers: {start_layer} to {end_layer}")
+        logger.info(f"- Using GPU: {gpu_id}")
+        logger.info("- Device mapping:")
+        for name, device in self.model.hf_device_map.items():
+            if name.startswith(f'model.layers.{start_layer}'):
+                logger.info(f"  {name}: {device}")
+        
+        self.model.eval()
+        
+        # 设置生成配置
         try:
-            # 将数据转换为可序列化的格式
-            if isinstance(data, torch.Tensor):
-                # 张量直接存储
-                data_tensor = data.cpu()
-            elif isinstance(data, dict):
-                # 对于字典，使用JSON字符串
-                import json
-                data_str = json.dumps(data)
-                data_tensor = torch.tensor([ord(c) for c in data_str], dtype=torch.int32, device='cpu')
-            elif isinstance(data, (list, tuple)):
-                # 对于列表或元组，直接转换为张量
-                try:
-                    data_tensor = torch.tensor(data, device='cpu')
-                except:
-                    # 如果无法直接转换，将其转为JSON字符串
-                    import json
-                    data_str = json.dumps(data)
-                    data_tensor = torch.tensor([ord(c) for c in data_str], dtype=torch.int32, device='cpu')
-            elif isinstance(data, str):
-                # 字符串转换为ASCII码序列
-                data_tensor = torch.tensor([ord(c) for c in data], dtype=torch.int32, device='cpu')
-            else:
-                # 其他类型转为字符串
-                data_str = str(data)
-                data_tensor = torch.tensor([ord(c) for c in data_str], dtype=torch.int32, device='cpu')
-            
-            # 使用dummy值作为v参数，简化兼容性
-            dummy_tensor = torch.zeros(1, dtype=torch.float32, device='cpu')
-            
-            # 添加标记表示数据类型
-            metadata = {
-                'type': str(type(data).__name__),
-                'is_tensor': isinstance(data, torch.Tensor),
-                'is_dict': isinstance(data, dict),
-                'is_list': isinstance(data, list),
-                'is_string': isinstance(data, str)
-            }
-            
-            # 创建metadata张量
-            import json
-            metadata_str = json.dumps(metadata)
-            metadata_tensor = torch.tensor([ord(c) for c in metadata_str], dtype=torch.int32, device='cpu')
-            
-            # 存储元数据和数据
-            key_meta = f"{key}_metadata"
-            self.kvcache_client.store(batch_id, key_meta, metadata_tensor, dummy_tensor)
-            self.kvcache_client.store(batch_id, key, data_tensor, dummy_tensor)
-            
-            return True
+            self.model.generation_config = GenerationConfig.from_pretrained(model_path)
         except Exception as e:
-            logger.error(f"存储数据时出错: {str(e)}")
-            logger.error(f"数据类型: {type(data)}")
-            import traceback
-            logger.error(traceback.format_exc())
+            logger.warning(f"Generation config can't auto create, making default. Message: {e}")
+            self.model.generation_config = GenerationConfig(
+                temperature=0.6,
+                top_p=0.9,
+                do_sample=True
+            )
+        if self.model.generation_config.pad_token_id is None:
+            self.model.generation_config.pad_token_id = self.model.generation_config.eos_token_id
+            
+        logger.info("Model loaded successfully")
+
+    # 修改 CustomStreamer 类定义
+    class CustomStreamer(TextStreamer):
+        def __init__(self, tokenizer, on_text_chunk=None, **kwargs):
+            super().__init__(tokenizer, **kwargs)
+            self.on_text_chunk = on_text_chunk
+
+        def on_finalized_text(self, text: str, stream_end: bool = False):
+            if self.on_text_chunk:
+                self.on_text_chunk(text, stream_end)
+
+    def store_kv_cache(self, request_id: str, layer_id: int, kv_tensor: torch.Tensor) -> bool:
+        """将KV缓存存储到中央服务器"""
+        if not self.kvcache_socket:
             return False
-    
-    def _retrieve_data(self, batch_id, key, device='cpu'):
-        """使用KVCacheClient检索数据的辅助方法，处理参数兼容性"""
-        try:
-            # 先尝试检索元数据
-            key_meta = f"{key}_metadata"
-            metadata_tensor = self.kvcache_client.retrieve(batch_id, key_meta, device=device)
-            
-            # 检索实际数据
-            data_tensor = self.kvcache_client.retrieve(batch_id, key, device=device)
-            
-            # 如果元数据不存在或检索失败
-            if metadata_tensor is None:
-                # 尝试直接返回数据
-                return data_tensor
-            
-            # 解析元数据
-            if isinstance(metadata_tensor, torch.Tensor):
-                try:
-                    metadata_str = ''.join(chr(int(i)) for i in metadata_tensor.tolist())
-                    import json
-                    metadata = json.loads(metadata_str)
-                except:
-                    # 无法解析元数据，返回原始数据
-                    return data_tensor
-            else:
-                # 元数据不是张量，直接返回数据
-                return data_tensor
-            
-            # 根据数据类型重建原始数据
-            if metadata.get('is_tensor'):
-                # 是张量，直接返回
-                return data_tensor
-            elif metadata.get('is_string'):
-                # 字符串类型，将整数转回字符
-                return ''.join(chr(int(i)) for i in data_tensor.tolist())
-            elif metadata.get('is_dict') or metadata.get('is_list'):
-                # 字典或列表，解析JSON
-                try:
-                    data_str = ''.join(chr(int(i)) for i in data_tensor.tolist())
-                    import json
-                    return json.loads(data_str)
-                except:
-                    # JSON解析失败，返回原始字符串
-                    return data_str
-            else:
-                # 无法识别的类型或解析失败，返回原始数据
-                return data_tensor
-            
-        except Exception as e:
-            logger.error(f"检索数据时出错: {str(e)}")
-            import traceback
-            logger.error(traceback.format_exc())
+        
+        # 将张量转换为numpy数组以便序列化
+        kv_tensor_numpy = kv_tensor.cpu().numpy()
+        
+        # 发送存储请求
+        request = {
+            "command": "store",
+            "request_id": request_id,
+            "worker_id": self.worker_id,
+            "layer_id": layer_id,
+            "kv_tensor": kv_tensor_numpy,
+            "data_size": kv_tensor_numpy.nbytes
+        }
+        
+        self.kvcache_socket.send_pyobj(request)
+        response = self.kvcache_socket.recv_pyobj()
+        
+        return response["status"] == "success"
+
+    def retrieve_kv_cache(self, request_id: str, layer_id: int) -> Optional[torch.Tensor]:
+        """从中央服务器检索KV缓存"""
+        if not self.kvcache_socket:
             return None
-    
+        
+        # 发送检索请求
+        request = {
+            "command": "retrieve",
+            "request_id": request_id,
+            "worker_id": self.worker_id,
+            "layer_id": layer_id
+        }
+        
+        self.kvcache_socket.send_pyobj(request)
+        response = self.kvcache_socket.recv_pyobj()
+        
+        if response["status"] != "success":
+            logger.warning(f"Failed to retrieve KV cache: {response.get('error')}")
+            return None
+        
+        # 将numpy数组转换回张量并移至GPU
+        kv_tensor_numpy = response["kv_tensor"]
+        kv_tensor = torch.from_numpy(kv_tensor_numpy).to(f"cuda:{0 if self.worker_id < 4 else 1}")
+        
+        return kv_tensor
+
+    def clear_kv_cache(self, request_id: str) -> bool:
+        """清除指定请求的KV缓存"""
+        if not self.kvcache_socket:
+            return False
+        
+        # 发送清除请求
+        request = {
+            "command": "clear",
+            "request_id": request_id
+        }
+        
+        self.kvcache_socket.send_pyobj(request)
+        response = self.kvcache_socket.recv_pyobj()
+        
+        return response["status"] == "success"
+
     def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
-        """处理生成请求"""
         try:
             logger.info("Received generation request")
+            logger.info(f"Input sequence length: {len(input_data['input_ids'])}")
             
-            # 检查输入格式
-            if 'input_ids' not in input_data:
-                logger.warning("输入数据中未找到'input_ids'，使用默认值")
-                input_ids = [0]  # 使用默认值
-            else:
-                input_ids = input_data['input_ids']
+            # 为这个请求创建一个唯一ID
+            request_id = str(uuid.uuid4())
+            self.current_requests[request_id] = {
+                "start_time": time.time(),
+                "input_length": len(input_data['input_ids'])
+            }
             
-            logger.info(f"Input sequence length: {len(input_ids)}")
-            
-            # 优化内存管理
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()  # 显式清理缓存
-                # 打印当前GPU显存状态
-                allocated_mem = torch.cuda.memory_allocated(0) / (1024**3)
-                reserved_mem = torch.cuda.memory_reserved(0) / (1024**3)
-                logger.info(f"生成前GPU显存: 已分配: {allocated_mem:.2f}GB, 已保留: {reserved_mem:.2f}GB")
-            
-            # 移动输入张量到GPU
+            # 创建输入张量
             logger.info("Moving input tensors to GPU...")
-            device = self.device
-            
-            # 初始化输入
-            input_tensor = torch.tensor(input_ids, device=device)
+            input_ids = torch.tensor(input_data['input_ids'], device='cuda')
+            attention_mask = torch.tensor(input_data['attention_mask'], device='cuda')
             
             # 生成参数日志
-            max_new_tokens = input_data.get('max_new_tokens', 50)
-            temperature = input_data.get('temperature', 0.7)
+            max_new_tokens = input_data.get('max_new_tokens', 512)
+            temperature = input_data.get('temperature', 0.6)
             top_p = input_data.get('top_p', 0.9)
             logger.info(f"Generation parameters: max_new_tokens={max_new_tokens}, "
                        f"temperature={temperature}, "
                        f"top_p={top_p}")
             
-            # 开始生成
+            # 修改 model.forward 方法，添加 KV 缓存同步
+            original_forward = self.model.forward
+            
+            def distributed_forward(input_ids, attention_mask=None, **kwargs):
+                # 确定当前处理的是哪一层
+                # 这需要根据具体模型架构进行调整
+                layer_indices = []
+                if hasattr(self.model, 'hf_device_map'):
+                    for name, device in self.model.hf_device_map.items():
+                        if device == f"cuda:{0 if self.worker_id < 4 else 1}" and "layers" in name:
+                            layer_id = int(name.split('.')[2])
+                            layer_indices.append(layer_id)
+                
+                # 在处理自己负责的层之前，获取之前层的KV缓存
+                for layer_id in range(min(layer_indices)):
+                    kv_cache = self.retrieve_kv_cache(request_id, layer_id)
+                    if kv_cache is not None:
+                        # 将KV缓存添加到模型的past_key_values中
+                        # 具体实现取决于模型如何处理KV缓存
+                        pass
+                
+                # 调用原始forward方法
+                outputs = original_forward(input_ids, attention_mask, **kwargs)
+                
+                # 存储本worker处理的层的KV缓存
+                for layer_id in layer_indices:
+                    if hasattr(outputs, 'past_key_values') and outputs.past_key_values is not None:
+                        kv_cache = outputs.past_key_values[layer_id]
+                        self.store_kv_cache(request_id, layer_id, kv_cache)
+                
+                return outputs
+            
+            # 替换模型的forward方法
+            if self.kvcache_socket:
+                self.model.forward = distributed_forward
+            
+            # 创建自定义流式处理器
+            class StreamingHandler:
+                def __init__(self, socket, tokenizer):
+                    self.socket = socket
+                    self.tokenizer = tokenizer
+                    self.current_text = ""
+                    self.last_send_time = time.time()
+                    
+                def __call__(self, text_chunk: str, stream_end: bool = False):
+                    current_time = time.time()
+                    self.current_text += text_chunk
+                    
+                    # 每0.5秒或结束时发送一次
+                    if stream_end or (current_time - self.last_send_time) > 0.5:
+                        self.socket.send_pyobj({
+                            'status': 'streaming',
+                            'text': self.current_text,
+                            'finished': stream_end
+                        })
+                        # 等待客户端确认
+                        self.socket.recv_pyobj()
+                        self.last_send_time = current_time
+            
+            # 创建流式处理器
+            streamer = self.CustomStreamer(
+                self.tokenizer,
+                on_text_chunk=StreamingHandler(self.socket, self.tokenizer),
+                skip_prompt=True,
+                skip_special_tokens=True
+            )
+            
+            # 生成文本
             logger.info("Starting text generation...")
             start_time = time.time()
-            
-            # 使用上下文管理器确保在出作用域时释放张量
-            with torch.no_grad(), torch.amp.autocast('cuda', enabled=True):
-                # 检查模型是否已加载
-                if not hasattr(self, 'model') or self.model is None:
-                    raise ValueError("模型未正确加载，无法进行推理")
-                    
-                # 设置生成参数
-                gen_kwargs = {
-                    'max_new_tokens': max_new_tokens,
-                    'do_sample': True,
-                    'temperature': temperature,
-                    'top_p': top_p
-                }
-                
-                # 使用模型进行实际生成
-                logger.info("正在使用模型生成文本...")
-                output = self.model.generate(
-                    inputs=input_tensor.unsqueeze(0),  # 添加批次维度
-                    **gen_kwargs
+            with torch.no_grad(), torch.amp.autocast('cuda'):
+                outputs = self.model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    do_sample=input_data.get('do_sample', True),
+                    streamer=streamer
                 )
-                
-                # 获取生成的token ids
-                output_token_ids = output[0].cpu().tolist()
-                logger.info(f"模型生成了{len(output_token_ids)-len(input_ids)}个新token")
-                
-            # 确保所有GPU操作完成
-            torch.cuda.synchronize()
             
-            # 再次打印显存状态
-            if torch.cuda.is_available():
-                allocated_mem = torch.cuda.memory_allocated(0) / (1024**3)
-                reserved_mem = torch.cuda.memory_reserved(0) / (1024**3)
-                logger.info(f"生成后GPU显存: 已分配: {allocated_mem:.2f}GB, 已保留: {reserved_mem:.2f}GB")
+            # 恢复原始forward方法
+            if self.kvcache_socket:
+                self.model.forward = original_forward
+                # 清理KV缓存
+                self.clear_kv_cache(request_id)
             
+            # 记录性能统计
+            end_time = time.time()
+            generation_time = end_time - start_time
+            tokens_generated = len(outputs[0]) - len(input_ids[0])
+            
+            logger.info("Generation statistics:")
+            logger.info(f"- Total time: {generation_time:.2f} seconds")
+            logger.info(f"- Tokens generated: {tokens_generated}")
+            logger.info(f"- Speed: {tokens_generated/generation_time:.2f} tokens/sec")
+            
+            # 清理当前请求记录
+            if request_id in self.current_requests:
+                del self.current_requests[request_id]
+            
+            # 最终返回完整的 token ids
             return {
                 'status': 'success',
-                'message': f"Worker {self.worker_id} successfully generated text",
-                'time_taken': time.time() - start_time,
-                'output_ids': output_token_ids
+                'output_ids': outputs.cpu().numpy().tolist()
             }
-            
         except Exception as e:
             logger.error(f"Generation error: {str(e)}")
-            import traceback
-            logger.error(traceback.format_exc())
-            
             return {
                 'status': 'error',
-                'error': str(e),
-                'output_ids': []
+                'error': str(e)
             }
 
-    def load_model(self, model_path: str, gguf_path: str) -> Dict[str, Any]:
-        """加载模型"""
+    def run(self):
+        logger.info("Worker ready to receive requests")
         try:
-            logger.info(f"开始加载模型: {model_path}")
-            
-            # 先验证路径
-            if not model_path:
-                logger.error("模型路径为空")
-                return {'status': 'error', 'error': '模型路径不能为空'}
-            
-            # 设置GPU显存使用上限为75%
-            if torch.cuda.is_available():
-                logger.info("设置GPU显存使用上限为75%")
-                torch.cuda.empty_cache()  # 清空CUDA缓存
-                torch.cuda.set_per_process_memory_fraction(0.75)  # 限制显存使用为75%
-                
-                # 打印当前GPU显存状态
-                total_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-                allocated_mem = torch.cuda.memory_allocated(0) / (1024**3)
-                reserved_mem = torch.cuda.memory_reserved(0) / (1024**3)
-                logger.info(f"GPU显存总量: {total_mem:.2f}GB, 已分配: {allocated_mem:.2f}GB, 已保留: {reserved_mem:.2f}GB")
-            
-            # 加载tokenizer
-            logger.info("加载tokenizer...")
-            try:
-                from transformers import AutoTokenizer
-                self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-                logger.info("Tokenizer加载成功")
-            except Exception as e:
-                logger.error(f"加载tokenizer出错: {str(e)}")
-                return {'status': 'error', 'error': f"加载tokenizer失败: {str(e)}"}
-            
-            # 加载模型配置
-            logger.info("加载模型配置...")
-            try:
-                from transformers import AutoConfig
-                self.config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-                # 设置默认数据类型
-                torch.set_default_dtype(self.config.torch_dtype)
-                logger.info(f"模型配置加载成功，类型: {self.config.model_type}")
-            except Exception as e:
-                logger.error(f"加载模型配置出错: {str(e)}")
-                return {'status': 'error', 'error': f"加载模型配置失败: {str(e)}"}
-            
-            # 完全跳过规则优化，直接使用简单加载
-            logger.info("使用直接加载模式（跳过GGUF优化）...")
-            try:
-                from transformers import AutoModelForCausalLM
-                
-                # 确保CUDA可用
-                if torch.cuda.is_available():
-                    device_map = "auto"
-                else:
-                    device_map = "cpu"
-                    logger.warning("CUDA不可用，使用CPU加载模型")
-                
-                # 直接加载原始模型
-                logger.info(f"直接从HuggingFace加载模型: {model_path}")
-                self.model = AutoModelForCausalLM.from_pretrained(
-                    model_path,
-                    config=self.config,
-                    trust_remote_code=True,
-                    torch_dtype=self.config.torch_dtype,
-                    device_map=device_map
-                )
-                
-                # 设置为评估模式
-                self.model.eval()
-                logger.info("模型加载成功，设置为评估模式")
-                
-                # 加载生成配置
+            while True:
                 try:
-                    from transformers import GenerationConfig
-                    self.model.generation_config = GenerationConfig.from_pretrained(model_path)
-                    logger.info("生成配置加载成功")
-                except Exception as e:
-                    logger.warning(f"无法加载生成配置，使用默认配置: {str(e)}")
-                    # 创建默认生成配置
-                    from transformers import GenerationConfig
-                    gen_config = GenerationConfig(
-                        temperature=0.7,
-                        top_p=0.9,
-                        do_sample=True,
-                        max_new_tokens=512  # 设置合理的默认值
-                    )
-                    self.model.generation_config = gen_config
+                    message = self.socket.recv_pyobj()
+                    command = message.get('command')
                     
-                # 确保pad_token_id设置
-                if self.model.generation_config.pad_token_id is None:
-                    self.model.generation_config.pad_token_id = self.model.generation_config.eos_token_id
+                    if command == 'load_model':
+                        self.load_model(message['model_path'], message['gguf_path'])
+                        self.socket.send_pyobj({'status': 'success'})
                     
-                logger.info("模型和相关配置加载完成")
-                
-                # 在GGUF加载部分
-                # 创建一个临时的空优化文件
-                with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
-                    f.write("# 空白优化文件\n")
-                    optimize_config_path = f.name
-
-                # 使用这个临时文件
-                logger.info(f"使用临时空白优化文件: {optimize_config_path}")
-                try:
-                    optimize_and_load_gguf(self.model, optimize_config_path, gguf_path, self.config)
-                    # 使用完后删除临时文件
-                    os.unlink(optimize_config_path)
+                    elif command == 'generate':
+                        result = self.generate(message['data'])
+                        self.socket.send_pyobj(result)
+                    
+                    elif command == 'shutdown':
+                        logger.info("Received shutdown command")
+                        self.socket.send_pyobj({'status': 'shutdown'})
+                        # 清理资源
+                        if hasattr(self, 'model'):
+                            del self.model
+                        if hasattr(self, 'tokenizer'):
+                            del self.tokenizer
+                        torch.cuda.empty_cache()
+                        logger.info("Resources cleaned up")
+                        break
+                    
                 except Exception as e:
-                    # 错误处理
-                    os.unlink(optimize_config_path)  # 确保清理
-                
-                return {'status': 'success', 'message': '模型加载成功（直接加载模式）'}
-                
-            except Exception as e:
-                logger.error(f"加载模型出错: {str(e)}")
-                import traceback
-                logger.error(traceback.format_exc())
-                return {'status': 'error', 'error': f"加载模型失败: {str(e)}"}
-                
-        except Exception as e:
-            logger.error(f"模型加载过程中出现未知错误: {str(e)}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return {'status': 'error', 'error': f"未知错误: {str(e)}"}
-
-class SimplifiedLayer(nn.Module):
-    """简化的Transformer层"""
-    def __init__(self, hidden_size):
-        super().__init__()
-        self.linear = nn.Linear(hidden_size, hidden_size)
-    
-    def forward(self, x):
-        return self.linear(x)
-
-class SimpleModel(nn.Module):
-    """简化的模型结构，只包含必要组件"""
-    def __init__(self, config, worker_id, worker_count):
-        super().__init__()
-        self.config = config
-        self.worker_id = worker_id
-        self.worker_count = worker_count
-        
-        # 模型参数
-        self.hidden_size = config.get('hidden_size', 8192)
-        self.num_layers = config.get('num_hidden_layers', 80)
-        
-        # 确定当前worker负责的层范围
-        layers_per_worker = self.num_layers // worker_count
-        self.start_layer = worker_id * layers_per_worker
-        self.end_layer = (worker_id + 1) * layers_per_worker
-        if worker_id == worker_count - 1:
-            self.end_layer = self.num_layers
-        
-        # 选择设备 (根据worker ID分配到两个GPU)
-        gpu_id = 0 if worker_id < worker_count // 2 else 1
-        self.device = torch.device(f'cuda:{gpu_id}' if torch.cuda.is_available() else 'cpu')
-        
-        # 创建简单的层结构
-        self.layers = nn.ModuleList([
-            SimplifiedLayer(self.hidden_size) 
-            for _ in range(self.start_layer, self.end_layer)
-        ])
-        
-        # 只给需要的worker创建特殊层
-        self.embed_tokens = nn.Embedding(config.get('vocab_size', 100000), self.hidden_size) if worker_id == 0 else None
-        self.norm = nn.LayerNorm(self.hidden_size) if worker_id == worker_count - 1 else None
-        self.lm_head = nn.Linear(self.hidden_size, config.get('vocab_size', 100000)) if worker_id == worker_count - 1 else None
-        
-        # 将模型移动到指定设备
-        self.to(self.device)
-        
-        # 设置为评估模式
-        self.eval()
+                    logger.error(f"Error processing message: {str(e)}")
+                    self.socket.send_pyobj({'status': 'error', 'error': str(e)})
+        finally:
+            # 确保资源被清理
+            logger.info("Cleaning up worker resources...")
+            self.socket.close()
+            self.context.term()
+            logger.info("Worker shutdown complete")
 
 if __name__ == '__main__':
     main() 

@@ -15,8 +15,6 @@ import locale
 import torch
 from transformers import AutoTokenizer
 import time
-from typing import Dict, List
-import re
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -37,227 +35,70 @@ def import_local_modules():
             prefill_and_generate, get_compute_capability, Config, flashinfer_enabled)
 
 class DistributedModel:
-    """分布式模型客户端类"""
-    
-    def __init__(self, server_address):
-        """初始化分布式模型客户端
-        
-        Args:
-            server_address: 中央服务器地址，如 "10.21.22.206:29400"
-        """
+    def __init__(self, worker_address: str):
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.REQ)
-        self.socket.connect(f"tcp://{server_address}")
-        self.distributed = True
+        self.socket.connect(f"tcp://{worker_address}")
+        logger.info(f"Connected to worker at {worker_address}")
         
-        # 初始化tokenizer属性
-        self.tokenizer = None
-        
-        logger.info(f"Connected to central server at {server_address}")
-    
-    def load_model(self, model_path: str, gguf_path: str = None) -> bool:
-        """加载模型"""
-        print(f"正在加载模型: {model_path}")
-        if gguf_path:
-            print(f"使用GGUF模型: {gguf_path}")
-        
-        # 确保路径不为空字符串
-        if not model_path or model_path.strip() == '':
-            print("错误: 模型路径不能为空")
-            return False
-        
-        # 打印详细的请求内容，用于调试
-        request_data = {
+    def load_model(self, model_path: str, gguf_path: str):
+        message = {
+            'command': 'load_model',
             'model_path': model_path,
             'gguf_path': gguf_path
         }
-        print(f"发送加载模型请求: {request_data}")
-        
-        response = self._send_command('load_model', request_data)
-        
-        # 检查response是否是字典
-        if isinstance(response, bool):
-            success = response
-            error = "未知错误" if not success else None
-        else:
-            success = response.get('status') == 'success'
-            error = response.get('error')
-        
-        if not success:
-            print(f"模型加载失败: {error}")
-            return False
-        
-        # 在成功加载模型后，初始化tokenizer
-        try:
-            from transformers import AutoTokenizer
-            self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-            print(f"Tokenizer loaded from {model_path}")
-        except Exception as e:
-            print(f"无法加载tokenizer: {e}")
-            print("将使用默认输出显示")
-            self.tokenizer = None
-        
-        print("模型加载成功!")
-        return True
+        logger.info("Requesting model load from worker...")
+        self.socket.send_pyobj(message)
+        response = self.socket.recv_pyobj()
+        if response['status'] != 'success':
+            raise Exception(f"Failed to load model: {response.get('error')}")
+        logger.info("Model loaded successfully on worker")
 
-    def _send_command(self, command: str, data: Dict = None) -> Dict:
-        """发送命令到服务器并接收响应"""
-        if data is None:
-            data = {}
-        
-        message = {
-            'command': command,
-            'data': data
-        }
-        
+    def generate(self, input_ids, attention_mask, **kwargs):
         try:
-            self.socket.send_pyobj(message)
-            response = self.socket.recv_pyobj()
-            
-            # 确保返回字典
-            if not isinstance(response, dict):
-                return {'status': 'success' if response else 'error', 'value': response}
-            
-            return response
-        except Exception as e:
-            print(f"通信错误: {str(e)}")
-            return {'status': 'error', 'error': str(e)}
-
-    def generate(self, input_ids=None, attention_mask=None, input_text=None, **kwargs):
-        """生成文本"""
-        try:
-            # 如果提供了输入文本，则创建消息并转换为tokens
-            if input_text is not None:
-                if self.tokenizer is None:
-                    print("错误: Tokenizer不可用")
-                    return ""
-                
-                # 创建消息格式，匹配原始实现
-                messages = [{"role": "user", "content": input_text}]
-                # 应用聊天模板处理消息
-                input_tensor = self.tokenizer.apply_chat_template(
-                    messages, add_generation_prompt=True, return_tensors="pt"
-                )
-                
-                input_ids = input_tensor
-                attention_mask = torch.ones_like(input_tensor)
-            else:
-                # 确保input_ids已提供
-                if input_ids is None:
-                    print("错误: 未提供输入文本或input_ids")
-                    return ""
-                
-                # 如果没有提供attention_mask，创建全1掩码
-                if attention_mask is None:
-                    attention_mask = torch.ones_like(input_ids) if isinstance(input_ids, torch.Tensor) else [1] * len(input_ids)
-            
-            # 准备请求数据
-            generate_data = {
-                'input_ids': input_ids.tolist() if isinstance(input_ids, torch.Tensor) else input_ids,
-                'attention_mask': attention_mask.tolist() if isinstance(attention_mask, torch.Tensor) else attention_mask
+            logger.info("Preparing generation request...")
+            message = {
+                'command': 'generate',
+                'data': {
+                    'input_ids': input_ids.cpu().numpy().tolist(),
+                    'attention_mask': attention_mask.cpu().numpy().tolist(),
+                    **kwargs
+                }
             }
-            # 添加其他生成参数
-            generate_data.update(kwargs)
             
-            # 发送生成请求
-            print("正在生成回复...")
-            response = self._send_command('generate', generate_data)
+            logger.info("Starting generation...")
+            self.socket.send_pyobj(message)
             
-            if response.get('status') != 'success':
-                error_msg = response.get('error', 'Unknown error')
-                print(f"生成失败: {error_msg}")
-                return ""
-            
-            # 获取输出token IDs
-            output_ids = response.get('output_ids', [])
-            
-            print("生成成功!")
-            
-            # 处理输出ID
-            if isinstance(output_ids, torch.Tensor):
-                has_outputs = len(output_ids) > 0
-                output_ids_list = output_ids.tolist() 
-            else:
-                has_outputs = bool(output_ids)
-                output_ids_list = output_ids
-            
-            # 处理嵌套列表
-            if has_outputs and isinstance(output_ids_list, list) and isinstance(output_ids_list[0], list):
-                output_ids_list = output_ids_list[0]
-            
-            if has_outputs:
-                # 显示前几个token
-                output_preview = output_ids_list[:10] if len(output_ids_list) > 10 else output_ids_list
-                print(f"生成的tokens: {output_preview}...")
+            # 接收流式响应
+            full_text = ""
+            while True:
+                response = self.socket.recv_pyobj()
                 
-                # 使用tokenizer解码
-                if self.tokenizer is not None:
-                    try:
-                        # 解码生成的tokens
-                        full_output_text = self.tokenizer.decode(output_ids_list)
-                        print(f"原始输出: {repr(full_output_text)}")
-                        
-                        # 提取助手回复部分
-                        assistant_response = self._extract_assistant_response(full_output_text)
-                        
-                        print(f"\n{assistant_response}\n")
-                        return assistant_response
-                    except Exception as e:
-                        print(f"\n解码文本时出错: {str(e)}")
-                        print(f"Token IDs: {output_ids_list[:20]}...\n")
-                        return ""
-                else:
-                    print("\n无法解码文本: tokenizer不可用\n")
-                    return ""
-            else:
-                print("警告: 未收到任何生成的tokens")
-                return ""
+                if response['status'] == 'error':
+                    raise Exception(f"Generation failed: {response.get('error')}")
+                
+                if response['status'] == 'streaming':
+                    # 打印新生成的文本部分
+                    new_text = response['text'][len(full_text):]
+                    if new_text:
+                        print(new_text, end='', flush=True)
+                    full_text = response['text']
+                    
+                    # 发送确认
+                    self.socket.send_pyobj({'status': 'received'})
+                    
+                    # 如果生成结束，退出循环
+                    if response.get('finished', False):
+                        print()  # 换行
+                        # 不要在这里 break，等待最终的 token IDs
+                
+                elif response['status'] == 'success':
+                    # 最终的完整响应
+                    return torch.tensor(response['output_ids'])
+        
         except Exception as e:
-            print(f"生成过程中出错: {str(e)}")
-            import traceback
-            print(traceback.format_exc())
-            return ""
-
-    def _extract_assistant_response(self, text):
-        """从完整输出中提取助手的回复"""
-        # 添加全面的提取方法，根据不同模型的格式调整
-        
-        # 1. 基于角色标记提取助手回复
-        import re
-        
-        # 可能的助手标记模式
-        assistant_patterns = [
-            r'<｜Assistant｜>(.*?)(?:<｜tool▁outputs▁end｜>|$)',  # 带符号的格式
-            r'<|Assistant|>(.*?)(?:<|User|>|$)',  # 英文竖线格式
-            r'<assistant>(.*?)(?:<user>|$)',          # 简化格式
-            r'Assistant:(.*?)(?:User:|$)',            # 冒号格式
-            r'assistant:(.*?)(?:user:|$)',            # 小写冒号格式
-        ]
-        
-        # 尝试所有可能的模式
-        for pattern in assistant_patterns:
-            match = re.search(pattern, text, re.DOTALL)
-            if match:
-                return match.group(1).strip()
-        
-        # 2. 如果没找到明确的助手回复，尝试去除所有已知的特殊标记
-        cleaned_text = text
-        special_tokens = [
-            " ", " ", " ",
-            "<|begin_of_sentence|>", "<|User|>", "<|Assistant|>",
-            "<user>", "<assistant>", "<think>", "</think>",
-            "User:", "Assistant:"
-        ]
-        
-        for token in special_tokens:
-            cleaned_text = cleaned_text.replace(token, "")
-        
-        # 3. 移除可能的用户输入部分
-        if input_text and cleaned_text.startswith(input_text):
-            cleaned_text = cleaned_text[len(input_text):].strip()
-        
-        # 如果是聊天场景中的第一条消息，可能需要返回整个文本
-        return cleaned_text.strip() or "抱歉，我无法理解您的请求。"
+            logger.error(f"Error in generate: {str(e)}")
+            raise
 
     def shutdown(self):
         """发送关闭命令给worker"""
@@ -273,33 +114,6 @@ class DistributedModel:
         except Exception as e:
             logger.error(f"Error during shutdown: {e}")
 
-    def _post_process_output(self, text):
-        """清理模型输出，移除特殊标记和内部思考过程"""
-        # 先打印原始文本，帮助调试
-        print(f"原始输出: {repr(text)}")
-        
-        # 去除常见的特殊标记
-        cleaned_text = text
-        special_tokens = [
-            " ", " ", " ",
-            "<｜user｜>", "<｜assistant｜>", "<think>", "</think>"
-        ]
-        
-        for token in special_tokens:
-            cleaned_text = cleaned_text.replace(token, "")
-        
-        # 去除用户输入（"你好"）
-        cleaned_text = cleaned_text.replace("你好", "")
-        
-        # 去除前后空白
-        cleaned_text = cleaned_text.strip()
-        
-        # 如果输出为空，返回一个默认消息
-        if not cleaned_text:
-            return "你好！很高兴为你服务。请问有什么我可以帮助你的吗？"
-        
-        return cleaned_text
-
 def main():
     # 设置终端编码
     if sys.platform.startswith('win'):
@@ -313,15 +127,15 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_path', type=str, required=True)
     parser.add_argument('--gguf_path', type=str, required=True)
-    parser.add_argument('--server_address', type=str, default=None,
-                      help='Address of central server (e.g., "10.21.22.206:29400")')
+    parser.add_argument('--worker_address', type=str, default=None,
+                      help='Address of worker for distributed mode (e.g., "10.21.22.206:29500")')
     parser.add_argument('--max_new_tokens', type=int, default=300)
     args = parser.parse_args()
 
-    if args.server_address:
+    if args.worker_address:
         # 分布式模式
         logger.info("Running in distributed mode")
-        model = DistributedModel(args.server_address)
+        model = DistributedModel(args.worker_address)
         model.load_model(args.model_path, args.gguf_path)
         tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
         

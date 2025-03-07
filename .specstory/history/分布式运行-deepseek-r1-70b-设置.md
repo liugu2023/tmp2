@@ -11275,6 +11275,284 @@ def generate(self, data):
         }
 ```
 
+这个修复:
+
+1. 修改了`run`方法以特殊处理生成请求:
+   - 对于流式请求，逐个处理生成的项并发送
+   - 处理客户端确认，支持提前终止生成
+
+2. 重写了`generate`方法:
+   - 移除了`yield`语句
+   - 对于流式生成，每次只返回一个token，由run方法中的循环处理
+   - 简化了实现，移除了与嵌入服务器的复杂交互（可以稍后再添加）
+
+这样修改后，生成功能应该可以正常工作，不会出现序列化生成器的错误。
+
+---
+
+_**User**_
+
+WARNING:accelerate.big_modeling:Some parameters are on the meta device because they were offloaded to the cpu.                      INFO:__main__:Model loaded successfully
+INFO:__main__:Set up hooks for 10 layers                                                                                            INFO:__main__:Set up proxies for 70 layers
+INFO:__main__:Worker 0 received generate request                                                                                    INFO:__main__:Worker 0 generating with 50 new tokens
+Setting `pad_token_id` to `eos_token_id`:128001 for open-end generation.                                                            /archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/generation/utils.py:1850: UserWarning: You are calling .generate() with the `input_ids` being on a device type different than your model's device. `input_ids` is on cpu, whereas the model is on meta. You may experience unexpected behaviors or slower generation. Please make sure that you have put `input_ids` to the correct device by calling for example input_ids = input_ids.to('meta') before running `.generate()`.                                                   warnings.warn(
+ERROR:__main__:Generation error: Tensor.item() cannot be called on meta tensors                                                     ERROR:__main__:Traceback (most recent call last):                                                                                     File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 503, in generate                                                 outputs = self.model.generate(
+              ^^^^^^^^^^^^^^^^^^^^                                                                                                    File "/archive/liugu/ds/ds/lib/python3.11/site-packages/torch/utils/_contextlib.py", line 116, in decorate_context
+    return func(*args, **kwargs)                                                                                                               ^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/generation/utils.py", line 1989, in generate                     result = self._sample(
+             ^^^^^^^^^^^^^                                                                                                            File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/generation/utils.py", line 2932, in _sample
+    outputs = self(**model_inputs, return_dict=True)                                                                                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl                 return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^                                                                                           File "/archive/liugu/ds/ds/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)                                                                                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/accelerate/hooks.py", line 176, in new_forward                                output = module._old_forward(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^                                                                                     File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/models/llama/modeling_llama.py", line 1141, in forward           outputs = self.model(
+              ^^^^^^^^^^^                                                                                                             File "/archive/liugu/ds/ds/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl                 return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl                         return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/models/llama/modeling_llama.py", line 914, in forward            causal_mask = self._update_causal_mask(                                                                                                           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/models/llama/modeling_llama.py", line 1008, in _update_causal_mask                                                                                                                                   if AttentionMaskConverter._ignore_causal_mask_sdpa(
+       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/modeling_attn_mask_utils.py", line 279, in _ignore_causal_mask_sdpa
+    elif (is_training or not is_tracing) and torch.all(attention_mask == 1):
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/torch/_meta_registrations.py", line 6471, in meta_local_scalar_dense          raise RuntimeError("Tensor.item() cannot be called on meta tensors")
+RuntimeError: Tensor.item() cannot be called on meta tensors
+
+---
+
+_**Assistant**_
+
+<think>
+这个错误是由于 `meta` 设备上的张量不支持 `.item()` 操作。错误发生在模型的生成过程中，特别是当模型尝试创建因果掩码时。
+
+问题出在输入张量在 CPU 上，但模型的某些部分在 `meta` 设备上，导致了设备不匹配。具体来说，`input_ids` 在 CPU 上，而模型的某些部分在 `meta` 设备上。
+
+这个问题可能是由于我们的按需加载机制导致的。在按需加载设计中，我们将一些层卸载到 `meta` 设备，但是在执行生成操作时，输入数据需要与模型在相同的设备上。
+
+让我们修改 `generate` 方法来解决这个问题，确保输入数据在正确的设备上：
+</think>
+
+# 解决 Meta 设备问题
+
+我看到错误信息显示 `Tensor.item() cannot be called on meta tensors`，这是由于我们的模型使用了 Meta 设备进行层卸载，但生成过程中处理输入不正确。我们需要修改 `generate` 方法来适应这种模型架构：
+
+```python:ktransformers/worker.py
+def generate(self, data):
+    """执行文本生成"""
+    try:
+        # 提取输入数据
+        input_ids = torch.tensor(data.get('input_ids'), device='cpu')
+        attention_mask = torch.tensor(data.get('attention_mask', None), device='cpu')
+        max_new_tokens = data.get('max_new_tokens', 512)
+        temperature = data.get('temperature', 0.7)
+        top_p = data.get('top_p', 0.9)
+        do_sample = data.get('do_sample', True)
+        stream = data.get('stream', True)
+        
+        logger.info(f"Worker {self.worker_id} generating with {max_new_tokens} new tokens")
+        
+        # 我们需要避免使用 generate 方法，因为它与 meta 设备不兼容
+        # 而是实现自己的生成循环
+        
+        # 准备初始状态
+        current_ids = input_ids.clone()
+        initial_length = current_ids.shape[1]
+        
+        # 准备生成配置
+        eos_token_id = self.model.config.eos_token_id if hasattr(self.model.config, 'eos_token_id') else None
+        pad_token_id = self.model.config.pad_token_id if hasattr(self.model.config, 'pad_token_id') else None
+        
+        # 手动实现生成循环
+        for i in range(max_new_tokens):
+            # 将输入传递到模型
+            model_inputs = {
+                'input_ids': current_ids,
+                'attention_mask': torch.ones_like(current_ids)
+            }
+            
+            # 前向传播
+            with torch.no_grad():
+                # 模型前向传递
+                outputs = self.model(
+                    input_ids=model_inputs['input_ids'], 
+                    attention_mask=model_inputs['attention_mask']
+                )
+                
+                # 获取最后一个token的logits
+                logits = outputs.logits[:, -1, :]
+                
+                # 应用温度
+                if temperature > 0:
+                    logits = logits / temperature
+                
+                # 应用top_p采样
+                if do_sample and top_p < 1.0:
+                    sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                    cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+                    
+                    # 删除不在top_p中的tokens
+                    sorted_indices_to_remove = cumulative_probs > top_p
+                    # 保留第一个大于阈值的token
+                    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                    sorted_indices_to_remove[..., 0] = 0
+                    
+                    # 创建索引散射的掩码
+                    indices_to_remove = sorted_indices_to_remove.scatter(
+                        1, sorted_indices, sorted_indices_to_remove
+                    )
+                    logits = logits.masked_fill(indices_to_remove, -float('Inf'))
+                
+                # 采样或贪婪解码
+                if do_sample:
+                    probs = torch.softmax(logits, dim=-1)
+                    next_token = torch.multinomial(probs, num_samples=1)
+                else:
+                    next_token = torch.argmax(logits, dim=-1, keepdim=True)
+            
+            # 添加到当前序列
+            current_ids = torch.cat([current_ids, next_token], dim=1)
+            
+            # 如果是流式生成，返回当前结果
+            if stream:
+                new_tokens = current_ids[:, initial_length:].cpu().numpy().tolist()
+                streaming_response = {
+                    'status': 'streaming',
+                    'output_ids': new_tokens
+                }
+                
+                if i < max_new_tokens - 1:
+                    # 中间结果
+                    return streaming_response
+            
+            # 检查是否生成了EOS
+            if eos_token_id is not None and (next_token == eos_token_id).any():
+                break
+        
+        # 返回最终结果
+        final_output = current_ids[:, initial_length:].cpu().numpy().tolist()
+        return {
+            'status': 'success',
+            'output_ids': final_output
+        }
+                
+    except Exception as e:
+        logger.error(f"Generation error: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return {
+            'status': 'error',
+            'error': str(e)
+        }
+```
+
+这个实现避开了使用 HuggingFace 的 `generate` 方法，而是手动实现了生成循环。关键改进：
+
+1. 完全避免使用 `generate` 方法，它与 meta 设备不兼容
+2. 手动实现温度和 top-p 采样
+3. 直接调用模型的 forward 方法，更容易与我们的层迁移机制兼容
+4. 改进了流式响应处理方式
+
+同时，需要确保 `run` 方法正确处理这种流式响应：
+
+```python:ktransformers/worker.py
+def run(self):
+    """运行worker主循环"""
+    logger.info(f"Worker {self.worker_id} ready to receive requests")
+    try:
+        while True:
+            try:
+                # 接收请求
+                message = self.socket.recv_pyobj()
+                command = message.get('command')
+                logger.info(f"Worker {self.worker_id} received {command} request")
+                
+                # 处理不同类型的请求
+                if command == 'load_model':
+                    # 加载模型
+                    response = self.load_model(message['model_path'], message.get('gguf_path'))
+                    self.socket.send_pyobj(response)
+                
+                elif command == 'status':
+                    # 返回模型状态
+                    status = {
+                        'status': 'ready',
+                        'model_loaded': hasattr(self, 'model') and self.model is not None,
+                        'worker_id': self.worker_id
+                    }
+                    self.socket.send_pyobj(status)
+                
+                elif command == 'generate':
+                    # 生成文本 - 区分流式和非流式请求
+                    if message['data'].get('stream', True):
+                        # 发送第一个结果
+                        first_result = self.generate(message['data'])
+                        self.socket.send_pyobj(first_result)
+                        
+                        # 继续生成直到完成
+                        if first_result.get('status') == 'streaming':
+                            # 等待客户端确认
+                            ack = self.socket.recv_pyobj()
+                            
+                            # 生成下一个结果
+                            final_result = self.generate(message['data'])
+                            self.socket.send_pyobj(final_result)
+                    else:
+                        # 非流式生成
+                        result = self.generate(message['data'])
+                        self.socket.send_pyobj(result)
+                
+                elif command == 'shutdown':
+                    # 关闭worker
+                    logger.info(f"Worker {self.worker_id} shutting down")
+                    self.socket.send_pyobj({'status': 'success'})
+                    break
+                
+                else:
+                    # 未知命令
+                    logger.warning(f"Unknown command: {command}")
+                    self.socket.send_pyobj({
+                        'status': 'error',
+                        'error': f"Unknown command: {command}"
+                    })
+            
+            except Exception as e:
+                logger.error(f"Error processing request: {str(e)}")
+                import traceback
+                logger.error(traceback.format_exc())
+                try:
+                    self.socket.send_pyobj({
+                        'status': 'error',
+                        'error': str(e)
+                    })
+                except:
+                    pass
+    
+    finally:
+        # 清理资源
+        logger.info(f"Worker {self.worker_id} shutting down")
+        self.socket.close()
+        if hasattr(self, 'kvcache_socket') and self.kvcache_socket:
+            self.kvcache_socket.close()
+        if hasattr(self, 'embedding_socket') and self.embedding_socket:
+            self.embedding_socket.close()
+        torch.cuda.empty_cache()
+```
+
+这些修改应该可以解决当前的 meta tensor 错误，让系统能够正常工作。系统现在将避免使用内置的 `generate` 方法，而是自己实现前向传播和token生成过程。
+
+---
+
+_**User**_
+
+现在的注意力机制是什么
+
+---
+
+_**Assistant**_
+
+
+
 ---
 
 

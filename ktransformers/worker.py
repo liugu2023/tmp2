@@ -383,24 +383,20 @@ class ModelWorker:
                         self.socket.send_pyobj(status)
                     
                     elif command == 'generate':
-                        # 处理生成请求 - 特殊处理流式输出
+                        # 生成文本 - 区分流式和非流式请求
                         if message['data'].get('stream', True):
-                            # 获取生成器
-                            generator = self.generate(message['data'])
-                            # 发送每个生成项
-                            try:
-                                for item in generator:
-                                    self.socket.send_pyobj(item)
-                                    # 等待客户端确认继续
-                                    ack = self.socket.recv_pyobj()
-                                    if ack.get('command') == 'stop':
-                                        break
-                            except Exception as e:
-                                logger.error(f"Streaming generation error: {e}")
-                                self.socket.send_pyobj({
-                                    'status': 'error',
-                                    'error': str(e)
-                                })
+                            # 发送第一个结果
+                            first_result = self.generate(message['data'])
+                            self.socket.send_pyobj(first_result)
+                            
+                            # 继续生成直到完成
+                            if first_result.get('status') == 'streaming':
+                                # 等待客户端确认
+                                ack = self.socket.recv_pyobj()
+                                
+                                # 生成下一个结果
+                                final_result = self.generate(message['data'])
+                                self.socket.send_pyobj(final_result)
                         else:
                             # 非流式生成
                             result = self.generate(message['data'])
@@ -456,84 +452,89 @@ class ModelWorker:
             
             logger.info(f"Worker {self.worker_id} generating with {max_new_tokens} new tokens")
             
-            # 创建生成配置
-            gen_config = GenerationConfig(
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                do_sample=do_sample,
-                pad_token_id=self.model.config.pad_token_id if hasattr(self.model.config, 'pad_token_id') else None,
-                eos_token_id=self.model.config.eos_token_id if hasattr(self.model.config, 'eos_token_id') else None,
-            )
+            # 我们需要避免使用 generate 方法，因为它与 meta 设备不兼容
+            # 而是实现自己的生成循环
             
-            # 准备输入
-            model_inputs = {
-                'input_ids': input_ids,
-                'attention_mask': attention_mask
-            }
+            # 准备初始状态
+            current_ids = input_ids.clone()
+            initial_length = current_ids.shape[1]
             
-            # 非流式生成
-            if not stream:
-                with torch.no_grad():
-                    outputs = self.model.generate(
-                        **model_inputs,
-                        generation_config=gen_config
-                    )
-                
-                return {
-                    'status': 'success',
-                    'output_ids': outputs.cpu().numpy().tolist()
+            # 准备生成配置
+            eos_token_id = self.model.config.eos_token_id if hasattr(self.model.config, 'eos_token_id') else None
+            pad_token_id = self.model.config.pad_token_id if hasattr(self.model.config, 'pad_token_id') else None
+            
+            # 手动实现生成循环
+            for i in range(max_new_tokens):
+                # 将输入传递到模型
+                model_inputs = {
+                    'input_ids': current_ids,
+                    'attention_mask': torch.ones_like(current_ids)
                 }
-            
-            # 流式生成 - 逐token返回
-            else:
-                current_ids = input_ids.clone()
-                initial_length = current_ids.shape[1]
                 
-                # 流式生成循环
-                for i in range(max_new_tokens):
-                    # 更新输入
-                    model_inputs = {
-                        'input_ids': current_ids,
-                        'attention_mask': torch.ones_like(current_ids)
-                    }
+                # 前向传播
+                with torch.no_grad():
+                    # 模型前向传递
+                    outputs = self.model(
+                        input_ids=model_inputs['input_ids'], 
+                        attention_mask=model_inputs['attention_mask']
+                    )
                     
-                    # 生成下一个token
-                    with torch.no_grad():
-                        outputs = self.model.generate(
-                            **model_inputs,
-                            generation_config=gen_config,
-                            max_new_tokens=1
+                    # 获取最后一个token的logits
+                    logits = outputs.logits[:, -1, :]
+                    
+                    # 应用温度
+                    if temperature > 0:
+                        logits = logits / temperature
+                    
+                    # 应用top_p采样
+                    if do_sample and top_p < 1.0:
+                        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                        cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+                        
+                        # 删除不在top_p中的tokens
+                        sorted_indices_to_remove = cumulative_probs > top_p
+                        # 保留第一个大于阈值的token
+                        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                        sorted_indices_to_remove[..., 0] = 0
+                        
+                        # 创建索引散射的掩码
+                        indices_to_remove = sorted_indices_to_remove.scatter(
+                            1, sorted_indices, sorted_indices_to_remove
                         )
+                        logits = logits.masked_fill(indices_to_remove, -float('Inf'))
                     
-                    # 获取新token
-                    next_token = outputs[:, -1:]
-                    
-                    # 添加到当前序列
-                    current_ids = torch.cat([current_ids, next_token], dim=1)
-                    
-                    # 准备流式响应
+                    # 采样或贪婪解码
+                    if do_sample:
+                        probs = torch.softmax(logits, dim=-1)
+                        next_token = torch.multinomial(probs, num_samples=1)
+                    else:
+                        next_token = torch.argmax(logits, dim=-1, keepdim=True)
+                
+                # 添加到当前序列
+                current_ids = torch.cat([current_ids, next_token], dim=1)
+                
+                # 如果是流式生成，返回当前结果
+                if stream:
                     new_tokens = current_ids[:, initial_length:].cpu().numpy().tolist()
                     streaming_response = {
                         'status': 'streaming',
                         'output_ids': new_tokens
                     }
                     
-                    # 返回这个item - 不使用yield
                     if i < max_new_tokens - 1:
+                        # 中间结果
                         return streaming_response
-                    
-                    # 检查结束条件
-                    eos_token_id = self.model.config.eos_token_id if hasattr(self.model.config, 'eos_token_id') else None
-                    if eos_token_id and (next_token == eos_token_id).any():
-                        break
                 
-                # 最终响应
-                final_output = current_ids[:, initial_length:].cpu().numpy().tolist()
-                return {
-                    'status': 'success',
-                    'output_ids': final_output
-                }
+                # 检查是否生成了EOS
+                if eos_token_id is not None and (next_token == eos_token_id).any():
+                    break
+            
+            # 返回最终结果
+            final_output = current_ids[:, initial_length:].cpu().numpy().tolist()
+            return {
+                'status': 'success',
+                'output_ids': final_output
+            }
                 
         except Exception as e:
             logger.error(f"Generation error: {str(e)}")

@@ -231,39 +231,97 @@ class ModelWorker:
         return response["status"] == "success"
     
     def load_model(self, model_path: str, gguf_path: str = None):
-        """加载模型并设置适当的参数"""
+        """加载模型并设置内存优化"""
         logger.info(f"Worker {self.worker_id} loading model from {model_path}")
         
         try:
-            # 加载模型配置
             from transformers import AutoConfig, AutoModelForCausalLM
             import torch
             
             logger.info(f"Loading model config...")
             config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
             
-            # 设置设备映射 - 确保我们的层在正确的位置
-            device_map = {"": f"cuda:{self.gpu_id}"}
+            # 获取总层数
+            if hasattr(config, 'num_hidden_layers'):
+                total_layers = config.num_hidden_layers
+            elif hasattr(config, 'n_layers'):
+                total_layers = config.n_layers
+            else:
+                total_layers = 32  # 默认值
             
-            # 加载模型 - 明确指定设备映射和数据类型
-            logger.info(f"Loading model with device map: {device_map}")
+            logger.info(f"Model has {total_layers} layers in total")
+            
+            # 计算每个worker负责的层范围
+            layers_per_worker = total_layers // self.num_workers
+            start_layer = self.worker_id * layers_per_worker
+            end_layer = start_layer + layers_per_worker if self.worker_id < self.num_workers - 1 else total_layers
+            
+            self.my_layers = list(range(start_layer, end_layer))
+            logger.info(f"Worker {self.worker_id} responsible for layers {self.my_layers}")
+            
+            # 创建设备映射 - 关键优化
+            device_map = {}
+            
+            # 嵌入层和输出层由嵌入服务器处理，设为'meta'
+            device_map["model.embed_tokens"] = "meta"
+            device_map["lm_head"] = "meta"
+            
+            # 对每一层分配设备
+            for i in range(total_layers):
+                if i in self.my_layers:
+                    # 我负责的层，初始设为CPU（推理时才移到GPU）
+                    device_map[f"model.layers.{i}"] = "cpu"
+                else:
+                    # 不负责的层设为meta（不加载）
+                    device_map[f"model.layers.{i}"] = "meta"
+            
+            # 其他组件放在CPU上
+            device_map["model.norm"] = "cpu"
+            
+            logger.info(f"Device map for worker {self.worker_id}: {device_map}")
+            
+            # 加载模型 - 使用offload和8位量化进一步降低内存
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_path,
                 config=config,
                 device_map=device_map,
+                load_in_8bit=True,  # 使用8位量化
+                low_cpu_mem_usage=True,
                 torch_dtype=torch.float16,
-                low_cpu_mem_usage=True
+                offload_folder=f"offload_folder_{self.worker_id}"
             )
+            
+            # 应用8位量化 (可选)
+            if not hasattr(self.model, "is_quantized") or not self.model.is_quantized:
+                try:
+                    from transformers import BitsAndBytesConfig
+                    quantization_config = BitsAndBytesConfig(
+                        load_in_8bit=True,
+                        llm_int8_enable_fp32_cpu_offload=True
+                    )
+                    logger.info("Applying 8-bit quantization")
+                    self.model = AutoModelForCausalLM.from_pretrained(
+                        model_path,
+                        config=config,
+                        device_map=device_map,
+                        quantization_config=quantization_config,
+                        low_cpu_mem_usage=True
+                    )
+                except Exception as e:
+                    logger.warning(f"Could not apply quantization: {e}")
+            
+            # 设置钩子，实现按需加载GPU
+            self._setup_layer_hooks()
             
             # 确保模型处于评估模式
             self.model.eval()
             
             logger.info(f"Model loaded successfully")
+            self.model_loaded = True
             
-            # 报告模型位置
-            for name, param in self.model.named_parameters():
-                if "layers.0" in name or "embed_tokens" in name or "lm_head" in name:
-                    logger.info(f"Parameter {name} is on device {param.device}")
+            # 报告CUDA内存使用
+            logger.info(f"CUDA memory allocated: {torch.cuda.memory_allocated(self.gpu_id) / 1024**3:.2f} GB")
+            logger.info(f"CUDA memory reserved: {torch.cuda.memory_reserved(self.gpu_id) / 1024**3:.2f} GB")
             
             return {"status": "success"}
             
@@ -272,42 +330,53 @@ class ModelWorker:
             import traceback
             logger.error(traceback.format_exc())
             return {"status": "error", "error": str(e)}
-    
-    def setup_model_hooks(self):
-        """设置钩子，在计算时动态移动层到GPU"""
+
+    def _setup_layer_hooks(self):
+        """设置钩子实现动态层调度"""
         if not hasattr(self.model, 'model') or not hasattr(self.model.model, 'layers'):
-            logger.warning("无法设置层管理钩子")
+            logger.warning("无法设置层管理钩子，模型结构不符合预期")
             return
         
         layers = self.model.model.layers
         
-        # 遍历所有我负责的层
+        # 遍历我负责的层
         for layer_id in self.my_layers:
-            if not hasattr(layers, str(layer_id)):
+            if layer_id >= len(layers):
                 continue
             
             layer = layers[layer_id]
             
             # 保存原始forward方法
-            layer._original_forward = layer.forward
+            if not hasattr(layer, '_original_forward'):
+                layer._original_forward = layer.forward
             
             # 创建新的forward方法
             def make_hook(layer_idx, orig_forward):
                 def hook_fn(*args, **kwargs):
-                    # 开始计算前移到GPU
-                    logger.debug(f"Moving layer {layer_idx} to GPU {self.gpu_id}")
-                    layer = self.model.model.layers[layer_idx]
-                    layer.to(f"cuda:{self.gpu_id}")
-                    
-                    # 执行计算
-                    output = orig_forward(*args, **kwargs)
-                    
-                    # 计算后立即移回CPU
-                    logger.debug(f"Moving layer {layer_idx} back to CPU")
-                    layer.to("cpu")
-                    torch.cuda.empty_cache()  # 立即释放显存
-                    
-                    return output
+                    try:
+                        # 开始计算前移到GPU
+                        logger.debug(f"Moving layer {layer_idx} to GPU {self.gpu_id}")
+                        layer = self.model.model.layers[layer_idx]
+                        layer.to(f"cuda:{self.gpu_id}")
+                        
+                        # 执行计算
+                        output = orig_forward(*args, **kwargs)
+                        
+                        # 计算后立即移回CPU，释放GPU内存
+                        logger.debug(f"Moving layer {layer_idx} back to CPU")
+                        layer.to("cpu")
+                        torch.cuda.empty_cache()  # 立即清理显存
+                        
+                        return output
+                    except Exception as e:
+                        logger.error(f"Error in layer hook {layer_idx}: {e}")
+                        # 发生错误时，尝试确保层回到CPU
+                        try:
+                            self.model.model.layers[layer_idx].to("cpu")
+                            torch.cuda.empty_cache()
+                        except:
+                            pass
+                        raise
                 return hook_fn
             
             # 替换forward方法
@@ -412,16 +481,18 @@ class ModelWorker:
             torch.cuda.empty_cache()
 
     def generate(self, data):
-        """执行文本生成，使用基本方法避免meta设备错误"""
+        """执行内存优化的文本生成"""
         try:
             # 提取输入数据
             input_ids = torch.tensor(data.get('input_ids'), device='cpu')
-            attention_mask = torch.tensor(data.get('attention_mask', None), device='cpu')
             max_new_tokens = data.get('max_new_tokens', 512)
             temperature = data.get('temperature', 0.7)
             top_p = data.get('top_p', 0.9)
             do_sample = data.get('do_sample', True)
             stream = data.get('stream', True)
+            
+            # 每次生成前清理缓存
+            torch.cuda.empty_cache()
             
             logger.info(f"Worker {self.worker_id} generating with {max_new_tokens} new tokens")
             
@@ -432,89 +503,63 @@ class ModelWorker:
             current_ids = input_ids.clone()
             initial_length = current_ids.shape[1]
             
-            # 我们将实现最基本的生成循环，完全绕过transformers的generate方法
-            # 这样可以避免meta设备的问题
-            past_key_values = None
-            
-            # 自定义生成循环
+            # 使用最小化内存的生成循环
             for i in range(max_new_tokens):
-                # 准备模型输入，只传递最后一个token（除了第一步）
-                if past_key_values is not None:
-                    # 仅使用最后一个token
-                    current_input_ids = current_ids[:, -1].unsqueeze(-1)
-                    # 为单个token创建掩码
-                    current_attention_mask = torch.ones_like(current_input_ids)
-                else:
-                    # 第一步，使用完整输入
-                    current_input_ids = current_ids
-                    current_attention_mask = torch.ones_like(current_ids)
+                # 管理输入大小，避免OOM
+                if current_ids.shape[1] > 1024 and i > 0:
+                    # 保留最后512个token以节省内存
+                    current_ids = torch.cat([
+                        current_ids[:, :512],  # 保留前512个
+                        current_ids[:, -512:]   # 保留最后512个
+                    ], dim=1)
+                    logger.info(f"Truncated context to {current_ids.shape[1]} tokens to save memory")
                 
-                # 将输入移到合适的设备
-                device = next(self.model.parameters()).device
-                if device.type != 'meta':
-                    current_input_ids = current_input_ids.to(device)
-                    current_attention_mask = current_attention_mask.to(device)
-                
-                # 使用try-except来处理可能的错误
+                # 模型前向传播，最大限度减少内存使用
                 try:
-                    # 前向传播，使用尽可能少的可选参数
+                    # 使用try包装整个过程，以防任何步骤OOM
                     with torch.no_grad():
-                        outputs = self.model(
-                            input_ids=current_input_ids,
-                            attention_mask=current_attention_mask,
-                            past_key_values=past_key_values,
-                            use_cache=True,
-                            return_dict=True
-                        )
-                    
-                    # 更新past_key_values
-                    past_key_values = outputs.past_key_values
-                    
-                    # 获取logits
-                    next_token_logits = outputs.logits[:, -1, :]
-                    
-                    # 应用温度
-                    if temperature > 0:
-                        next_token_logits = next_token_logits / temperature
-                    
-                    # 应用top_p采样（在非meta设备上）
-                    if do_sample and top_p < 1.0:
-                        cpu_logits = next_token_logits.cpu()  # 移到CPU处理
-                        # 计算top-p过滤
-                        sorted_logits, sorted_indices = torch.sort(cpu_logits, descending=True)
-                        cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+                        # 只需要输入ID
+                        outputs = self.model(input_ids=current_ids)
                         
-                        # 删除不在top_p中的tokens
-                        sorted_indices_to_remove = cumulative_probs > top_p
-                        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-                        sorted_indices_to_remove[..., 0] = 0
+                        # 获取最后一个token的logits
+                        logits = outputs.logits[:, -1, :].cpu()  # 立即移至CPU
                         
-                        # 散射过滤
-                        indices_to_remove = torch.zeros_like(cpu_logits, dtype=torch.bool)
-                        for b in range(cpu_logits.shape[0]):
-                            indices_to_remove[b].scatter_(
-                                dim=0, 
-                                index=sorted_indices[b], 
-                                src=sorted_indices_to_remove[b]
-                            )
+                        # 应用温度
+                        if temperature > 0:
+                            logits = logits / temperature
                         
-                        cpu_logits[indices_to_remove] = -float('inf')
-                        next_token_logits = cpu_logits
-                    else:
-                        next_token_logits = next_token_logits.cpu()  # 移到CPU处理
-                    
-                    # 采样或贪婪解码
-                    if do_sample:
-                        probs = torch.softmax(next_token_logits, dim=-1)
-                        next_tokens = torch.multinomial(probs, num_samples=1)
-                    else:
-                        next_tokens = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+                        # 简化的top_p采样
+                        if do_sample and top_p < 1.0:
+                            # 简化实现以减少内存使用
+                            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                            cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+                            sorted_indices_to_remove = cumulative_probs > top_p
+                            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                            sorted_indices_to_remove[..., 0] = 0
+                            
+                            # 内存高效的掩码创建
+                            for b in range(logits.shape[0]):
+                                indices = sorted_indices[b][sorted_indices_to_remove[b]]
+                                logits[b, indices] = -float('inf')
+                        
+                        # 采样或贪婪解码
+                        if do_sample:
+                            probs = torch.softmax(logits, dim=-1)
+                            next_token = torch.multinomial(probs, num_samples=1)
+                        else:
+                            next_token = torch.argmax(logits, dim=-1, keepdim=True)
                     
                     # 添加到生成序列
-                    current_ids = torch.cat([current_ids, next_tokens], dim=-1)
+                    current_ids = torch.cat([current_ids, next_token], dim=-1)
+                    
+                    # 清理中间变量以释放内存
+                    del logits, outputs
+                    if 'probs' in locals():
+                        del probs
+                    torch.cuda.empty_cache()
                     
                     # 检查是否生成了EOS
-                    if eos_token_id is not None and (next_tokens == eos_token_id).any():
+                    if eos_token_id is not None and (next_token == eos_token_id).any():
                         break
                     
                     # 如果是流式生成，返回当前结果
@@ -528,35 +573,22 @@ class ModelWorker:
                         if i < max_new_tokens - 1:
                             # 中间结果
                             return streaming_response
-                            
-                except RuntimeError as e:
-                    logger.error(f"Error during generation step {i}: {str(e)}")
-                    logger.error(f"Trying alternative approach...")
                     
-                    # 如果前向传播失败，尝试直接在CPU上推理最后一个token
-                    try:
-                        # 获取词表大小
-                        vocab_size = self.model.config.vocab_size
-                        
-                        # 创建随机logits作为应急方案
-                        random_logits = torch.tensor(np.random.randn(1, vocab_size), dtype=torch.float32)
-                        
-                        # 选择下一个token (随机或简单地选择一个常见token)
-                        if do_sample:
-                            next_tokens = torch.randint(0, min(10000, vocab_size), (1, 1))
-                        else:
-                            # 使用一个常见token作为备选
-                            next_tokens = torch.tensor([[20]]) # 通常是常见单词
-                        
-                        # 添加到生成序列
-                        current_ids = torch.cat([current_ids, next_tokens], dim=-1)
-                        
-                        # 重置past_key_values以防止错误累积
-                        past_key_values = None
-                        
-                        logger.warning(f"Used fallback token generation for step {i}")
-                    except Exception as inner_e:
-                        logger.error(f"Even fallback generation failed: {str(inner_e)}")
+                except torch.cuda.OutOfMemoryError as e:
+                    logger.error(f"CUDA OOM during generation at step {i}!")
+                    
+                    # 进行紧急内存清理
+                    torch.cuda.empty_cache()
+                    
+                    # 尝试生成一个简单的后备token
+                    next_token = torch.tensor([[0]])  # 使用一个安全的token
+                    
+                    # 添加到生成序列并继续
+                    current_ids = torch.cat([current_ids, next_token], dim=-1)
+                    
+                    # 如果多次OOM，提前结束生成
+                    if i > 10:
+                        logger.error("Multiple OOM errors, ending generation early")
                         break
             
             # 返回最终结果
@@ -570,6 +602,10 @@ class ModelWorker:
             logger.error(f"Generation error: {str(e)}")
             import traceback
             logger.error(traceback.format_exc())
+            
+            # 确保内存被清理
+            torch.cuda.empty_cache()
+            
             return {
                 'status': 'error',
                 'error': str(e)

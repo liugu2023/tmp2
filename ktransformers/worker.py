@@ -187,29 +187,8 @@ class ModelWorker:
         return response["status"] == "success"
     
     def load_model(self, model_path: str, gguf_path: str):
-        logger.info("Loading tokenizer...")
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        
-        # 获取模型配置
-        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-        num_layers = config.num_hidden_layers
-        
-        # 计算该worker负责的层范围
-        layers_per_worker = num_layers // self.num_workers
-        remainder = num_layers % self.num_workers
-        
-        if self.worker_id < remainder:
-            # 前remainder个worker多分配一层
-            start_layer = self.worker_id * (layers_per_worker + 1)
-            end_layer = start_layer + layers_per_worker + 1
-        else:
-            # 后面的worker正常分配
-            start_layer = self.worker_id * layers_per_worker + remainder
-            end_layer = start_layer + layers_per_worker
-        
-        self.my_layers = list(range(start_layer, end_layer))
-        
-        logger.info(f"Worker {self.worker_id} responsible for layers {self.my_layers}")
+        """加载模型并分配层"""
+        logger.info(f"Worker {self.worker_id} loading model from {model_path}")
         
         # 设置内存分配
         max_memory = {
@@ -218,109 +197,127 @@ class ModelWorker:
             'cpu': "138GiB"  # CPU 内存
         }
         
-        # 设置设备映射
-        device_map = {
-            'model.embed_tokens': 'cpu',
-            'model.norm': 'cpu',
-            'lm_head': 'cpu'
-        }
+        # 配置设备映射
+        # 我们将大多数层放在CPU上，只在需要计算时移动到GPU
+        device_map = "auto"
         
-        # 默认将所有层放在CPU上
-        for i in range(num_layers):
-            device_map[f'model.layers.{i}'] = 'cpu'
+        # 加载配置
+        logger.info(f"Loading model config...")
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         
-        logger.info(f"Loading model with device map strategy...")
+        # 获取模型总层数
+        if hasattr(config, 'num_hidden_layers'):
+            total_layers = config.num_hidden_layers
+        elif hasattr(config, 'n_layers'):
+            total_layers = config.n_layers
+        else:
+            total_layers = 32  # 默认值
         
-        model_kwargs = {
-            "device_map": device_map,
-            "max_memory": max_memory,
-            "torch_dtype": torch.float16,
-            "low_cpu_mem_usage": True  # 添加这个选项来减少内存使用
-        }
+        logger.info(f"Model has {total_layers} layers in total")
         
-        try:
-            # 使用自动设备映射
-            logger.info(f"Loading model from {model_path} with specified device map...")
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model_path,
-                trust_remote_code=True,
-                **model_kwargs
-            )
+        # 计算每个worker负责的层
+        layers_per_worker = total_layers // self.num_workers
+        start_layer = self.worker_id * layers_per_worker
+        end_layer = start_layer + layers_per_worker if self.worker_id < self.num_workers - 1 else total_layers
+        
+        self.my_layers = list(range(start_layer, end_layer))
+        logger.info(f"Worker {self.worker_id} is responsible for layers {self.my_layers}")
+        
+        # 加载模型
+        logger.info(f"Loading model to CPU first...")
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            config=config,
+            device_map="cpu",  # 先全部加载到CPU
+            torch_dtype=torch.float16,
+            low_cpu_mem_usage=True
+        )
+        
+        # 保存原始forward方法
+        self.original_forward = self.model.forward
+        
+        # 重写forward方法以实现分布式层处理
+        def distributed_forward(self, *args, **kwargs):
+            # 获取当前请求ID
+            request_id = kwargs.pop('request_id', str(uuid.uuid4()))
             
-            # 将不需要的层从内存中删除
-            keep_layers = set(self.my_layers)
-            for i in range(num_layers):
-                if i not in keep_layers:
-                    # 如果这一层不是由这个worker处理，释放其内存
-                    if hasattr(self.model.model.layers, str(i)):
-                        delattr(self.model.model.layers, str(i))
-                    else:
-                        self.model.model.layers[i] = None
-                elif hasattr(self.model.model.layers, str(i)):
-                    # 保留这个worker负责的层在CPU上
-                    layer = getattr(self.model.model.layers, str(i))
-                    # 当需要时移动到GPU
+            # 检查这是否是我们负责的层
+            layer_id = kwargs.pop('layer_id', None)
             
-            # 打印设备分配情况
-            for name, param in self.model.named_parameters():
-                device = param.device
-                if any(f'layers.{i}' in name for i in self.my_layers):
-                    logger.info(f"  {name}: {device}")
-            
-            logger.info(f"Model loading complete. Worker {self.worker_id} is responsible for layers {self.my_layers}")
-            
-        except Exception as e:
-            logger.error(f"Error loading model: {str(e)}")
-            raise
-        
-        self.model.eval()
-        
-        # 拦截前向传播方法进行分布式计算
-        original_forward = self.model.forward
-        
-        def distributed_forward(*args, **kwargs):
-            """支持分布式推理的前向传播"""
-            with torch.no_grad():
-                # 生成唯一的请求ID
-                request_id = str(uuid.uuid4())
-                self.current_requests[request_id] = True
+            if layer_id is not None and layer_id in self.my_layers:
+                # 这是我们负责的层，将其移动到GPU
+                layer = self.model.model.layers[layer_id]
+                self.memory_manager.move_to_gpu(layer)
                 
-                try:
-                    logger.info(f"Starting distributed forward pass for request {request_id}")
+                # 执行前向传播
+                result = layer(*args, **kwargs)
+                
+                # 将结果存储到KV缓存
+                if self.kvcache_socket:
+                    self.store_kv_cache(request_id, layer_id, result)
+                
+                # 完成后将层移回CPU
+                self.memory_manager.move_to_cpu(layer)
+                
+                return result
+            elif self.kvcache_socket:
+                # 不是我们负责的层，从KV缓存获取结果
+                return self.retrieve_kv_cache(request_id, layer_id)
+            else:
+                # 如果没有KV缓存服务器，执行正常的前向传播
+                return self.original_forward(*args, **kwargs)
+        
+        # 应用新的forward方法
+        self.model.forward = distributed_forward
+        
+        # 记录模型已加载
+        logger.info(f"Model loaded successfully by Worker {self.worker_id}")
+        logger.info(f"Worker {self.worker_id} is responsible for layers: {self.my_layers}")
+        
+        # 加载tokenizer
+        logger.info(f"Loading tokenizer...")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        logger.info(f"Tokenizer loaded successfully")
+        
+        self.setup_model_hooks()
+    
+    def setup_model_hooks(self):
+        """设置模型钩子，以便在推理过程中处理层交换"""
+        # 获取所有层
+        if hasattr(self.model, 'model') and hasattr(self.model.model, 'layers'):
+            layers = self.model.model.layers
+        else:
+            logger.warning("无法获取模型层，跳过钩子设置")
+            return
+        
+        # 为每一层添加前向传播钩子
+        for i, layer in enumerate(layers):
+            # 跳过不属于此worker的层
+            if i not in self.my_layers:
+                continue
+            
+            # 保存原始forward方法
+            original_forward = layer.forward
+            
+            # 创建新的forward方法
+            def make_forward_hook(layer_idx, orig_forward):
+                def hooked_forward(*args, **kwargs):
+                    # 在计算前将层移动到GPU
+                    self.memory_manager.move_to_gpu(layers[layer_idx])
                     
-                    # 将我负责的层移到GPU上
-                    for layer_idx in self.my_layers:
-                        if hasattr(self.model.model.layers, str(layer_idx)):
-                            layer = getattr(self.model.model.layers, str(layer_idx))
-                            self.memory_manager.move_to_gpu(layer)
-                        else:
-                            layer = self.model.model.layers[layer_idx]
-                            self.memory_manager.move_to_gpu(layer)
+                    # 执行原始forward
+                    result = orig_forward(*args, **kwargs)
                     
-                    # 正常调用原始forward方法
-                    result = original_forward(*args, **kwargs)
-                    
-                    # 完成后将层移回CPU
-                    for layer_idx in self.my_layers:
-                        if hasattr(self.model.model.layers, str(layer_idx)):
-                            layer = getattr(self.model.model.layers, str(layer_idx))
-                            self.memory_manager.move_to_cpu(layer)
-                        else:
-                            layer = self.model.model.layers[layer_idx]
-                            self.memory_manager.move_to_cpu(layer)
-                    
-                    # 清理
-                    torch.cuda.empty_cache()
+                    # 计算完成后将层移回CPU
+                    self.memory_manager.move_to_cpu(layers[layer_idx])
                     
                     return result
-                    
-                finally:
-                    # 清理请求记录
-                    if request_id in self.current_requests:
-                        del self.current_requests[request_id]
+                return hooked_forward
+            
+            # 应用新的forward方法
+            layer.forward = make_forward_hook(i, original_forward)
         
-        # 替换模型的forward方法
-        self.model.forward = distributed_forward
+        logger.info(f"设置了 {len(self.my_layers)} 个层的钩子函数")
     
     class CustomStreamer(TextStreamer):
         """自定义文本生成流式处理器"""
@@ -336,112 +333,59 @@ class ModelWorker:
                 self.generated_text += text
                 self.on_text_chunk(text, stream_end)
     
-    def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+    def generate(self, input_data):
+        """使用分布式层处理生成tokens"""
         try:
-            # 解析输入参数
-            input_ids = torch.tensor(input_data['input_ids'])
-            attention_mask = torch.tensor(input_data['attention_mask'])
-            max_new_tokens = input_data.get('max_new_tokens', 512)
+            # 提取输入数据
+            input_ids = torch.tensor(input_data.get('input_ids'))
+            attention_mask = torch.tensor(input_data.get('attention_mask'))
+            max_new_tokens = input_data.get('max_new_tokens', 50)
             temperature = input_data.get('temperature', 0.7)
             top_p = input_data.get('top_p', 0.9)
             
-            # 生成唯一的请求ID
+            # 创建一个唯一的请求ID
             request_id = str(uuid.uuid4())
-            self.current_requests[request_id] = True
+            self.current_requests[request_id] = {'start_time': time.time()}
             
-            # 移动输入到GPU
-            gpu_id = self.gpu_id
-            if gpu_id is not None:
-                input_ids = input_ids.to(f"cuda:{gpu_id}")
-                attention_mask = attention_mask.to(f"cuda:{gpu_id}")
+            # 记录输入数据大小
+            logger.info(f"Input shape: {input_ids.shape}")
             
-            # 流式生成处理器
-            class StreamingHandler:
-                def __init__(self, socket, tokenizer):
-                    self.socket = socket
-                    self.tokenizer = tokenizer
-                    self.current_text = ""
-                    self.last_send_time = time.time()
-                    
-                def __call__(self, text_chunk: str, stream_end: bool = False):
-                    current_time = time.time()
-                    self.current_text += text_chunk
-                    
-                    # 每0.5秒或结束时发送一次
-                    if stream_end or (current_time - self.last_send_time) > 0.5:
-                        self.socket.send_pyobj({
-                            'status': 'streaming',
-                            'text': self.current_text,
-                            'finished': stream_end
-                        })
-                        # 等待客户端确认
-                        self.socket.recv_pyobj()
-                        self.last_send_time = current_time
+            # 创建流式输出器
+            streamer = None
+            if input_data.get('stream', True):
+                streamer = self.create_streamer(request_id)
             
-            # 创建流式处理器
-            streamer = self.CustomStreamer(
-                self.tokenizer,
-                on_text_chunk=StreamingHandler(self.socket, self.tokenizer),
-                skip_prompt=True,
-                skip_special_tokens=True
-            )
-            
-            # 拦截原始forward方法进行KV缓存共享
+            # 保存原始forward方法
             original_forward = self.model.forward
             
-            def shared_kv_forward(*args, **kwargs):
-                """使用共享KV缓存的前向传播"""
-                with torch.no_grad():
-                    # 默认使用原始forward
-                    result = original_forward(*args, **kwargs)
-                    
-                    # 获取和存储KV缓存
-                    if hasattr(result, 'past_key_values') and result.past_key_values:
-                        past_key_values = result.past_key_values
-                        
-                        # 存储我负责的层的KV缓存
-                        for layer_idx in self.my_layers:
-                            if layer_idx < len(past_key_values):
-                                kv_cache = past_key_values[layer_idx]
-                                # 存储KV缓存
-                                self.store_kv_cache(request_id, layer_idx, kv_cache)
-                        
-                        # 替换其他层的KV缓存为从服务器获取的值
-                        new_past_key_values = list(past_key_values)
-                        for layer_idx in range(len(past_key_values)):
-                            if layer_idx not in self.my_layers:
-                                # 从服务器获取这一层的KV缓存
-                                remote_kv_cache = self.retrieve_kv_cache(request_id, layer_idx)
-                                if remote_kv_cache is not None:
-                                    new_past_key_values[layer_idx] = remote_kv_cache
-                        
-                        # 使用更新后的KV缓存
-                        result.past_key_values = tuple(new_past_key_values)
-                    
-                    return result
+            # 修改模型的forward方法以使用request_id
+            def forward_with_request_id(*args, **kwargs):
+                kwargs['request_id'] = request_id
+                return self.model.forward(*args, **kwargs)
             
-            # 如果有KV缓存服务器，使用共享KV缓存forward
-            if self.kvcache_socket:
-                self.model.forward = shared_kv_forward
+            # 应用修改后的forward方法
+            self.model.forward = forward_with_request_id
             
-            # 生成文本
-            logger.info("Starting text generation...")
+            # 记录开始时间
             start_time = time.time()
-            with torch.no_grad(), torch.amp.autocast('cuda'):
-                outputs = self.model.generate(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    max_new_tokens=max_new_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    do_sample=input_data.get('do_sample', True),
-                    streamer=streamer
-                )
+            
+            # 生成输出
+            logger.info(f"Starting generation with max_new_tokens={max_new_tokens}")
+            outputs = self.model.generate(
+                input_ids=input_ids.unsqueeze(0) if input_ids.dim() == 1 else input_ids,
+                attention_mask=attention_mask.unsqueeze(0) if attention_mask.dim() == 1 else attention_mask,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                do_sample=input_data.get('do_sample', True),
+                streamer=streamer
+            )
             
             # 恢复原始forward方法
+            self.model.forward = original_forward
+            
+            # 清理KV缓存
             if self.kvcache_socket:
-                self.model.forward = original_forward
-                # 清理KV缓存
                 self.clear_kv_cache(request_id)
             
             # 记录性能统计

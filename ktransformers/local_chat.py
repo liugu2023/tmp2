@@ -21,15 +21,15 @@ logger = logging.getLogger(__name__)
 
 # 只在非分布式模式下导入这些模块
 def import_local_modules():
-    from ktransformers.optimize.optimize import optimize_and_load_gguf
-    from ktransformers.models.modeling_deepseek import DeepseekV2ForCausalLM
-    from ktransformers.models.modeling_qwen2_moe import Qwen2MoeForCausalLM
-    from ktransformers.models.modeling_deepseek_v3 import DeepseekV3ForCausalLM
-    from ktransformers.models.modeling_llama import LlamaForCausalLM
-    from ktransformers.models.modeling_mixtral import MixtralForCausalLM
-    from ktransformers.util.utils import prefill_and_generate, get_compute_capability
-    from ktransformers.server.config.config import Config
-    from ktransformers.operators.flashinfer_wrapper import flashinfer_enabled
+from ktransformers.optimize.optimize import optimize_and_load_gguf
+from ktransformers.models.modeling_deepseek import DeepseekV2ForCausalLM
+from ktransformers.models.modeling_qwen2_moe import Qwen2MoeForCausalLM
+from ktransformers.models.modeling_deepseek_v3 import DeepseekV3ForCausalLM
+from ktransformers.models.modeling_llama import LlamaForCausalLM
+from ktransformers.models.modeling_mixtral import MixtralForCausalLM
+from ktransformers.util.utils import prefill_and_generate, get_compute_capability
+from ktransformers.server.config.config import Config
+from ktransformers.operators.flashinfer_wrapper import flashinfer_enabled
     return (optimize_and_load_gguf, DeepseekV2ForCausalLM, Qwen2MoeForCausalLM,
             DeepseekV3ForCausalLM, LlamaForCausalLM, MixtralForCausalLM,
             prefill_and_generate, get_compute_capability, Config, flashinfer_enabled)
@@ -168,7 +168,7 @@ class DistributedModel:
                 logger.info("Shutdown successful")
             self.socket.close()
             self.context.term()
-        except Exception as e:
+    except Exception as e:
             logger.error(f"Error during shutdown: {e}")
 
 def main():
@@ -212,14 +212,14 @@ def main():
                     model.shutdown()
                     break
                 elif content == "":
-                    content = "Please write a piece of quicksort code in C++."
-                elif os.path.isfile(content):
+                content = "Please write a piece of quicksort code in C++."
+        elif os.path.isfile(content):
                     logger.info(f"Reading from file: {content}")
                     with open(content, "r", encoding='utf-8') as f:
                         content = f.read()
-                
+            
                 logger.info("Creating chat messages...")
-                messages = [{"role": "user", "content": content}]
+        messages = [{"role": "user", "content": content}]
                 
                 logger.info("Starting chat...")
                 if args.scheduler_address:
@@ -234,9 +234,9 @@ def main():
                 else:
                     # 直接连接worker的原始方法
                     logger.info("Tokenizing input...")
-                    input_tensor = tokenizer.apply_chat_template(
-                        messages, add_generation_prompt=True, return_tensors="pt"
-                    )
+        input_tensor = tokenizer.apply_chat_template(
+            messages, add_generation_prompt=True, return_tensors="pt"
+        )
                     
                     logger.info("Starting generation...")
                     outputs = model.generate(

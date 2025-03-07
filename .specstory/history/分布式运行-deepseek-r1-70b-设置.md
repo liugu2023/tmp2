@@ -5588,7 +5588,1440 @@ _**User**_
 
 _**Assistant**_
 
+<think>
+让我理解一下当前系统架构和需求：
 
+1. 我们有三个组件：
+   - 计算节点 (10.21.22.206) - 运行 KV 缓存服务器和 Worker 进程
+   - 调度节点 (10.21.22.100) - 作为客户端和计算节点之间的桥梁
+   - 客户端 - 可以在内网任意设备上运行
+
+2. 现在需求是让调度器(100)负责预处理输入数据。
+
+这意味着我们需要将文本处理和tokenization的工作从客户端移到调度器上。这样，客户端只需要发送原始文本，调度器会将其转换为tokens并发送给计算节点。
+
+我需要修改：
+1. scheduler.py - 添加tokenization功能
+2. local_chat.py - 让客户端直接发送文本而非tokens
+
+这样的架构有几个好处：
+- 客户端变得更轻量
+- tokenization只需要在一个地方维护
+- 一致的模型处理流程
+</think>
+
+让我修改调度器来负责预处理输入数据：
+
+```python:ktransformers/scheduler.py
+"""
+任务调度服务器
+负责预处理输入数据并转发客户端请求到计算节点
+"""
+
+import zmq
+import logging
+import time
+import argparse
+import torch
+from typing import Dict, Any, List
+from transformers import AutoTokenizer
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class SchedulerServer:
+    def __init__(self, server_address: str, compute_address: str, model_path: str):
+        # 初始化ZMQ上下文
+        self.context = zmq.Context()
+        
+        # 设置面向客户端的套接字
+        self.client_socket = self.context.socket(zmq.REP)
+        self.client_socket.bind(f"tcp://{server_address}")
+        logger.info(f"Scheduler listening for clients at {server_address}")
+        
+        # 设置面向计算节点的套接字
+        self.compute_socket = self.context.socket(zmq.REQ)
+        self.compute_address = compute_address
+        self.compute_socket.connect(f"tcp://{compute_address}")
+        logger.info(f"Connected to compute node at {compute_address}")
+        
+        # 加载tokenizer
+        self.model_path = model_path
+        logger.info(f"Loading tokenizer from {model_path}")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        logger.info(f"Tokenizer loaded successfully")
+        
+        # 统计信息
+        self.stats = {
+            "total_requests": 0,
+            "start_time": time.time(),
+            "active_sessions": 0,
+            "total_tokens_processed": 0
+        }
+    
+    def run(self):
+        """运行调度器主循环"""
+        logger.info("Scheduler server ready to receive requests")
+        try:
+            while True:
+                # 接收来自客户端的请求
+                client_request = self.client_socket.recv_pyobj()
+                self.stats["total_requests"] += 1
+                
+                command = client_request.get("command")
+                logger.info(f"Received {command} request from client")
+                
+                if command == "shutdown":
+                    # 处理关闭命令
+                    self.client_socket.send_pyobj({"status": "shutdown"})
+                    break
+                elif command == "stats":
+                    # 返回统计信息
+                    response = self._get_stats()
+                    self.client_socket.send_pyobj(response)
+                elif command == "chat":
+                    # 预处理聊天输入并转发
+                    processed_request = self._preprocess_chat(client_request)
+                    self._forward_to_compute(processed_request)
+                else:
+                    # 转发所有其他命令到计算节点
+                    try:
+                        self._forward_to_compute(client_request)
+                    except Exception as e:
+                        logger.error(f"Error forwarding request: {str(e)}")
+                        self.client_socket.send_pyobj({
+                            "status": "error",
+                            "error": f"Scheduler error: {str(e)}"
+                        })
+        finally:
+            logger.info("Shutting down scheduler...")
+            self.client_socket.close()
+            self.compute_socket.close()
+            self.context.term()
+    
+    def _preprocess_chat(self, client_request: Dict[str, Any]) -> Dict[str, Any]:
+        """预处理聊天输入，将文本转换为token"""
+        messages = client_request.get("messages", [])
+        max_new_tokens = client_request.get("max_new_tokens", 512)
+        temperature = client_request.get("temperature", 0.7)
+        top_p = client_request.get("top_p", 0.9)
+        do_sample = client_request.get("do_sample", True)
+        
+        logger.info(f"Preprocessing chat input with {len(messages)} messages")
+        
+        # 使用tokenizer处理输入
+        input_tensor = self.tokenizer.apply_chat_template(
+            messages, add_generation_prompt=True, return_tensors="pt"
+        )
+        
+        # 创建注意力掩码
+        attention_mask = torch.ones_like(input_tensor)
+        
+        # 记录token数量
+        input_tokens = len(input_tensor[0])
+        self.stats["total_tokens_processed"] += input_tokens
+        
+        logger.info(f"Input processed: {input_tokens} tokens")
+        
+        # 创建计算节点请求
+        compute_request = {
+            "command": "generate",
+            "data": {
+                "input_ids": input_tensor.numpy().tolist(),
+                "attention_mask": attention_mask.numpy().tolist(),
+                "max_new_tokens": max_new_tokens,
+                "temperature": temperature,
+                "top_p": top_p,
+                "do_sample": do_sample
+            }
+        }
+        
+        return compute_request
+    
+    def _forward_to_compute(self, request: Dict[str, Any]):
+        """转发请求到计算节点并处理响应"""
+        try:
+            # 将请求转发到计算节点
+            self.compute_socket.send_pyobj(request)
+            
+            # 如果是generate命令，则处理流式响应
+            if request.get("command") == "generate":
+                self._handle_streaming_response()
+            else:
+                # 普通命令直接转发响应
+                compute_response = self.compute_socket.recv_pyobj()
+                self.client_socket.send_pyobj(compute_response)
+        except Exception as e:
+            logger.error(f"Error in forward_to_compute: {str(e)}")
+            self.client_socket.send_pyobj({
+                "status": "error",
+                "error": f"Scheduler error: {str(e)}"
+            })
+    
+    def _handle_streaming_response(self):
+        """处理来自计算节点的流式响应"""
+        # 接收来自计算节点的流式响应并转发给客户端
+        while True:
+            compute_response = self.compute_socket.recv_pyobj()
+            
+            # 转发响应给客户端
+            self.client_socket.send_pyobj(compute_response)
+            
+            # 如果是最终响应，退出循环
+            if compute_response.get('status') == 'success':
+                break
+            
+            # 如果是流式响应，等待客户端确认
+            if compute_response.get('status') == 'streaming':
+                client_ack = self.client_socket.recv_pyobj()
+                self.compute_socket.send_pyobj(client_ack)
+    
+    def _get_stats(self) -> Dict[str, Any]:
+        """获取调度器统计信息"""
+        current_time = time.time()
+        uptime = current_time - self.stats["start_time"]
+        
+        return {
+            "status": "success",
+            "total_requests": self.stats["total_requests"],
+            "uptime": uptime,
+            "active_sessions": self.stats["active_sessions"],
+            "total_tokens_processed": self.stats["total_tokens_processed"],
+            "compute_node": self.compute_address,
+            "model_path": self.model_path
+        }
+
+def main():
+    parser = argparse.ArgumentParser(description="KTransformers Scheduler Server")
+    parser.add_argument('--server_address', type=str, default="0.0.0.0:29400",
+                        help='Address to listen for client connections')
+    parser.add_argument('--compute_address', type=str, default="10.21.22.206:29500",
+                        help='Address of compute node worker')
+    parser.add_argument('--model_path', type=str, required=True,
+                        help='Path to the model for tokenization')
+    args = parser.parse_args()
+    
+    server = SchedulerServer(args.server_address, args.compute_address, args.model_path)
+    server.run()
+
+if __name__ == "__main__":
+    main()
+```
+
+
+现在修改 local_chat.py 来直接发送聊天消息而不是预处理过的 tokens：
+
+```python:ktransformers/local_chat.py
+"""
+Description  :  
+Author       : Boxin Zhang, Azure-Tang
+Version      : 0.1.0
+Copyright (c) 2024 by KVCache.AI, All Rights Reserved. 
+"""
+
+import os
+import platform
+import sys
+import zmq
+import argparse
+import logging
+import locale
+import torch
+from transformers import AutoTokenizer
+import time
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# 只在非分布式模式下导入这些模块
+def import_local_modules():
+    from ktransformers.optimize.optimize import optimize_and_load_gguf
+    from ktransformers.models.modeling_deepseek import DeepseekV2ForCausalLM
+    from ktransformers.models.modeling_qwen2_moe import Qwen2MoeForCausalLM
+    from ktransformers.models.modeling_deepseek_v3 import DeepseekV3ForCausalLM
+    from ktransformers.models.modeling_llama import LlamaForCausalLM
+    from ktransformers.models.modeling_mixtral import MixtralForCausalLM
+    from ktransformers.util.utils import prefill_and_generate, get_compute_capability
+    from ktransformers.server.config.config import Config
+    from ktransformers.operators.flashinfer_wrapper import flashinfer_enabled
+    return (optimize_and_load_gguf, DeepseekV2ForCausalLM, Qwen2MoeForCausalLM,
+            DeepseekV3ForCausalLM, LlamaForCausalLM, MixtralForCausalLM,
+            prefill_and_generate, get_compute_capability, Config, flashinfer_enabled)
+
+class DistributedModel:
+    def __init__(self, worker_address: str = None, scheduler_address: str = None):
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.REQ)
+        
+        if scheduler_address:
+            # 连接到调度器
+            self.socket.connect(f"tcp://{scheduler_address}")
+            logger.info(f"Connected to scheduler at {scheduler_address}")
+            self.use_scheduler = True
+        elif worker_address:
+            # 直接连接到worker
+            self.socket.connect(f"tcp://{worker_address}")
+            logger.info(f"Connected to worker at {worker_address}")
+            self.use_scheduler = False
+        else:
+            raise ValueError("Must provide either worker_address or scheduler_address")
+
+    def load_model(self, model_path: str, gguf_path: str):
+        message = {
+            'command': 'load_model',
+            'model_path': model_path,
+            'gguf_path': gguf_path
+        }
+        logger.info("Requesting model load...")
+        self.socket.send_pyobj(message)
+        response = self.socket.recv_pyobj()
+        if response['status'] != 'success':
+            raise Exception(f"Failed to load model: {response.get('error')}")
+        logger.info("Model loaded successfully")
+
+    def generate_from_messages(self, messages, **kwargs):
+        """使用聊天消息直接生成文本，由调度器处理tokenization"""
+        try:
+            if not self.use_scheduler:
+                raise ValueError("This method requires a scheduler connection")
+                
+            logger.info("Preparing chat request...")
+            message = {
+                'command': 'chat',
+                'messages': messages,
+                **kwargs
+            }
+            
+            logger.info("Sending chat request to scheduler...")
+            self.socket.send_pyobj(message)
+            
+            # 接收流式响应
+            full_text = ""
+            while True:
+                response = self.socket.recv_pyobj()
+                
+                if response['status'] == 'error':
+                    raise Exception(f"Generation failed: {response.get('error')}")
+                
+                if response['status'] == 'streaming':
+                    # 打印新生成的文本部分
+                    new_text = response['text'][len(full_text):]
+                    if new_text:
+                        print(new_text, end='', flush=True)
+                    full_text = response['text']
+                    
+                    # 发送确认
+                    self.socket.send_pyobj({'status': 'received'})
+                    
+                    # 如果生成结束，退出循环
+                    if response.get('finished', False):
+                        print()  # 换行
+                
+                elif response['status'] == 'success':
+                    # 最终的完整响应
+                    return response['output_ids']
+        
+        except Exception as e:
+            logger.error(f"Error in generate_from_messages: {str(e)}")
+            raise
+
+    def generate(self, input_ids, attention_mask, **kwargs):
+        """原始的generate方法，用于与worker直接通信"""
+        try:
+            logger.info("Preparing generation request...")
+            message = {
+                'command': 'generate',
+                'data': {
+                    'input_ids': input_ids.cpu().numpy().tolist(),
+                    'attention_mask': attention_mask.cpu().numpy().tolist(),
+                    **kwargs
+                }
+            }
+            
+            logger.info("Starting generation...")
+            self.socket.send_pyobj(message)
+            
+            # 接收流式响应
+            full_text = ""
+            while True:
+                response = self.socket.recv_pyobj()
+                
+                if response['status'] == 'error':
+                    raise Exception(f"Generation failed: {response.get('error')}")
+                
+                if response['status'] == 'streaming':
+                    # 打印新生成的文本部分
+                    new_text = response['text'][len(full_text):]
+                    if new_text:
+                        print(new_text, end='', flush=True)
+                    full_text = response['text']
+                    
+                    # 发送确认
+                    self.socket.send_pyobj({'status': 'received'})
+                    
+                    # 如果生成结束，退出循环
+                    if response.get('finished', False):
+                        print()  # 换行
+                
+                elif response['status'] == 'success':
+                    # 最终的完整响应
+                    return torch.tensor(response['output_ids'])
+        
+        except Exception as e:
+            logger.error(f"Error in generate: {str(e)}")
+            raise
+
+    def shutdown(self):
+        """发送关闭命令"""
+        try:
+            logger.info("Sending shutdown command...")
+            message = {'command': 'shutdown'}
+            self.socket.send_pyobj(message)
+            response = self.socket.recv_pyobj()
+            if response['status'] == 'shutdown':
+                logger.info("Shutdown successful")
+            self.socket.close()
+            self.context.term()
+        except Exception as e:
+            logger.error(f"Error during shutdown: {e}")
+
+def main():
+    # 设置终端编码
+    if sys.platform.startswith('win'):
+        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stdin.reconfigure(encoding='utf-8')
+    else:
+        default_encoding = locale.getpreferredencoding()
+        sys.stdout = open(sys.stdout.fileno(), mode='w', encoding='utf-8', buffering=1)
+        sys.stdin = open(sys.stdin.fileno(), mode='r', encoding=default_encoding, buffering=1)
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--model_path', type=str, required=True)
+    parser.add_argument('--gguf_path', type=str, required=True)
+    parser.add_argument('--worker_address', type=str, default=None,
+                      help='Address of worker for distributed mode (e.g., "10.21.22.206:29500")')
+    parser.add_argument('--scheduler_address', type=str, default=None,
+                      help='Address of scheduler for distributed mode (e.g., "10.21.22.100:29400")')
+    parser.add_argument('--max_new_tokens', type=int, default=300)
+    parser.add_argument('--temperature', type=float, default=0.7)
+    parser.add_argument('--top_p', type=float, default=0.9)
+    args = parser.parse_args()
+
+    if args.scheduler_address or args.worker_address:
+        # 分布式模式
+        logger.info("Running in distributed mode")
+        model = DistributedModel(args.worker_address, args.scheduler_address)
+        model.load_model(args.model_path, args.gguf_path)
+        
+        # 当使用调度器时，无需在客户端加载tokenizer
+        tokenizer = None
+        if args.worker_address and not args.scheduler_address:
+            tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+        
+        try:
+            while True:
+                content = input("Chat: ")
+                if content.lower() in ['quit', 'exit']:
+                    logger.info("Shutting down...")
+                    model.shutdown()
+                    break
+                elif content == "":
+                    content = "Please write a piece of quicksort code in C++."
+                elif os.path.isfile(content):
+                    logger.info(f"Reading from file: {content}")
+                    with open(content, "r", encoding='utf-8') as f:
+                        content = f.read()
+                
+                logger.info("Creating chat messages...")
+                messages = [{"role": "user", "content": content}]
+                
+                logger.info("Starting chat...")
+                if args.scheduler_address:
+                    # 使用调度器进行预处理的方法
+                    outputs = model.generate_from_messages(
+                        messages,
+                        max_new_tokens=args.max_new_tokens,
+                        temperature=args.temperature,
+                        top_p=args.top_p,
+                        do_sample=True
+                    )
+                else:
+                    # 直接连接worker的原始方法
+                    logger.info("Tokenizing input...")
+                    input_tensor = tokenizer.apply_chat_template(
+                        messages, add_generation_prompt=True, return_tensors="pt"
+                    )
+                    
+                    logger.info("Starting generation...")
+                    outputs = model.generate(
+                        input_tensor,
+                        torch.ones_like(input_tensor),
+                        max_new_tokens=args.max_new_tokens,
+                        temperature=args.temperature,
+                        top_p=args.top_p,
+                        do_sample=True
+                    )
+                
+                if outputs is not None:
+                    logger.info("Generation completed successfully")
+                else:
+                    logger.warning("No output tokens received")
+                
+        except KeyboardInterrupt:
+            logger.info("Received keyboard interrupt, shutting down...")
+            model.shutdown()
+        except Exception as e:
+            logger.error(f"Error: {str(e)}")
+            model.shutdown()
+
+    else:
+        # 本地模式，动态导入所需模块
+        (optimize_and_load_gguf, DeepseekV2ForCausalLM, Qwen2MoeForCausalLM,
+         DeepseekV3ForCausalLM, LlamaForCausalLM, MixtralForCausalLM,
+         prefill_and_generate, get_compute_capability, Config, flashinfer_enabled) = import_local_modules()
+        
+        # 本地模式的代码...
+        raise NotImplementedError("Local mode is not implemented in this version")
+
+if __name__ == "__main__":
+    main()
+```
+
+
+最后，修改 start.sh 以支持新的参数：
+
+```diff:start.sh
+# 启动调度节点上的服务
+start_scheduler_services() {
+    echo "在调度节点上启动服务..."
+    
+    # 启动调度器
+    echo "启动任务调度器..."
+-    PYTHONPATH=$PYTHONPATH python -m ktransformers.scheduler --server_address ${SCHEDULER_IP}:29400 --compute_address ${COMPUTE_IP}:29500 > scheduler.log 2>&1 &
++    PYTHONPATH=$PYTHONPATH python -m ktransformers.scheduler \
++        --server_address ${SCHEDULER_IP}:29400 \
++        --compute_address ${COMPUTE_IP}:29500 \
++        --model_path $MODEL_PATH > scheduler.log 2>&1 &
+    
+    echo "调度服务已启动"
+    echo "调度器日志: scheduler.log"
+}
+```
+
+
+使用这个架构：
+
+1. 客户端变得更轻量化，只需发送原始聊天消息
+2. 调度器负责:
+   - tokenization处理
+   - 将处理好的token发送到计算节点
+   - 将计算节点的结果转发回客户端
+3. 计算节点只负责推理计算
+
+这样的分工明确，架构清晰，可以在内网的任何10.21.22.*设备上运行客户端。
+
+---
+
+_**User**_
+
+将模型分层处理，，每个进程各存储10层，这样一共八十层，就不用放到显存上了，等到计算时，需要哪层就往显存上移动那层
+
+---
+
+_**Assistant**_
+
+<think>
+好的，需要修改worker.py来实现每个进程只加载和管理部分模型层，需要时才将层放到GPU上。假设有70B模型，可能有80层左右，需要分布到8个进程。
+
+我们将改进Worker的实现:
+1. 每个worker加载特定的10层左右
+2. 所有worker都与KVCache Server通信
+3. 当需要计算某层时，将该层从CPU移到GPU
+4. 完成计算后再将层移回CPU
+5. 实现动态层交换机制
+
+这样可以大大减少GPU内存使用。
+</think>
+
+下面我来修改worker.py，实现分层计算并动态管理GPU显存：
+
+```python:ktransformers/worker.py
+import os
+import torch
+import zmq
+import pickle
+from typing import Dict, Any, List, Optional, Tuple
+import logging
+from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM, GenerationConfig, TextStreamer
+import time
+import subprocess
+import multiprocessing
+import uuid
+import torch.nn.functional as F
+import gc
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+def get_numa_nodes():
+    """获取 NUMA 节点信息"""
+    try:
+        output = subprocess.check_output(['numactl', '--hardware']).decode()
+        nodes = []
+        for line in output.split('\n'):
+            if line.startswith('node ') and 'cpus:' in line:
+                node_id = int(line.split()[1])
+                nodes.append(node_id)
+        return nodes
+    except Exception as e:
+        logger.error(f"Error getting NUMA nodes: {e}")
+        return [0]  # 默认返回节点0
+
+class LayerMemoryManager:
+    """处理模型层的动态GPU内存管理"""
+    
+    def __init__(self, gpu_id: int, max_gpu_memory: str = "3GiB"):
+        self.gpu_id = gpu_id
+        self.max_gpu_memory = max_gpu_memory
+        self.current_layers_on_gpu = set()
+        self.device = f"cuda:{gpu_id}"
+        
+    def move_to_gpu(self, layer):
+        """将层移动到GPU"""
+        # 确保有足够的显存
+        self._ensure_memory_available()
+        
+        # 检查层是否已在GPU上
+        if id(layer) in self.current_layers_on_gpu:
+            return
+        
+        # 将层移动到GPU
+        layer_device = next(layer.parameters()).device
+        if str(layer_device) != self.device:
+            layer.to(self.device)
+            self.current_layers_on_gpu.add(id(layer))
+            logger.debug(f"Moved layer to GPU {self.gpu_id}, current layers on GPU: {len(self.current_layers_on_gpu)}")
+    
+    def move_to_cpu(self, layer):
+        """将层移回CPU"""
+        layer_device = next(layer.parameters()).device
+        if str(layer_device) == self.device:
+            layer.to("cpu")
+            self.current_layers_on_gpu.discard(id(layer))
+            logger.debug(f"Moved layer to CPU, current layers on GPU: {len(self.current_layers_on_gpu)}")
+    
+    def _ensure_memory_available(self):
+        """确保有足够的GPU内存可用，必要时释放内存"""
+        # 当前GPU使用的显存
+        current_memory = torch.cuda.memory_allocated(self.gpu_id) / (1024**3)  # 转换为GB
+        max_memory = float(self.max_gpu_memory.replace("GiB", ""))
+        
+        # 如果使用超过80%的最大显存，则清理一些层
+        if current_memory > max_memory * 0.8:
+            logger.info(f"GPU {self.gpu_id} memory usage high ({current_memory:.2f}GB/{max_memory}GB), clearing cache")
+            torch.cuda.empty_cache()
+            gc.collect()
+
+class ModelWorker:
+    def __init__(self, address: str, worker_id: int = 0, num_workers: int = 1, kvcache_address: str = None):
+        self.worker_id = worker_id
+        self.num_workers = num_workers
+        self.kvcache_address = kvcache_address
+        
+        # 如果提供了KV Cache服务器地址，则连接
+        if self.kvcache_address:
+            self.kvcache_context = zmq.Context()
+            self.kvcache_socket = self.kvcache_context.socket(zmq.REQ)
+            self.kvcache_socket.connect(f"tcp://{kvcache_address}")
+            logger.info(f"Worker {worker_id} connected to KV Cache Server at {kvcache_address}")
+        else:
+            self.kvcache_socket = None
+            logger.info(f"Worker {worker_id} running without KV Cache Server")
+        
+        # 设置 GPU 设备
+        if torch.cuda.is_available():
+            # 根据 worker_id 分配 GPU
+            self.gpu_id = 0 if worker_id < 4 else 1
+            torch.cuda.set_device(self.gpu_id)
+            logger.info(f"Worker {worker_id} using GPU {self.gpu_id}")
+            
+            # 创建内存管理器
+            self.memory_manager = LayerMemoryManager(self.gpu_id, "3GiB")
+        else:
+            self.gpu_id = None
+            logger.warning("CUDA not available, using CPU only.")
+        
+        # 设置 ZMQ 服务器
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.REP)
+        host, port = address.split(':')
+        self.socket.bind(f"tcp://0.0.0.0:{port}")
+        self.socket.setsockopt(zmq.RCVHWM, 0)
+        self.socket.setsockopt(zmq.SNDHWM, 0)
+        
+        self.model = None
+        self.tokenizer = None
+        self.current_requests = {}  # 跟踪当前处理的请求
+        
+        # 记录层分配
+        self.my_layers = []  # 由这个worker负责的层
+        
+        logger.info(f"Worker {worker_id} started at {address}, listening on all interfaces")
+    
+    def store_kv_cache(self, request_id: str, layer_id: int, kv_tensor: torch.Tensor) -> bool:
+        """将KV缓存存储到中央服务器"""
+        if not self.kvcache_socket:
+            return False
+        
+        # 将张量转换为numpy数组以便序列化
+        kv_tensor_numpy = kv_tensor.cpu().numpy()
+        
+        # 发送存储请求
+        request = {
+            "command": "store",
+            "request_id": request_id,
+            "worker_id": self.worker_id,
+            "layer_id": layer_id,
+            "kv_tensor": kv_tensor_numpy,
+            "data_size": kv_tensor_numpy.nbytes
+        }
+        
+        self.kvcache_socket.send_pyobj(request)
+        response = self.kvcache_socket.recv_pyobj()
+        
+        return response["status"] == "success"
+    
+    def retrieve_kv_cache(self, request_id: str, layer_id: int) -> Optional[torch.Tensor]:
+        """从中央服务器检索KV缓存"""
+        if not self.kvcache_socket:
+            return None
+        
+        # 发送检索请求
+        request = {
+            "command": "retrieve",
+            "request_id": request_id,
+            "worker_id": self.worker_id,
+            "layer_id": layer_id
+        }
+        
+        self.kvcache_socket.send_pyobj(request)
+        response = self.kvcache_socket.recv_pyobj()
+        
+        if response["status"] != "success":
+            return None
+        
+        # 将numpy数组转换回张量
+        kv_tensor = torch.from_numpy(response["kv_tensor"])
+        if self.gpu_id is not None:
+            # 放到对应的GPU上
+            kv_tensor = kv_tensor.to(f"cuda:{self.gpu_id}")
+        
+        return kv_tensor
+    
+    def clear_kv_cache(self, request_id: str) -> bool:
+        """清除KV缓存"""
+        if not self.kvcache_socket:
+            return False
+        
+        # 发送清除请求
+        request = {
+            "command": "clear",
+            "request_id": request_id
+        }
+        
+        self.kvcache_socket.send_pyobj(request)
+        response = self.kvcache_socket.recv_pyobj()
+        
+        return response["status"] == "success"
+    
+    def load_model(self, model_path: str, gguf_path: str):
+        logger.info("Loading tokenizer...")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        
+        # 获取模型配置
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        num_layers = config.num_hidden_layers
+        
+        # 计算该worker负责的层范围
+        layers_per_worker = num_layers // self.num_workers
+        remainder = num_layers % self.num_workers
+        
+        if self.worker_id < remainder:
+            # 前remainder个worker多分配一层
+            start_layer = self.worker_id * (layers_per_worker + 1)
+            end_layer = start_layer + layers_per_worker + 1
+        else:
+            # 后面的worker正常分配
+            start_layer = self.worker_id * layers_per_worker + remainder
+            end_layer = start_layer + layers_per_worker
+        
+        self.my_layers = list(range(start_layer, end_layer))
+        
+        logger.info(f"Worker {self.worker_id} responsible for layers {self.my_layers}")
+        
+        # 设置内存分配
+        max_memory = {
+            0: "3GiB" if self.worker_id < 4 else None,    # 前4个进程使用 GPU 0，每个3GB
+            1: "3GiB" if self.worker_id >= 4 else None,   # 后4个进程使用 GPU 1，每个3GB
+            'cpu': "138GiB"  # CPU 内存
+        }
+        
+        # 设置设备映射
+        device_map = {
+            'model.embed_tokens': 'cpu',
+            'model.norm': 'cpu',
+            'lm_head': 'cpu'
+        }
+        
+        # 默认将所有层放在CPU上
+        for i in range(num_layers):
+            device_map[f'model.layers.{i}'] = 'cpu'
+        
+        logger.info(f"Loading model with device map strategy...")
+        
+        model_kwargs = {
+            "device_map": device_map,
+            "max_memory": max_memory,
+            "torch_dtype": torch.float16,
+            "low_cpu_mem_usage": True  # 添加这个选项来减少内存使用
+        }
+        
+        try:
+            # 使用自动设备映射
+            logger.info(f"Loading model from {model_path} with specified device map...")
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                trust_remote_code=True,
+                **model_kwargs
+            )
+            
+            # 将不需要的层从内存中删除
+            keep_layers = set(self.my_layers)
+            for i in range(num_layers):
+                if i not in keep_layers:
+                    # 如果这一层不是由这个worker处理，释放其内存
+                    if hasattr(self.model.model.layers, str(i)):
+                        delattr(self.model.model.layers, str(i))
+                    else:
+                        self.model.model.layers[i] = None
+                elif hasattr(self.model.model.layers, str(i)):
+                    # 保留这个worker负责的层在CPU上
+                    layer = getattr(self.model.model.layers, str(i))
+                    # 当需要时移动到GPU
+            
+            # 打印设备分配情况
+            for name, param in self.model.named_parameters():
+                device = param.device
+                if any(f'layers.{i}' in name for i in self.my_layers):
+                    logger.info(f"  {name}: {device}")
+            
+            logger.info(f"Model loading complete. Worker {self.worker_id} is responsible for layers {self.my_layers}")
+            
+        except Exception as e:
+            logger.error(f"Error loading model: {str(e)}")
+            raise
+        
+        self.model.eval()
+        
+        # 拦截前向传播方法进行分布式计算
+        original_forward = self.model.forward
+        
+        def distributed_forward(*args, **kwargs):
+            """支持分布式推理的前向传播"""
+            with torch.no_grad():
+                # 生成唯一的请求ID
+                request_id = str(uuid.uuid4())
+                self.current_requests[request_id] = True
+                
+                try:
+                    logger.info(f"Starting distributed forward pass for request {request_id}")
+                    
+                    # 将我负责的层移到GPU上
+                    for layer_idx in self.my_layers:
+                        if hasattr(self.model.model.layers, str(layer_idx)):
+                            layer = getattr(self.model.model.layers, str(layer_idx))
+                            self.memory_manager.move_to_gpu(layer)
+                        else:
+                            layer = self.model.model.layers[layer_idx]
+                            self.memory_manager.move_to_gpu(layer)
+                    
+                    # 正常调用原始forward方法
+                    result = original_forward(*args, **kwargs)
+                    
+                    # 完成后将层移回CPU
+                    for layer_idx in self.my_layers:
+                        if hasattr(self.model.model.layers, str(layer_idx)):
+                            layer = getattr(self.model.model.layers, str(layer_idx))
+                            self.memory_manager.move_to_cpu(layer)
+                        else:
+                            layer = self.model.model.layers[layer_idx]
+                            self.memory_manager.move_to_cpu(layer)
+                    
+                    # 清理
+                    torch.cuda.empty_cache()
+                    
+                    return result
+                    
+                finally:
+                    # 清理请求记录
+                    if request_id in self.current_requests:
+                        del self.current_requests[request_id]
+        
+        # 替换模型的forward方法
+        self.model.forward = distributed_forward
+    
+    class CustomStreamer(TextStreamer):
+        """自定义文本生成流式处理器"""
+        
+        def __init__(self, tokenizer, on_text_chunk, **kwargs):
+            super().__init__(tokenizer, **kwargs)
+            self.on_text_chunk = on_text_chunk
+            self.generated_text = ""
+        
+        def on_finalized_text(self, text: str, stream_end: bool = False):
+            # 这里不进行标准输出
+            if text:
+                self.generated_text += text
+                self.on_text_chunk(text, stream_end)
+    
+    def generate(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            # 解析输入参数
+            input_ids = torch.tensor(input_data['input_ids'])
+            attention_mask = torch.tensor(input_data['attention_mask'])
+            max_new_tokens = input_data.get('max_new_tokens', 512)
+            temperature = input_data.get('temperature', 0.7)
+            top_p = input_data.get('top_p', 0.9)
+            
+            # 生成唯一的请求ID
+            request_id = str(uuid.uuid4())
+            self.current_requests[request_id] = True
+            
+            # 移动输入到GPU
+            gpu_id = self.gpu_id
+            if gpu_id is not None:
+                input_ids = input_ids.to(f"cuda:{gpu_id}")
+                attention_mask = attention_mask.to(f"cuda:{gpu_id}")
+            
+            # 流式生成处理器
+            class StreamingHandler:
+                def __init__(self, socket, tokenizer):
+                    self.socket = socket
+                    self.tokenizer = tokenizer
+                    self.current_text = ""
+                    self.last_send_time = time.time()
+                    
+                def __call__(self, text_chunk: str, stream_end: bool = False):
+                    current_time = time.time()
+                    self.current_text += text_chunk
+                    
+                    # 每0.5秒或结束时发送一次
+                    if stream_end or (current_time - self.last_send_time) > 0.5:
+                        self.socket.send_pyobj({
+                            'status': 'streaming',
+                            'text': self.current_text,
+                            'finished': stream_end
+                        })
+                        # 等待客户端确认
+                        self.socket.recv_pyobj()
+                        self.last_send_time = current_time
+            
+            # 创建流式处理器
+            streamer = self.CustomStreamer(
+                self.tokenizer,
+                on_text_chunk=StreamingHandler(self.socket, self.tokenizer),
+                skip_prompt=True,
+                skip_special_tokens=True
+            )
+            
+            # 拦截原始forward方法进行KV缓存共享
+            original_forward = self.model.forward
+            
+            def shared_kv_forward(*args, **kwargs):
+                """使用共享KV缓存的前向传播"""
+                with torch.no_grad():
+                    # 默认使用原始forward
+                    result = original_forward(*args, **kwargs)
+                    
+                    # 获取和存储KV缓存
+                    if hasattr(result, 'past_key_values') and result.past_key_values:
+                        past_key_values = result.past_key_values
+                        
+                        # 存储我负责的层的KV缓存
+                        for layer_idx in self.my_layers:
+                            if layer_idx < len(past_key_values):
+                                kv_cache = past_key_values[layer_idx]
+                                # 存储KV缓存
+                                self.store_kv_cache(request_id, layer_idx, kv_cache)
+                        
+                        # 替换其他层的KV缓存为从服务器获取的值
+                        new_past_key_values = list(past_key_values)
+                        for layer_idx in range(len(past_key_values)):
+                            if layer_idx not in self.my_layers:
+                                # 从服务器获取这一层的KV缓存
+                                remote_kv_cache = self.retrieve_kv_cache(request_id, layer_idx)
+                                if remote_kv_cache is not None:
+                                    new_past_key_values[layer_idx] = remote_kv_cache
+                        
+                        # 使用更新后的KV缓存
+                        result.past_key_values = tuple(new_past_key_values)
+                    
+                    return result
+            
+            # 如果有KV缓存服务器，使用共享KV缓存forward
+            if self.kvcache_socket:
+                self.model.forward = shared_kv_forward
+            
+            # 生成文本
+            logger.info("Starting text generation...")
+            start_time = time.time()
+            with torch.no_grad(), torch.amp.autocast('cuda'):
+                outputs = self.model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    do_sample=input_data.get('do_sample', True),
+                    streamer=streamer
+                )
+            
+            # 恢复原始forward方法
+            if self.kvcache_socket:
+                self.model.forward = original_forward
+                # 清理KV缓存
+                self.clear_kv_cache(request_id)
+            
+            # 记录性能统计
+            end_time = time.time()
+            generation_time = end_time - start_time
+            tokens_generated = len(outputs[0]) - len(input_ids[0])
+            
+            logger.info("Generation statistics:")
+            logger.info(f"- Total time: {generation_time:.2f} seconds")
+            logger.info(f"- Tokens generated: {tokens_generated}")
+            logger.info(f"- Speed: {tokens_generated/generation_time:.2f} tokens/sec")
+            
+            # 清理当前请求记录
+            if request_id in self.current_requests:
+                del self.current_requests[request_id]
+            
+            # 最终返回完整的 token ids
+            return {
+                'status': 'success',
+                'output_ids': outputs.cpu().numpy().tolist()
+            }
+        except Exception as e:
+            logger.error(f"Generation error: {str(e)}")
+            return {
+                'status': 'error',
+                'error': str(e)
+            }
+
+    def run(self):
+        logger.info("Worker ready to receive requests")
+        try:
+            while True:
+                try:
+                    message = self.socket.recv_pyobj()
+                    command = message.get('command')
+                    
+                    if command == 'load_model':
+                        self.load_model(message['model_path'], message['gguf_path'])
+                        self.socket.send_pyobj({'status': 'success'})
+                    
+                    elif command == 'generate':
+                        result = self.generate(message['data'])
+                        self.socket.send_pyobj(result)
+                    
+                    elif command == 'shutdown':
+                        logger.info("Received shutdown command")
+                        self.socket.send_pyobj({'status': 'shutdown'})
+                        # 清理资源
+                        if hasattr(self, 'model'):
+                            del self.model
+                        if hasattr(self, 'tokenizer'):
+                            del self.tokenizer
+                        torch.cuda.empty_cache()
+                        logger.info("Resources cleaned up")
+                        break
+                    
+                except Exception as e:
+                    logger.error(f"Error processing message: {str(e)}")
+                    self.socket.send_pyobj({'status': 'error', 'error': str(e)})
+        finally:
+            # 确保资源被清理
+            logger.info("Cleaning up worker resources...")
+            self.socket.close()
+            self.context.term()
+            if hasattr(self, 'kvcache_socket') and self.kvcache_socket:
+                self.kvcache_socket.close()
+                self.kvcache_context.term()
+            logger.info("Worker shutdown complete")
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--base_port', type=int, default=29500)
+    parser.add_argument('--num_workers', type=int, default=8)
+    parser.add_argument('--worker_address', type=str, required=False)
+    parser.add_argument('--worker_id', type=int, default=0)
+    parser.add_argument('--kvcache_address', type=str, default=None,
+                        help='Address of KV Cache Server (e.g., "10.21.22.206:29600")')
+    args = parser.parse_args()
+    
+    if args.worker_address:
+        # 单个 worker 进程模式
+        worker = ModelWorker(args.worker_address, args.worker_id, args.num_workers, args.kvcache_address)
+        worker.run()
+    else:
+        # 主进程模式，启动多个 worker
+        for worker_id in range(args.num_workers):
+            start_worker_process(worker_id, args.base_port, args.num_workers, args.kvcache_address)
+        
+        # 等待所有进程
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            logger.info("Shutting down all workers...")
+
+def start_worker_process(worker_id: int, base_port: int, num_workers: int, kvcache_address: str = None):
+    """启动单个 worker 进程"""
+    # 计算 NUMA 节点
+    numa_nodes = get_numa_nodes()
+    node_id = 0 if worker_id < 4 else 1  # 前4个进程在节点0，后4个在节点1
+    
+    # 计算端口
+    port = base_port + worker_id
+    
+    # 使用 numactl 启动进程
+    cmd = [
+        'numactl',
+        f'--cpunodebind={node_id}',
+        f'--membind={node_id}',
+        'python',
+        '-m',
+        'ktransformers.worker',
+        f'--worker_address=10.21.22.206:{port}',
+        f'--worker_id={worker_id}',
+        f'--num_workers={num_workers}'
+    ]
+    
+    # 添加KV缓存服务器地址（如果有）
+    if kvcache_address:
+        cmd.append(f'--kvcache_address={kvcache_address}')
+    
+    logger.info(f"Starting worker {worker_id} on NUMA node {node_id} with port {port}")
+    subprocess.Popen(cmd)
+
+if __name__ == '__main__':
+    main()
+```
+
+
+主要改进：
+
+1. **添加LayerMemoryManager类**：
+   - 管理GPU内存
+   - 跟踪哪些层当前在GPU上
+   - 当GPU内存不足时自动清理
+
+2. **模型层分配逻辑**：
+   - 每个worker只负责8-10层
+   - 计算器均匀分配层
+   - 将不需要的层从内存中删除
+
+3. **动态GPU内存管理**：
+   - 默认将所有层放在CPU上
+   - 需要计算时才将层移动到GPU
+   - 计算完成后移回CPU
+
+4. **拦截前向传播**：
+   - 添加分布式forward方法
+   - 管理KV缓存同步
+
+这样即使是非常大的模型也能在有限的显存上运行，因为：
+1. 每个进程只存储8-10层
+2. 计算时动态加载层到GPU
+3. 使用KV Cache Server同步各层的KV缓存
+
+每个worker只处理自己负责的那部分层，大大减少了显存需求。
+
+---
+
+_**User**_
+
+另，将start的计算节点和调度节点的检测方式由ip检测改为主机名检测，调度节点的是login，计算节点的是compute06
+
+---
+
+_**Assistant**_
+
+<think>
+我需要修改 start.sh 脚本，使用主机名检测而非 IP 地址来区分节点类型。
+
+现在的代码使用:
+```bash
+# 检查是哪个节点
+is_scheduler_node() {
+    [[ "$IP_ADDRESS" == "$SCHEDULER_IP" ]] && return 0 || return 1
+}
+
+is_compute_node() {
+    [[ "$IP_ADDRESS" == "$COMPUTE_IP" ]] && return 0 || return 1
+}
+```
+
+我应该改为使用主机名检测:
+```bash
+# 检查是哪个节点
+is_scheduler_node() {
+    [[ "$HOSTNAME" == *"login"* ]] && return 0 || return 1
+}
+
+is_compute_node() {
+    [[ "$HOSTNAME" == *"compute06"* ]] && return 0 || return 1
+}
+```
+
+同时，也可能不再需要检测 IP 地址那部分代码。
+</think>
+
+我将修改 start.sh 脚本，将节点检测方式从 IP 地址改为主机名：
+
+```bash:start.sh
+#!/bin/bash
+
+# 设置路径
+PYTHONPATH=/archive/liugu/ds/ktransformers
+MODEL_PATH=/archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/
+GGUF_PATH=/archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/
+
+# 获取主机名和IP地址
+HOSTNAME=$(hostname)
+SCHEDULER_IP="10.21.22.100"  # 保留IP地址用于网络连接
+COMPUTE_IP="10.21.22.206"    # 保留IP地址用于网络连接
+
+# 检查是哪个节点 (使用主机名)
+is_scheduler_node() {
+    [[ "$HOSTNAME" == *"login"* ]] && return 0 || return 1
+}
+
+is_compute_node() {
+    [[ "$HOSTNAME" == *"compute06"* ]] && return 0 || return 1
+}
+
+# 杀死已有进程函数
+kill_existing_processes() {
+    echo "检测并杀死已存在的进程..."
+    
+    # 杀死 KV Cache Server 进程 (端口 29600)
+    KVCACHE_PID=$(netstat -tunlp 2>/dev/null | grep ":29600" | awk '{print $7}' | cut -d'/' -f1)
+    if [ ! -z "$KVCACHE_PID" ]; then
+        echo "正在杀死 KV Cache Server 进程 (PID: $KVCACHE_PID)..."
+        kill -9 $KVCACHE_PID
+    fi
+    
+    # 杀死 Worker 进程 (端口 29500-29507)
+    for PORT in $(seq 29500 29507); do
+        WORKER_PID=$(netstat -tunlp 2>/dev/null | grep ":$PORT" | awk '{print $7}' | cut -d'/' -f1)
+        if [ ! -z "$WORKER_PID" ]; then
+            echo "正在杀死 Worker 进程 (端口: $PORT, PID: $WORKER_PID)..."
+            kill -9 $WORKER_PID
+        fi
+    done
+    
+    # 杀死调度器进程 (端口 29400)
+    SCHEDULER_PID=$(netstat -tunlp 2>/dev/null | grep ":29400" | awk '{print $7}' | cut -d'/' -f1)
+    if [ ! -z "$SCHEDULER_PID" ]; then
+        echo "正在杀死调度器进程 (PID: $SCHEDULER_PID)..."
+        kill -9 $SCHEDULER_PID
+    fi
+    
+    # 杀死所有 python 含有 ktransformers 的进程
+    echo "杀死所有相关 Python 进程..."
+    ps aux | grep "python.*ktransformers" | grep -v grep | awk '{print $2}' | xargs -r kill -9
+    
+    # 等待进程完全终止
+    sleep 2
+    echo "所有旧进程已终止"
+}
+
+# 启动计算服务器上的服务
+start_compute_services() {
+    echo "在计算服务器 (compute06) 上启动服务..."
+    
+    # 启动 KV Cache 服务器
+    echo "启动 KV Cache 服务器..."
+    PYTHONPATH=$PYTHONPATH python -m ktransformers.kvcache_server --server_address ${COMPUTE_IP}:29600 --num_workers 8 > kvcache_server.log 2>&1 &
+    
+    # 等待 KV Cache 服务器启动
+    sleep 3
+    
+    # 启动 Worker 进程
+    echo "启动 Worker 进程..."
+    PYTHONPATH=$PYTHONPATH python -m ktransformers.worker --base_port 29500 --num_workers 8 --kvcache_address ${COMPUTE_IP}:29600 > worker.log 2>&1 &
+    
+    echo "所有服务已启动"
+    echo "KV Cache 服务器日志: kvcache_server.log"
+    echo "Worker 进程日志: worker.log"
+}
+
+# 启动调度节点上的服务
+start_scheduler_services() {
+    echo "在调度节点 (login) 上启动服务..."
+    
+    # 启动调度器
+    echo "启动任务调度器..."
+    PYTHONPATH=$PYTHONPATH python -m ktransformers.scheduler \
+        --server_address ${SCHEDULER_IP}:29400 \
+        --compute_address ${COMPUTE_IP}:29500 \
+        --model_path $MODEL_PATH > scheduler.log 2>&1 &
+    
+    echo "调度服务已启动"
+    echo "调度器日志: scheduler.log"
+}
+
+# 启动客户端（在任何节点上）
+start_client() {
+    echo "在客户端节点 (${HOSTNAME}) 上启动客户端..."
+    
+    PYTHONPATH=$PYTHONPATH python -m ktransformers.local_chat \
+        --model_path $MODEL_PATH \
+        --gguf_path $GGUF_PATH \
+        --scheduler_address "${SCHEDULER_IP}:29400" \
+        --max_new_tokens 50
+    
+    echo "客户端已退出"
+}
+
+# 检查GPU状态（仅在计算节点上）
+check_gpu_status() {
+    if command -v nvidia-smi &> /dev/null; then
+        echo "GPU 状态:"
+        nvidia-smi --query-gpu=index,name,memory.used,memory.total,temperature.gpu --format=csv,noheader
+    else
+        echo "无法检查 GPU 状态（nvidia-smi 不可用）"
+    fi
+}
+
+# 显示帮助信息
+show_help() {
+    echo "使用方法: $0 [选项]"
+    echo "选项:"
+    echo "  --compute   启动计算节点服务 (在 compute06 上运行)"
+    echo "  --scheduler 启动调度节点服务 (在 login 上运行)"
+    echo "  --client    启动客户端 (可在任何内网节点上运行)"
+    echo "  --help      显示此帮助信息"
+    echo ""
+    echo "示例:"
+    echo "  $0 --compute   # 在计算节点上启动KV缓存和Worker服务"
+    echo "  $0 --scheduler # 在调度节点上启动调度服务"
+    echo "  $0 --client    # 在任何节点上启动客户端"
+}
+
+# 默认参数处理
+if [ $# -eq 0 ]; then
+    # 根据主机名自动检测模式
+    if is_compute_node; then
+        echo "检测到计算节点 (compute06)..."
+        kill_existing_processes
+        check_gpu_status
+        start_compute_services
+        
+        # 显示各个进程的状态
+        echo "服务状态:"
+        ps aux | grep "python.*ktransformers" | grep -v grep
+        
+        echo "端口监听状态:"
+        netstat -tunlp 2>/dev/null | grep -E ":(29500|29501|29502|29503|29504|29505|29506|29507|29600)"
+    elif is_scheduler_node; then
+        echo "检测到调度节点 (login)..."
+        kill_existing_processes
+        start_scheduler_services
+        
+        # 显示进程状态
+        echo "服务状态:"
+        ps aux | grep "python.*ktransformers" | grep -v grep
+        
+        echo "端口监听状态:"
+        netstat -tunlp 2>/dev/null | grep -E ":(29400)"
+    else
+        # 默认作为客户端
+        echo "未检测到特定节点，以客户端模式运行..."
+        start_client
+    fi
+else
+    # 处理命令行参数
+    case "$1" in
+        --compute)
+            if ! is_compute_node; then
+                echo "警告：当前节点不是计算节点 (compute06)，服务可能无法正确运行"
+                read -p "是否继续？ (y/n): " confirm
+                [[ $confirm != "y" ]] && exit 1
+            fi
+            kill_existing_processes
+            check_gpu_status
+            start_compute_services
+            ;;
+        --scheduler)
+            if ! is_scheduler_node; then
+                echo "警告：当前节点不是调度节点 (login)，服务可能无法正确运行"
+                read -p "是否继续？ (y/n): " confirm
+                [[ $confirm != "y" ]] && exit 1
+            fi
+            kill_existing_processes
+            start_scheduler_services
+            ;;
+        --client)
+            start_client
+            ;;
+        --help)
+            show_help
+            ;;
+        *)
+            echo "未知选项: $1"
+            show_help
+            exit 1
+            ;;
+    esac
+fi
+```
+
+
+这个脚本的主要变更：
+
+1. 使用主机名而不是IP地址来检测节点类型：
+   ```bash
+   is_scheduler_node() {
+       [[ "$HOSTNAME" == *"login"* ]] && return 0 || return 1
+   }
+
+   is_compute_node() {
+       [[ "$HOSTNAME" == *"compute06"* ]] && return 0 || return 1
+   }
+   ```
+
+2. 优化了节点检测的提示信息，显示主机名而不是IP：
+   ```bash
+   if is_compute_node; then
+       echo "检测到计算节点 (compute06)..."
+   ```
+
+3. 添加了调度器进程的清理代码：
+   ```bash
+   # 杀死调度器进程 (端口 29400)
+   SCHEDULER_PID=$(netstat -tunlp 2>/dev/null | grep ":29400" | awk '{print $7}' | cut -d'/' -f1)
+   ```
+
+4. 显示帮助信息中也使用了主机名：
+   ```bash
+   echo "  --compute   启动计算节点服务 (在 compute06 上运行)"
+   echo "  --scheduler 启动调度节点服务 (在 login 上运行)"
+   ```
+
+这样脚本就能基于主机名而不是IP地址来自动检测节点类型，同时保留了原有的网络连接功能。
 
 ---
 

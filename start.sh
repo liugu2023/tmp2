@@ -7,17 +7,16 @@ GGUF_PATH=/archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/
 
 # 获取主机名和IP地址
 HOSTNAME=$(hostname)
-IP_ADDRESS=$(hostname -I | awk '{print $1}')
-SCHEDULER_IP="10.21.22.100"
-COMPUTE_IP="10.21.22.206"
+SCHEDULER_IP="10.21.22.100"  # 保留IP地址用于网络连接
+COMPUTE_IP="10.21.22.206"    # 保留IP地址用于网络连接
 
-# 检查是哪个节点
+# 检查是哪个节点 (使用主机名)
 is_scheduler_node() {
-    [[ "$IP_ADDRESS" == "$SCHEDULER_IP" ]] && return 0 || return 1
+    [[ "$HOSTNAME" == *"login"* ]] && return 0 || return 1
 }
 
 is_compute_node() {
-    [[ "$IP_ADDRESS" == "$COMPUTE_IP" ]] && return 0 || return 1
+    [[ "$HOSTNAME" == *"compute06"* ]] && return 0 || return 1
 }
 
 # 杀死已有进程函数
@@ -40,6 +39,13 @@ kill_existing_processes() {
         fi
     done
     
+    # 杀死调度器进程 (端口 29400)
+    SCHEDULER_PID=$(netstat -tunlp 2>/dev/null | grep ":29400" | awk '{print $7}' | cut -d'/' -f1)
+    if [ ! -z "$SCHEDULER_PID" ]; then
+        echo "正在杀死调度器进程 (PID: $SCHEDULER_PID)..."
+        kill -9 $SCHEDULER_PID
+    fi
+    
     # 杀死所有 python 含有 ktransformers 的进程
     echo "杀死所有相关 Python 进程..."
     ps aux | grep "python.*ktransformers" | grep -v grep | awk '{print $2}' | xargs -r kill -9
@@ -51,7 +57,7 @@ kill_existing_processes() {
 
 # 启动计算服务器上的服务
 start_compute_services() {
-    echo "在计算服务器上启动服务..."
+    echo "在计算服务器 (compute06) 上启动服务..."
     
     # 启动 KV Cache 服务器
     echo "启动 KV Cache 服务器..."
@@ -71,7 +77,7 @@ start_compute_services() {
 
 # 启动调度节点上的服务
 start_scheduler_services() {
-    echo "在调度节点上启动服务..."
+    echo "在调度节点 (login) 上启动服务..."
     
     # 启动调度器
     echo "启动任务调度器..."
@@ -86,7 +92,7 @@ start_scheduler_services() {
 
 # 启动客户端（在任何节点上）
 start_client() {
-    echo "在客户端节点 (${IP_ADDRESS}) 上启动客户端..."
+    echo "在客户端节点 (${HOSTNAME}) 上启动客户端..."
     
     PYTHONPATH=$PYTHONPATH python -m ktransformers.local_chat \
         --model_path $MODEL_PATH \
@@ -111,8 +117,8 @@ check_gpu_status() {
 show_help() {
     echo "使用方法: $0 [选项]"
     echo "选项:"
-    echo "  --compute   启动计算节点服务 (在 ${COMPUTE_IP} 上运行)"
-    echo "  --scheduler 启动调度节点服务 (在 ${SCHEDULER_IP} 上运行)"
+    echo "  --compute   启动计算节点服务 (在 compute06 上运行)"
+    echo "  --scheduler 启动调度节点服务 (在 login 上运行)"
     echo "  --client    启动客户端 (可在任何内网节点上运行)"
     echo "  --help      显示此帮助信息"
     echo ""
@@ -124,8 +130,9 @@ show_help() {
 
 # 默认参数处理
 if [ $# -eq 0 ]; then
-    # 根据IP地址自动检测模式
+    # 根据主机名自动检测模式
     if is_compute_node; then
+        echo "检测到计算节点 (compute06)..."
         kill_existing_processes
         check_gpu_status
         start_compute_services
@@ -137,6 +144,7 @@ if [ $# -eq 0 ]; then
         echo "端口监听状态:"
         netstat -tunlp 2>/dev/null | grep -E ":(29500|29501|29502|29503|29504|29505|29506|29507|29600)"
     elif is_scheduler_node; then
+        echo "检测到调度节点 (login)..."
         kill_existing_processes
         start_scheduler_services
         
@@ -148,6 +156,7 @@ if [ $# -eq 0 ]; then
         netstat -tunlp 2>/dev/null | grep -E ":(29400)"
     else
         # 默认作为客户端
+        echo "未检测到特定节点，以客户端模式运行..."
         start_client
     fi
 else
@@ -155,7 +164,7 @@ else
     case "$1" in
         --compute)
             if ! is_compute_node; then
-                echo "警告：当前节点不是计算节点 (${COMPUTE_IP})，服务可能无法正确运行"
+                echo "警告：当前节点不是计算节点 (compute06)，服务可能无法正确运行"
                 read -p "是否继续？ (y/n): " confirm
                 [[ $confirm != "y" ]] && exit 1
             fi
@@ -165,7 +174,7 @@ else
             ;;
         --scheduler)
             if ! is_scheduler_node; then
-                echo "警告：当前节点不是调度节点 (${SCHEDULER_IP})，服务可能无法正确运行"
+                echo "警告：当前节点不是调度节点 (login)，服务可能无法正确运行"
                 read -p "是否继续？ (y/n): " confirm
                 [[ $confirm != "y" ]] && exit 1
             fi

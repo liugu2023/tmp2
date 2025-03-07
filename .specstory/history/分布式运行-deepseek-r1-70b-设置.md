@@ -8825,6 +8825,102 @@ def generate_from_messages(self, messages, **kwargs):
 
 ---
 
+_**User**_
+
+usage: embedding_server.py [-h] [--server_address SERVER_ADDRESS] --model_path
+                           MODEL_PATH
+embedding_server.py: error: unrecognized arguments: --skip_tokenizer true
+
+---
+
+_**Assistant**_
+
+<think>
+看起来在命令行参数中出现了错误。`embedding_server.py`不识别`--skip_tokenizer true`参数。我们需要修改`embedding_server.py`的参数解析部分，添加这个参数。
+
+在`main`函数中，我们需要添加`--skip_tokenizer`参数的解析。
+</think>
+
+让我修复`embedding_server.py`中的命令行参数解析问题：
+
+```python:ktransformers/embedding_server.py
+def main():
+    parser = argparse.ArgumentParser(description="Embedding Server")
+    parser.add_argument("--server_address", type=str, default="0.0.0.0:29700",
+                      help="Address to listen for requests")
+    parser.add_argument("--model_path", type=str, required=True,
+                      help="Path to the model")
+    parser.add_argument("--skip_tokenizer", type=str, choices=["true", "false"], default="true",
+                      help="Skip loading tokenizer (will be handled by scheduler)")
+    
+    args = parser.parse_args()
+    
+    # 启动嵌入服务器
+    skip_tokenizer = args.skip_tokenizer.lower() == "true"
+    server = EmbeddingServer(args.server_address, args.model_path, skip_tokenizer)
+    server.run()
+```
+
+这个修改添加了`--skip_tokenizer`参数，它接受"true"或"false"作为值，并将字符串转换为布尔值传递给`EmbeddingServer`构造函数。
+
+另外，我看到`local_chat.py`的修改有一些格式问题。让我修复它：
+
+```python:ktransformers/local_chat.py
+def generate_from_messages(self, messages, **kwargs):
+    """使用聊天消息直接生成文本，由调度器处理tokenization"""
+    try:
+        if not self.use_scheduler:
+            raise ValueError("This method requires a scheduler connection")
+            
+        logger.info("Preparing chat request...")
+        message = {
+            'command': 'chat',
+            'messages': messages,
+            **kwargs
+        }
+        
+        logger.info("Sending chat request to scheduler...")
+        self.socket.send_pyobj(message)
+        
+        # 接收流式响应
+        full_text = ""
+        while True:
+            response = self.socket.recv_pyobj()
+            
+            if response['status'] == 'error':
+                raise Exception(f"Generation failed: {response.get('error')}")
+            
+            elif response['status'] == 'streaming':
+                # 流式响应，输出增量文本
+                delta_text = response.get('text', '')
+                if delta_text:
+                    print(delta_text, end='', flush=True)
+                    full_text += delta_text
+                
+                # 告诉服务器继续生成
+                self.socket.send_pyobj({'status': 'continue'})
+            
+            elif response['status'] == 'success':
+                # 最终响应，生成完成
+                print()  # 换行
+                logger.info("Generation completed")
+                return full_text
+            
+            else:
+                logger.warning(f"Unknown response status: {response['status']}")
+                self.socket.send_pyobj({'status': 'continue'})
+    
+    except Exception as e:
+        logger.error(f"Error in generate_from_messages: {str(e)}")
+        return None
+```
+
+现在整个系统应该可以正常工作了：
+
+1. **Embedding Server** 负责模型的嵌入层
+
+---
+
 
 
 ---

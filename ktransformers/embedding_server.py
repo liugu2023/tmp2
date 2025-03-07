@@ -267,11 +267,14 @@ def main():
                       help="Address to listen for requests")
     parser.add_argument("--model_path", type=str, required=True,
                       help="Path to the model")
+    parser.add_argument("--skip_tokenizer", type=str, choices=["true", "false"], default="true",
+                      help="Skip loading tokenizer (will be handled by scheduler)")
     
     args = parser.parse_args()
     
     # 启动嵌入服务器
-    server = EmbeddingServer(args.server_address, args.model_path)
+    skip_tokenizer = args.skip_tokenizer.lower() == "true"
+    server = EmbeddingServer(args.server_address, args.model_path, skip_tokenizer)
     server.run()
 
 if __name__ == "__main__":

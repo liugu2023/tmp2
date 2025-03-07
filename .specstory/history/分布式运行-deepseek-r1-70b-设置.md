@@ -9671,6 +9671,203 @@ AttributeError: 'DistributedModel' object has no attribute 'model_loaded'客户�
 
 _**Assistant**_
 
+<think>
+这个错误表明在`DistributedModel`类中尝试访问`model_loaded`属性时失败了，因为该属性不存在。我们需要确保在`local_chat.py`中的`DistributedModel`类中初始化这个属性。让我们修复这个问题：
+
+```python
+class DistributedModel:
+    def __init__(self, worker_address: str = None, scheduler_address: str = None):
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.REQ)
+        
+        # 初始化model_loaded属性
+        self.model_loaded = False
+        
+        if scheduler_address:
+            # 连接到调度器
+            self.socket.connect(f"tcp://{scheduler_address}")
+```
+
+这个修改确保了`model_loaded`属性在类初始化时就被设置为False，这样后续的代码就可以检查这个属性了。
+
+对于`load_model`方法，我们需要确保它正确设置`model_loaded`属性，并在成功加载模型后返回适当的结果。
+
+```python
+def load_model(self, model_path: str, gguf_path: str = None):
+    """加载模型"""
+    if self.model_loaded:
+        logger.info("Model already loaded, skipping load step")
+        return True
+    
+    # 先检查模型状态，避免重复加载
+    if self.use_scheduler and self._check_model_status():
+        return True
+    
+    # 发送加载模型的请求
+    logger.info(f"Sending request to load model from {model_path}")
+    request = {
+        'command': 'load_model',
+        'model_path': model_path,
+        'gguf_path': gguf_path
+    }
+    
+    self.socket.send_pyobj(request)
+    response = self.socket.recv_pyobj()
+    
+    if response.get('status') == 'success':
+        logger.info("Model loaded successfully")
+        self.model_loaded = True
+        return True
+    else:
+        logger.error(f"Failed to load model: {response.get('error')}")
+        return False
+```
+
+我还需要添加`_check_model_status`方法，用于检查模型是否已经加载：
+
+```python
+def _check_model_status(self):
+    """检查模型是否已加载，避免重复加载"""
+    try:
+        logger.info("Checking model status...")
+        self.socket.send_pyobj({"command": "status"})
+        response = self.socket.recv_pyobj()
+        
+        if response.get('status') == 'success' and response.get('model_loaded', False):
+            logger.info("Model already loaded, skipping load step")
+            self.model_loaded = True
+            print("模型已经加载完成，可以开始对话")
+            return True
+        else:
+            logger.info("Model not loaded yet")
+            return False
+    except Exception as e:
+        logger.error(f"Error checking model status: {e}")
+        return False
+```
+
+最后，我需要在`__init__`方法中添加一个`use_scheduler`属性，用于标记是否使用调度器模式：
+
+```python
+def __init__(self, worker_address: str = None, scheduler_address: str = None):
+    self.context = zmq.Context()
+    self.socket = self.context.socket(zmq.REQ)
+    
+    # 初始化model_loaded属性
+    self.model_loaded = False
+    
+    if scheduler_address:
+        # 连接到调度器
+        self.socket.connect(f"tcp://{scheduler_address}")
+        self.use_scheduler = True
+    elif worker_address:
+        # 直接连接到worker
+        self.socket.connect(f"tcp://{worker_address}")
+        self.use_scheduler = False
+    else:
+        raise ValueError("Either worker_address or scheduler_address must be provided")
+```
+
+这些修改应该能解决`AttributeError: 'DistributedModel' object has no attribute 'model_loaded'`错误。
+</think>
+
+需要修改`local_chat.py`中的`DistributedModel`类，添加缺失的`model_loaded`属性：
+
+```python:ktransformers/local_chat.py
+class DistributedModel:
+    def __init__(self, worker_address: str = None, scheduler_address: str = None):
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.REQ)
+        
+        # 添加model_loaded属性初始化
+        self.model_loaded = False
+        
+        if scheduler_address:
+            # 连接到调度器
+            self.socket.connect(f"tcp://{scheduler_address}")
+            self.use_scheduler = True
+            logger.info(f"Connected to scheduler at {scheduler_address}")
+        elif worker_address:
+            # 直接连接到worker
+            self.socket.connect(f"tcp://{worker_address}")
+            self.use_scheduler = False
+            logger.info(f"Connected to worker at {worker_address}")
+        else:
+            raise ValueError("必须提供worker_address或scheduler_address参数")
+        
+        # 初始化后检查模型状态
+        if hasattr(self, 'use_scheduler') and self.use_scheduler:
+            self._check_model_status()
+        
+    def _check_model_status(self):
+        """检查模型是否已加载，避免重复加载"""
+        try:
+            logger.info("检查模型加载状态...")
+            self.socket.send_pyobj({"command": "status"})
+            response = self.socket.recv_pyobj()
+            
+            if response.get('status') == 'success' and response.get('model_loaded', False):
+                logger.info("模型已经加载，跳过加载步骤")
+                self.model_loaded = True
+                print("模型已经加载完成，可以开始对话")
+                return True
+            else:
+                logger.info("模型尚未加载")
+                return False
+        except Exception as e:
+            logger.error(f"检查模型状态时出错: {e}")
+            return False
+    
+    def load_model(self, model_path: str, gguf_path: str = None):
+        """加载模型"""
+        if hasattr(self, 'model_loaded') and self.model_loaded:
+            logger.info("模型已经加载，跳过加载步骤")
+            return True
+        
+        # 先检查模型状态，避免重复加载
+        if hasattr(self, 'use_scheduler') and self.use_scheduler and self._check_model_status():
+            return True
+        
+        # 发送加载模型的请求
+        logger.info(f"发送请求加载模型: {model_path}")
+        request = {
+            'command': 'load_model',
+            'model_path': model_path,
+            'gguf_path': gguf_path
+        }
+        
+        self.socket.send_pyobj(request)
+        response = self.socket.recv_pyobj()
+        
+        if response.get('status') == 'success':
+            logger.info("模型加载成功")
+            self.model_loaded = True
+            return True
+        else:
+            logger.error(f"加载模型失败: {response.get('error')}")
+            return False
+```
+
+这个修改主要解决了几个问题：
+
+1. 添加了`model_loaded`属性的初始化，确保属性存在
+2. 添加了`use_scheduler`标志，用于区分是否使用调度器模式
+3. 添加了`_check_model_status`方法，用于检查模型是否已加载
+4. 优化了`load_model`方法，可以避免重复加载模型
+5. 加入了`hasattr`检查，防止属性不存在引起的错误
+
+这个修复将确保在使用调度器模式时，客户端可以正确检测模型加载状态，并且在意外断开连接后重连时，能够恢复到正确的状态。
+
+---
+
+_**User**_
+
+你确定你现在是按需加载模型吗
+
+---
+
+_**Assistant**_
+
 
 
 ---

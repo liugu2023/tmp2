@@ -229,11 +229,11 @@ class ModelWorker:
         
         return response["status"] == "success"
     
-    def load_model(self, model_path: str, gguf_path: str):
+    def load_model(self, model_path: str, gguf_path: str = None):
         """加载模型并分配层"""
         logger.info(f"Worker {self.worker_id} loading model from {model_path}")
         
-        # 加载配置
+        # 加载模型配置
         logger.info(f"Loading model config...")
         config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         
@@ -255,68 +255,55 @@ class ModelWorker:
         self.my_layers = list(range(start_layer, end_layer))
         logger.info(f"Worker {self.worker_id} is responsible for layers {self.my_layers}")
         
-        # 设置设备映射 - 关键改进
-        # 我们将只加载自己负责的层到内存中
-        device_map = {}
+        # 设置设备映射 - 仅加载自己负责的层
+        device_map = {
+            'model.embed_tokens': 'meta',  # 嵌入层由嵌入服务器处理
+            'model.norm': 'cpu',           # 最终范数层放在CPU上
+            'lm_head': 'meta'              # 输出投影由嵌入服务器处理
+        }
         
-        # 将基础模型放在CPU上
-        device_map['model.embed_tokens'] = 'cpu'
-        device_map['model.norm'] = 'cpu'
-        device_map['lm_head'] = 'cpu'
-        
-        # 只将自己负责的层映射到此worker
+        # 只将自己负责的层映射到此worker的CPU
         for i in range(total_layers):
             if i in self.my_layers:
-                # 我们负责的层 - 初始放在CPU上，计算时会移到GPU
+                # 我们负责的层先加载到CPU，计算时动态移到GPU
                 device_map[f'model.layers.{i}'] = 'cpu'
             else:
-                # 不负责的层映射到'meta'设备(不加载参数)
+                # 不负责的层不加载
                 device_map[f'model.layers.{i}'] = 'meta'
         
         logger.info(f"Device map for worker {self.worker_id}: {device_map}")
         
         # 加载模型 - 只加载我们负责的层
-        logger.info(f"Loading model (only responsible layers)...")
         try:
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_path,
                 config=config,
-                device_map=device_map,  # 使用我们自定义的设备映射
-                torch_dtype=torch.float16,
-                low_cpu_mem_usage=True
+                device_map=device_map,
+                low_cpu_mem_usage=True,
+                torch_dtype=torch.float16
             )
-            
-            # 替换不负责的层使用KV缓存层
-            model_layers = self.model.model.layers
-            for i in range(total_layers):
-                if i not in self.my_layers and hasattr(model_layers, str(i)):
-                    logger.info(f"Replacing layer {i} with KVCacheLayer proxy")
-                    # 创建一个代理层，它会从KV缓存服务器获取结果
-                    model_layers[i] = KVCacheLayer(self, i)
-            
             logger.info(f"Model loaded successfully")
         except Exception as e:
             logger.error(f"Error loading model: {e}")
             raise
         
-        # 加载tokenizer
-        logger.info(f"Loading tokenizer...")
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        logger.info(f"Tokenizer loaded successfully")
-        
-        # 设置模型的钩子，管理GPU内存
+        # 设置模型的钩子，以便在计算时将层移到GPU
         self.setup_model_hooks()
+        
+        # 创建一个工作备份结构，处理不是我们负责的层
+        self.setup_layer_proxies()
+        
+        return {"status": "success"}
     
     def setup_model_hooks(self):
-        """设置模型钩子，以便在推理过程中处理层交换"""
-        # 获取所有层
+        """设置钩子，在计算时动态移动层到GPU"""
         if not hasattr(self.model, 'model') or not hasattr(self.model.model, 'layers'):
-            logger.warning("无法获取模型层，跳过钩子设置")
+            logger.warning("无法设置层管理钩子")
             return
         
         layers = self.model.model.layers
         
-        # 只处理我们负责的层
+        # 遍历所有我负责的层
         for layer_id in self.my_layers:
             if not hasattr(layers, str(layer_id)):
                 continue
@@ -324,46 +311,83 @@ class ModelWorker:
             layer = layers[layer_id]
             
             # 保存原始forward方法
-            if not hasattr(layer, '_original_forward'):
-                layer._original_forward = layer.forward
+            layer._original_forward = layer.forward
             
             # 创建新的forward方法
-            def make_hook(*args, **kwargs):
-                # 移动到GPU
-                logger.debug(f"Moving layer {layer_id} to GPU")
-                self.memory_manager.move_to_gpu(layers[layer_id])
-                
-                # 执行计算
-                result = layer._original_forward(*args, **kwargs)
-                
-                # 获取request_id并存储结果到KV缓存
-                request_id = kwargs.get('request_id', None)
-                if request_id and self.kvcache_socket:
-                    self.store_kv_cache(request_id, layer_id, result)
-                
-                # 计算后移回CPU
-                logger.debug(f"Moving layer {layer_id} back to CPU")
-                self.memory_manager.move_to_cpu(layers[layer_id])
-                
-                return result
-            layer.forward = make_hook
+            def make_hook(layer_idx, orig_forward):
+                def hook_fn(*args, **kwargs):
+                    # 开始计算前移到GPU
+                    logger.debug(f"Moving layer {layer_idx} to GPU {self.gpu_id}")
+                    layer = self.model.model.layers[layer_idx]
+                    layer.to(f"cuda:{self.gpu_id}")
+                    
+                    # 执行计算
+                    output = orig_forward(*args, **kwargs)
+                    
+                    # 计算后立即移回CPU
+                    logger.debug(f"Moving layer {layer_idx} back to CPU")
+                    layer.to("cpu")
+                    torch.cuda.empty_cache()  # 立即释放显存
+                    
+                    return output
+                return hook_fn
+            
+            # 替换forward方法
+            layer.forward = make_hook(layer_id, layer._original_forward)
         
         logger.info(f"Set up hooks for {len(self.my_layers)} layers")
-    
-    class CustomStreamer(TextStreamer):
-        """自定义文本生成流式处理器"""
+
+    def setup_layer_proxies(self):
+        """设置代理层，处理不是我们负责的层"""
+        if not hasattr(self.model, 'model') or not hasattr(self.model.model, 'layers'):
+            logger.warning("无法设置层代理")
+            return
         
-        def __init__(self, tokenizer, on_text_chunk, **kwargs):
-            super().__init__(tokenizer, **kwargs)
-            self.on_text_chunk = on_text_chunk
-            self.generated_text = ""
+        layers = self.model.model.layers
         
-        def on_finalized_text(self, text: str, stream_end: bool = False):
-            # 这里不进行标准输出
-            if text:
-                self.generated_text += text
-                self.on_text_chunk(text, stream_end)
-    
+        # 遍历所有层，为不是我负责的层创建代理
+        for i in range(len(layers)):
+            if i not in self.my_layers:
+                # 创建代理层
+                proxy_layer = KVCacheLayerProxy(self, i)
+                
+                # 替换原始层
+                layers[i] = proxy_layer
+                
+        logger.info(f"Set up proxies for {len(layers) - len(self.my_layers)} layers")
+
+class KVCacheLayerProxy(torch.nn.Module):
+    """代理层，从KV缓存服务器获取结果"""
+    def __init__(self, worker, layer_id):
+        super().__init__()
+        self.worker = worker
+        self.layer_id = layer_id
+        
+    def forward(self, hidden_states, attention_mask=None, **kwargs):
+        """转发到KV缓存服务器而不是本地计算"""
+        # 生成请求ID
+        request_id = kwargs.get('request_id', str(uuid.uuid4()))
+        
+        # 从KV缓存服务器获取这一层的结果
+        kv_request = {
+            "command": "retrieve",
+            "request_id": request_id,
+            "worker_id": self.worker.worker_id,
+            "layer_id": self.layer_id
+        }
+        
+        # 发送请求
+        self.worker.kvcache_socket.send_pyobj(kv_request)
+        response = self.worker.kvcache_socket.recv_pyobj()
+        
+        if response.get('status') != 'success':
+            logger.error(f"Failed to retrieve layer {self.layer_id} from KV cache")
+            # 创建一个全0张量作为备选
+            return torch.zeros_like(hidden_states)
+            
+        # 返回从KV缓存服务器获取的结果
+        return response.get('kv_tensor')
+
     def create_streamer(self, request_id):
         """创建一个流式输出器，用于在生成过程中返回部分结果"""
         self.socket.send_pyobj({

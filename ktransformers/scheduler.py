@@ -1,6 +1,6 @@
 """
 任务调度服务器
-负责预处理输入数据并转发客户端请求到计算节点
+负责处理用户请求，拼接聊天模板并转发到计算节点
 """
 
 import zmq
@@ -65,13 +65,21 @@ class SchedulerServer:
                     response = self._get_stats()
                     self.client_socket.send_pyobj(response)
                 elif command == "chat":
-                    # 预处理聊天输入并转发
-                    processed_request = self._preprocess_chat(client_request)
-                    self._forward_to_compute(processed_request)
+                    # 处理聊天请求 - 只进行模板拼接，不做embedding
+                    self._handle_chat_request(client_request)
                 else:
                     # 转发所有其他命令到计算节点
                     try:
-                        self._forward_to_compute(client_request)
+                        # 将请求转发到计算节点
+                        self.compute_socket.send_pyobj(client_request)
+                        
+                        # 如果是generate命令，则处理流式响应
+                        if command == "generate":
+                            self._handle_streaming_response()
+                        else:
+                            # 普通命令直接转发响应
+                            compute_response = self.compute_socket.recv_pyobj()
+                            self.client_socket.send_pyobj(compute_response)
                     except Exception as e:
                         logger.error(f"Error forwarding request: {str(e)}")
                         self.client_socket.send_pyobj({
@@ -84,64 +92,61 @@ class SchedulerServer:
             self.compute_socket.close()
             self.context.term()
     
-    def _preprocess_chat(self, client_request: Dict[str, Any]) -> Dict[str, Any]:
-        """预处理聊天输入，将文本转换为token"""
-        messages = client_request.get("messages", [])
-        max_new_tokens = client_request.get("max_new_tokens", 512)
-        temperature = client_request.get("temperature", 0.7)
-        top_p = client_request.get("top_p", 0.9)
-        do_sample = client_request.get("do_sample", True)
-        
-        logger.info(f"Preprocessing chat input with {len(messages)} messages")
-        
-        # 使用tokenizer处理输入
-        input_tensor = self.tokenizer.apply_chat_template(
-            messages, add_generation_prompt=True, return_tensors="pt"
-        )
-        
-        # 创建注意力掩码
-        attention_mask = torch.ones_like(input_tensor)
-        
-        # 记录token数量
-        input_tokens = len(input_tensor[0])
-        self.stats["total_tokens_processed"] += input_tokens
-        
-        logger.info(f"Input processed: {input_tokens} tokens")
-        
-        # 创建计算节点请求
-        compute_request = {
-            "command": "generate",
-            "data": {
-                "input_ids": input_tensor.numpy().tolist(),
-                "attention_mask": attention_mask.numpy().tolist(),
-                "max_new_tokens": max_new_tokens,
-                "temperature": temperature,
-                "top_p": top_p,
-                "do_sample": do_sample
-            }
-        }
-        
-        return compute_request
-    
-    def _forward_to_compute(self, request: Dict[str, Any]):
-        """转发请求到计算节点并处理响应"""
+    def _handle_chat_request(self, client_request):
+        """处理聊天请求 - 只进行模板拼接，不做embedding"""
         try:
-            # 将请求转发到计算节点
-            self.compute_socket.send_pyobj(request)
+            # 从请求中获取聊天消息
+            messages = client_request.get("messages", [])
+            max_new_tokens = client_request.get("max_new_tokens", 100)
+            temperature = client_request.get("temperature", 0.7)
+            top_p = client_request.get("top_p", 0.9)
+            do_sample = client_request.get("do_sample", True)
             
-            # 如果是generate命令，则处理流式响应
-            if request.get("command") == "generate":
-                self._handle_streaming_response()
-            else:
-                # 普通命令直接转发响应
-                compute_response = self.compute_socket.recv_pyobj()
-                self.client_socket.send_pyobj(compute_response)
+            logger.info(f"Processing chat request with {len(messages)} messages")
+            
+            # 应用聊天模板 - 只处理模板拼接，转换为token IDs
+            logger.info("Applying chat template...")
+            input_ids = self.tokenizer.apply_chat_template(
+                messages, 
+                add_generation_prompt=True, 
+                return_tensors="pt"
+            )
+            
+            # 将token IDs发送到计算节点进行推理
+            logger.info(f"Sending tokenized chat to compute node, input shape: {input_ids.shape}")
+            
+            # 更新统计信息
+            self.stats["active_sessions"] += 1
+            self.stats["total_tokens_processed"] += input_ids.shape[1]
+            
+            # 准备发送到计算节点的请求
+            compute_request = {
+                "command": "generate",
+                "data": {
+                    "input_ids": input_ids.numpy().tolist(),
+                    "attention_mask": torch.ones_like(input_ids).numpy().tolist(),
+                    "max_new_tokens": max_new_tokens,
+                    "temperature": temperature,
+                    "top_p": top_p,
+                    "do_sample": do_sample,
+                    "stream": True
+                }
+            }
+            
+            # 发送到计算节点
+            self.compute_socket.send_pyobj(compute_request)
+            
+            # 处理流式响应并转发给客户端
+            self._handle_streaming_response()
+            
         except Exception as e:
-            logger.error(f"Error in forward_to_compute: {str(e)}")
+            logger.error(f"Error processing chat request: {str(e)}")
             self.client_socket.send_pyobj({
                 "status": "error",
-                "error": f"Scheduler error: {str(e)}"
+                "error": f"Chat processing error: {str(e)}"
             })
+            if hasattr(self, "stats") and "active_sessions" in self.stats:
+                self.stats["active_sessions"] = max(0, self.stats["active_sessions"] - 1)
     
     def _handle_streaming_response(self):
         """处理来自计算节点的流式响应"""
@@ -154,6 +159,9 @@ class SchedulerServer:
             
             # 如果是最终响应，退出循环
             if compute_response.get('status') == 'success':
+                # 更新统计信息
+                if hasattr(self, "stats") and "active_sessions" in self.stats:
+                    self.stats["active_sessions"] = max(0, self.stats["active_sessions"] - 1)
                 break
             
             # 如果是流式响应，等待客户端确认

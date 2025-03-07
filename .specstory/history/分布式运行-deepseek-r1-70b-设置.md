@@ -8301,7 +8301,527 @@ cd /archive/liugu/ds
 cd /archive/liugu/ds
 ./start.sh
 ```
-如果不是compute06或login节点
+如果不是compute06或login节点，脚本会自动以客户端模式运行。
+
+### 方法二：使用命令行参数
+
+也可以使用命令行参数明确指定要启动的组件：
+
+**启动计算服务:**
+```bash
+./start.sh --compute
+```
+
+**启动调度服务:**
+```bash
+./start.sh --scheduler
+```
+
+**启动客户端:**
+```bash
+./start.sh --client
+```
+
+## 查看日志
+
+服务启动后，可以通过以下命令查看各个组件的日志：
+
+```bash
+# 查看嵌入服务器日志
+tail -f embedding_server.log
+
+# 查看KV缓存服务器日志
+tail -f kvcache_server.log
+
+# 查看worker进程日志
+tail -f worker.log
+
+# 查看调度器日志
+tail -f scheduler.log
+```
+
+## 验证服务是否正常运行
+
+可以使用以下命令检查服务是否正常运行：
+
+```bash
+# 检查所有相关服务
+ps aux | grep "python.*ktransformers" | grep -v grep
+
+# 检查监听端口
+netstat -tunlp | grep -E ":(29400|29500|29501|29502|29503|29504|29505|29506|29507|29600|29700)"
+```
+
+## 系统架构说明
+
+此系统使用分层架构，将大模型分布在多个进程中：
+
+1. **词表查询层 (Embedding Server)**：负责将输入的token转换为嵌入向量，以及将隐藏状态映射回词汇表
+2. **中间层 (Worker进程)**：每个worker只负责模型的一部分层，将它们分配到不同GPU上
+3. **同步层 (KV Cache Server)**：跨worker同步中间状态和KV缓存
+4. **调度层 (Scheduler)**：协调不同节点之间的计算，处理客户端请求
+
+这种架构使大模型能够在有限的GPU显存上运行，因为：
+- 模型参数被分散到多个进程
+- 词表查询独立处理，减轻worker负担
+- 中间层按需加载到GPU，不需要时保存在CPU内存中
+
+---
+
+_**User**_
+
+Prompt处理	只在Scheduler做模板拼接，不做embedding
+
+---
+
+_**Assistant**_
+
+<think>
+让我改进一下系统，将prompt处理（模板拼接）限制在Scheduler上进行，而不是进行embedding。
+
+主要需要修改的是：
+1. scheduler.py：确保它只做模板拼接，不做embedding
+2. embedding_server.py：确保它只在需要时处理embedding
+3. worker.py：可能需要调整以配合这个流程
+
+我需要看一下当前的scheduler.py实现来理解如何修改它。
+</think>
+
+# 架构改进：模板处理分离
+
+我将修改系统架构，使得prompt模板处理只在Scheduler上完成，而不做embedding。这样可以提高效率并减少网络传输。
+
+## 修改scheduler.py
+
+```python:ktransformers/scheduler.py
+"""
+任务调度服务器
+负责处理用户请求，拼接聊天模板并转发到计算节点
+"""
+
+import zmq
+import logging
+import time
+import argparse
+import torch
+from typing import Dict, Any, List
+from transformers import AutoTokenizer
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class SchedulerServer:
+    def __init__(self, server_address: str, compute_address: str, model_path: str):
+        # 初始化ZMQ上下文
+        self.context = zmq.Context()
+        
+        # 设置面向客户端的套接字
+        self.client_socket = self.context.socket(zmq.REP)
+        self.client_socket.bind(f"tcp://{server_address}")
+        logger.info(f"Scheduler listening for clients at {server_address}")
+        
+        # 设置面向计算节点的套接字
+        self.compute_socket = self.context.socket(zmq.REQ)
+        self.compute_address = compute_address
+        self.compute_socket.connect(f"tcp://{compute_address}")
+        logger.info(f"Connected to compute node at {compute_address}")
+        
+        # 加载tokenizer
+        self.model_path = model_path
+        logger.info(f"Loading tokenizer from {model_path}")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        logger.info(f"Tokenizer loaded successfully")
+        
+        # 统计信息
+        self.stats = {
+            "total_requests": 0,
+            "start_time": time.time(),
+            "active_sessions": 0,
+            "total_tokens_processed": 0
+        }
+    
+    def run(self):
+        """运行调度器主循环"""
+        logger.info("Scheduler server ready to receive requests")
+        try:
+            while True:
+                # 接收来自客户端的请求
+                client_request = self.client_socket.recv_pyobj()
+                self.stats["total_requests"] += 1
+                
+                command = client_request.get("command")
+                logger.info(f"Received {command} request from client")
+                
+                if command == "shutdown":
+                    # 处理关闭命令
+                    self.client_socket.send_pyobj({"status": "shutdown"})
+                    break
+                elif command == "stats":
+                    # 返回统计信息
+                    response = self._get_stats()
+                    self.client_socket.send_pyobj(response)
+                elif command == "chat":
+                    # 处理聊天请求 - 只进行模板拼接，不做embedding
+                    self._handle_chat_request(client_request)
+                else:
+                    # 转发所有其他命令到计算节点
+                    try:
+                        # 将请求转发到计算节点
+                        self.compute_socket.send_pyobj(client_request)
+                        
+                        # 如果是generate命令，则处理流式响应
+                        if command == "generate":
+                            self._handle_streaming_response()
+                        else:
+                            # 普通命令直接转发响应
+                            compute_response = self.compute_socket.recv_pyobj()
+                            self.client_socket.send_pyobj(compute_response)
+                    except Exception as e:
+                        logger.error(f"Error forwarding request: {str(e)}")
+                        self.client_socket.send_pyobj({
+                            "status": "error",
+                            "error": f"Scheduler error: {str(e)}"
+                        })
+        finally:
+            logger.info("Shutting down scheduler...")
+            self.client_socket.close()
+            self.compute_socket.close()
+            self.context.term()
+    
+    def _handle_chat_request(self, client_request):
+        """处理聊天请求 - 只进行模板拼接，不做embedding"""
+        try:
+            # 从请求中获取聊天消息
+            messages = client_request.get("messages", [])
+            max_new_tokens = client_request.get("max_new_tokens", 100)
+            temperature = client_request.get("temperature", 0.7)
+            top_p = client_request.get("top_p", 0.9)
+            do_sample = client_request.get("do_sample", True)
+            
+            logger.info(f"Processing chat request with {len(messages)} messages")
+            
+            # 应用聊天模板 - 只处理模板拼接，转换为token IDs
+            logger.info("Applying chat template...")
+            input_ids = self.tokenizer.apply_chat_template(
+                messages, 
+                add_generation_prompt=True, 
+                return_tensors="pt"
+            )
+            
+            # 将token IDs发送到计算节点进行推理
+            logger.info(f"Sending tokenized chat to compute node, input shape: {input_ids.shape}")
+            
+            # 更新统计信息
+            self.stats["active_sessions"] += 1
+            self.stats["total_tokens_processed"] += input_ids.shape[1]
+            
+            # 准备发送到计算节点的请求
+            compute_request = {
+                "command": "generate",
+                "data": {
+                    "input_ids": input_ids.numpy().tolist(),
+                    "attention_mask": torch.ones_like(input_ids).numpy().tolist(),
+                    "max_new_tokens": max_new_tokens,
+                    "temperature": temperature,
+                    "top_p": top_p,
+                    "do_sample": do_sample,
+                    "stream": True
+                }
+            }
+            
+            # 发送到计算节点
+            self.compute_socket.send_pyobj(compute_request)
+            
+            # 处理流式响应并转发给客户端
+            self._handle_streaming_response()
+            
+        except Exception as e:
+            logger.error(f"Error processing chat request: {str(e)}")
+            self.client_socket.send_pyobj({
+                "status": "error",
+                "error": f"Chat processing error: {str(e)}"
+            })
+            if hasattr(self, "stats") and "active_sessions" in self.stats:
+                self.stats["active_sessions"] = max(0, self.stats["active_sessions"] - 1)
+    
+    def _handle_streaming_response(self):
+        """处理来自计算节点的流式响应"""
+        # 接收来自计算节点的流式响应并转发给客户端
+        while True:
+            compute_response = self.compute_socket.recv_pyobj()
+            
+            # 转发响应给客户端
+            self.client_socket.send_pyobj(compute_response)
+            
+            # 如果是最终响应，退出循环
+            if compute_response.get('status') == 'success':
+                # 更新统计信息
+                if hasattr(self, "stats") and "active_sessions" in self.stats:
+                    self.stats["active_sessions"] = max(0, self.stats["active_sessions"] - 1)
+                break
+            
+            # 如果是流式响应，等待客户端确认
+            if compute_response.get('status') == 'streaming':
+                client_ack = self.client_socket.recv_pyobj()
+                self.compute_socket.send_pyobj(client_ack)
+    
+    def _get_stats(self) -> Dict[str, Any]:
+        """获取调度器统计信息"""
+        current_time = time.time()
+        uptime = current_time - self.stats["start_time"]
+        
+        return {
+            "status": "success",
+            "total_requests": self.stats["total_requests"],
+            "uptime": uptime,
+            "active_sessions": self.stats["active_sessions"],
+            "total_tokens_processed": self.stats["total_tokens_processed"],
+            "compute_node": self.compute_address,
+            "model_path": self.model_path
+        }
+```
+
+## 修改embedding_server.py为仅处理embedding
+
+```diff:ktransformers/embedding_server.py
+class EmbeddingServer:
+-    def __init__(self, server_address: str, model_path: str):
++    def __init__(self, server_address: str, model_path: str, skip_tokenizer: bool = True):
+        # 初始化ZMQ上下文
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.REP)
+        self.socket.bind(f"tcp://{server_address}")
+        self.socket.setsockopt(zmq.RCVHWM, 0)
+        self.socket.setsockopt(zmq.SNDHWM, 0)
+        logger.info(f"Embedding server listening at {server_address}")
+        
+        # 加载模型配置
+        self.model_path = model_path
+        logger.info(f"Loading model config from {model_path}")
+        self.config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        
++        # 如果需要tokenizer，才加载
++        self.tokenizer = None
++        if not skip_tokenizer:
+-        # 加载tokenizer
+-        logger.info("Loading tokenizer")
+-        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
++            logger.info("Loading tokenizer")
++            self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
++        else:
++            logger.info("Skipping tokenizer loading (will be handled by scheduler)")
+```
+
+## 修改worker.py以便更好地与embedding_server整合
+
+```diff:ktransformers/worker.py
+    def generate(self, input_data):
+        """使用分布式层处理生成tokens"""
+        try:
+            # 提取输入数据
+            input_ids = torch.tensor(input_data.get('input_ids'))
+            attention_mask = torch.tensor(input_data.get('attention_mask'))
+            max_new_tokens = input_data.get('max_new_tokens', 50)
+            temperature = input_data.get('temperature', 0.7)
+            top_p = input_data.get('top_p', 0.9)
+            
++            # 如果有embedding服务器，获取输入嵌入
++            if hasattr(self, 'embedding_socket') and self.embedding_socket:
++                logger.info("Using embedding server for input embeddings")
++                embedding_request = {
++                    "command": "embed_tokens",
++                    "input_ids": input_ids.numpy().tolist()
++                }
++                self.embedding_socket.send_pyobj(embedding_request)
++                embedding_response = self.embedding_socket.recv_pyobj()
++                
++                if embedding_response.get('status') == 'success':
++                    # 使用从embedding服务器获取的嵌入
++                    embeds = torch.tensor(embedding_response.get('embeddings')).to(self.device)
++                    logger.info(f"Got embeddings from server, shape: {embeds.shape}")
++                else:
++                    logger.error("Failed to get embeddings from server")
+```
+
+## 修改start.sh以支持新配置
+
+```diff:start.sh
+# 启动嵌入服务器
+echo "启动嵌入服务器..."
+-PYTHONPATH=$PYTHONPATH python -m ktransformers.embedding_server --server_address ${COMPUTE_IP}:29700 --model_path $MODEL_PATH > embedding_server.log 2>&1 &
++PYTHONPATH=$PYTHONPATH python -m ktransformers.embedding_server --server_address ${COMPUTE_IP}:29700 --model_path $MODEL_PATH --skip_tokenizer true > embedding_server.log 2>&1 &
+```
+
+## 架构流程
+
+1. **客户端**发送聊天消息到**调度器**
+2. **调度器**进行模板拼接并tokenization，但不做embedding
+3. **调度器**将tokenized的输入发送到**Worker**进程
+4. **Worker**需要embedding时，从**Embedding Server**获取
+5. **Worker**进行模型计算，各层协同工作
+6. 结果流回给**调度器**并转发到**客户端**
+
+这种架构有几个优势：
+1. 模板处理逻辑集中在调度器，便于维护和更新
+2. Embedding Server变得更专注，只需处理embedding转换
+3. 网络传输更高效，因为传输的是token IDs而不是原始文本
+4. 更清晰的职责分离，每个组件只做一件事
+
+## 使用方法
+
+系统启动方式不变，仍然通过start.sh脚本启动各组件：
+
+```bash
+# 在计算节点启动所有计算服务
+./start.sh --compute
+
+# 在调度节点启动调度服务
+./start.sh --scheduler
+
+# 在任何节点启动客户端
+./start.sh --client
+```
+
+---
+
+_**User**_
+
+ERROR:__main__:Error in generate_from_messages: Generation failed: 'ModelWorker' object has no attribute 'create_streamer'
+WARNING:__main__:No output tokens received
+
+---
+
+_**Assistant**_
+
+<think>
+这个错误表明在worker.py中有一个问题：当调用`generate`方法时，它试图使用`create_streamer`方法，但这个方法似乎没有被定义。我们需要在ModelWorker类中添加这个方法。
+
+`create_streamer`方法应该创建一个流式输出器，用于在生成过程中逐步返回token。这对于流式处理聊天的响应很重要，可以让用户不必等待整个生成过程完成就开始看到回复。
+</think>
+
+让我添加`create_streamer`方法到`worker.py`中，修复流式文本生成的问题：
+
+```python:ktransformers/worker.py
+def create_streamer(self, request_id):
+    """创建一个流式输出器，用于在生成过程中返回部分结果"""
+    self.socket.send_pyobj({
+        'status': 'streaming',
+        'text': '',
+        'token_ids': []
+    })
+    
+    # 等待客户端确认
+    ack = self.socket.recv_pyobj()
+    if ack.get('status') != 'continue':
+        logger.warning(f"Client did not send continue status, got: {ack}")
+    
+    class ZMQStreamer:
+        def __init__(self, worker, socket, request_id):
+            self.worker = worker
+            self.socket = socket
+            self.request_id = request_id
+            self.generated_text = ""
+            self.token_ids = []
+        
+        def put(self, token_ids):
+            """接收新生成的token，发送到客户端"""
+            # 如果是单个token，包装成列表
+            if not isinstance(token_ids, list):
+                token_ids = [token_ids]
+            
+            # 添加新token到累积列表
+            self.token_ids.extend(token_ids)
+            
+            # 解码文本
+            new_text = self.worker.tokenizer.decode(
+                self.token_ids, 
+                skip_special_tokens=True
+            )
+            # 只发送新增部分
+            delta_text = new_text[len(self.generated_text):]
+            self.generated_text = new_text
+            
+            # 发送更新
+            self.socket.send_pyobj({
+                'status': 'streaming',
+                'text': delta_text,
+                'token_ids': token_ids
+            })
+            
+            # 等待客户端确认
+            ack = self.socket.recv_pyobj()
+            if ack.get('status') != 'continue':
+                logger.warning(f"Client did not send continue status, got: {ack}")
+        
+        def end(self):
+            """标记生成完成"""
+            logger.info("Streaming completed")
+    
+    return ZMQStreamer(self, self.socket, request_id)
+```
+
+这个修复方案增加了一个`create_streamer`方法，它实现了一个自定义的streamer类，用于与ZeroMQ通信。这个streamer:
+
+1. 当被实例化时，向客户端发送一个初始的空回复，表示流式生成开始
+2. 当新token生成时，会解码它们为文本并只发送变化部分
+3. 它会跟踪生成的tokens，允许增量更新
+4. 每次发送后等待客户端确认才继续
+
+这个修复应该解决"'ModelWorker' object has no attribute 'create_streamer'"错误，并让流式文本生成正常工作。
+
+此外，我还需要给`local_chat.py`添加一个处理函数来处理流式回复：
+
+```python:ktransformers/local_chat.py
+def generate_from_messages(self, messages, **kwargs):
+    """使用聊天消息直接生成文本，由调度器处理tokenization"""
+    try:
+        if not self.use_scheduler:
+            raise ValueError("This method requires a scheduler connection")
+            
+        logger.info("Preparing chat request...")
+        message = {
+            'command': 'chat',
+            'messages': messages,
+            **kwargs
+        }
+        
+        logger.info("Sending chat request to scheduler...")
+        self.socket.send_pyobj(message)
+        
+        # 接收流式响应
+        full_text = ""
+        while True:
+            response = self.socket.recv_pyobj()
+            
+            if response['status'] == 'error':
+                raise Exception(f"Generation failed: {response.get('error')}")
+            
+            elif response['status'] == 'streaming':
+                # 流式响应，输出增量文本
+                delta_text = response.get('text', '')
+                if delta_text:
+                    print(delta_text, end='', flush=True)
+                    full_text += delta_text
+                
+                # 告诉服务器继续生成
+                self.socket.send_pyobj({'status': 'continue'})
+            
+            elif response['status'] == 'success':
+                # 最终响应，生成完成
+                print()  # 换行
+                logger.info("Generation completed")
+                return full_text
+            
+            else:
+                logger.warning(f"Unknown response status: {response['status']}")
+                self.socket.send_pyobj({'status': 'continue'})
+    
+    except Exception as e:
+        logger.error(f"Error in generate_from_messages: {str(e)}")
+        return None
+```
+
+此修复确保客户端能够正确处理流式响应，并向服务器发送适当的确认。
 
 ---
 

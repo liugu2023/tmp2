@@ -89,21 +89,26 @@ class DistributedModel:
                 if response['status'] == 'error':
                     raise Exception(f"Generation failed: {response.get('error')}")
                 
-                if response['status'] == 'streaming':
-                    # 打印新生成的文本部分
-                    text = response.get('text', '')
-                    print(text, end='', flush=True)
-                    full_text += text
+                elif response['status'] == 'streaming':
+                    # 流式响应，输出增量文本
+                    delta_text = response.get('text', '')
+                    if delta_text:
+                        print(delta_text, end='', flush=True)
+                        full_text += delta_text
                     
-                    # 向服务器确认接收
-                    self.socket.send_pyobj({'status': 'received'})
+                    # 告诉服务器继续生成
+                    self.socket.send_pyobj({'status': 'continue'})
                 
-                if response['status'] == 'success':
-                    # 生成完成
+                elif response['status'] == 'success':
+                    # 最终响应，生成完成
+                    print()  # 换行
                     logger.info("Generation completed")
-                    break
-            
-            return full_text
+                    return full_text
+                
+                else:
+                    logger.warning(f"Unknown response status: {response['status']}")
+                    self.socket.send_pyobj({'status': 'continue'})
+        
         except Exception as e:
             logger.error(f"Error in generate_from_messages: {str(e)}")
             return None

@@ -356,6 +356,63 @@ class ModelWorker:
                 self.generated_text += text
                 self.on_text_chunk(text, stream_end)
     
+    def create_streamer(self, request_id):
+        """创建一个流式输出器，用于在生成过程中返回部分结果"""
+        self.socket.send_pyobj({
+            'status': 'streaming',
+            'text': '',
+            'token_ids': []
+        })
+        
+        # 等待客户端确认
+        ack = self.socket.recv_pyobj()
+        if ack.get('status') != 'continue':
+            logger.warning(f"Client did not send continue status, got: {ack}")
+        
+        class ZMQStreamer:
+            def __init__(self, worker, socket, request_id):
+                self.worker = worker
+                self.socket = socket
+                self.request_id = request_id
+                self.generated_text = ""
+                self.token_ids = []
+            
+            def put(self, token_ids):
+                """接收新生成的token，发送到客户端"""
+                # 如果是单个token，包装成列表
+                if not isinstance(token_ids, list):
+                    token_ids = [token_ids]
+                
+                # 添加新token到累积列表
+                self.token_ids.extend(token_ids)
+                
+                # 解码文本
+                new_text = self.worker.tokenizer.decode(
+                    self.token_ids, 
+                    skip_special_tokens=True
+                )
+                # 只发送新增部分
+                delta_text = new_text[len(self.generated_text):]
+                self.generated_text = new_text
+                
+                # 发送更新
+                self.socket.send_pyobj({
+                    'status': 'streaming',
+                    'text': delta_text,
+                    'token_ids': token_ids
+                })
+                
+                # 等待客户端确认
+                ack = self.socket.recv_pyobj()
+                if ack.get('status') != 'continue':
+                    logger.warning(f"Client did not send continue status, got: {ack}")
+            
+            def end(self):
+                """标记生成完成"""
+                logger.info("Streaming completed")
+        
+        return ZMQStreamer(self, self.socket, request_id)
+    
     def generate(self, input_data):
         """使用分布式层处理生成tokens"""
         try:
@@ -365,6 +422,23 @@ class ModelWorker:
             max_new_tokens = input_data.get('max_new_tokens', 50)
             temperature = input_data.get('temperature', 0.7)
             top_p = input_data.get('top_p', 0.9)
+            
+            # 如果有embedding服务器，获取输入嵌入
+            if hasattr(self, 'embedding_socket') and self.embedding_socket:
+                logger.info("Using embedding server for input embeddings")
+                embedding_request = {
+                    "command": "embed_tokens",
+                    "input_ids": input_ids.numpy().tolist()
+                }
+                self.embedding_socket.send_pyobj(embedding_request)
+                embedding_response = self.embedding_socket.recv_pyobj()
+                
+                if embedding_response.get('status') == 'success':
+                    # 使用从embedding服务器获取的嵌入
+                    embeds = torch.tensor(embedding_response.get('embeddings')).to(self.device)
+                    logger.info(f"Got embeddings from server, shape: {embeds.shape}")
+                else:
+                    logger.error("Failed to get embeddings from server")
             
             # 创建一个唯一的请求ID
             request_id = str(uuid.uuid4())

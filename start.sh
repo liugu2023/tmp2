@@ -68,7 +68,7 @@ start_compute_services() {
     
     # 启动嵌入服务器
     echo "启动嵌入服务器..."
-    PYTHONPATH=$PYTHONPATH python -m ktransformers.embedding_server --server_address ${COMPUTE_IP}:29700 --model_path $MODEL_PATH > embedding_server.log 2>&1 &
+    PYTHONPATH=$PYTHONPATH python -m ktransformers.embedding_server --server_address ${COMPUTE_IP}:29700 --model_path $MODEL_PATH --skip_tokenizer true > embedding_server.log 2>&1 &
     
     # 等待嵌入服务器启动
     sleep 3

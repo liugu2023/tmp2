@@ -16,7 +16,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class EmbeddingServer:
-    def __init__(self, server_address: str, model_path: str):
+    def __init__(self, server_address: str, model_path: str, skip_tokenizer: bool = True):
         # 初始化ZMQ上下文
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.REP)
@@ -30,9 +30,13 @@ class EmbeddingServer:
         logger.info(f"Loading model config from {model_path}")
         self.config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         
-        # 加载tokenizer
-        logger.info("Loading tokenizer")
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        # 如果需要tokenizer，才加载
+        self.tokenizer = None
+        if not skip_tokenizer:
+            logger.info("Loading tokenizer")
+            self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        else:
+            logger.info("Skipping tokenizer loading (will be handled by scheduler)")
         
         # 只加载嵌入层和最后的输出层
         logger.info("Loading embedding layer and output projection")

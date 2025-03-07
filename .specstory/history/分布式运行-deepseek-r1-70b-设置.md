@@ -8917,7 +8917,280 @@ def generate_from_messages(self, messages, **kwargs):
 
 现在整个系统应该可以正常工作了：
 
-1. **Embedding Server** 负责模型的嵌入层
+1. **Embedding Server** 负责模型的嵌入层与输出投影计算
+2. **KV Cache Server** 在各个worker之间共享KV缓存
+3. **Worker** 每个只处理模型的一部分层
+4. **Scheduler** 处理聊天模板拼接和tokenization，但不做embedding
+
+有了这些修改，系统应该能够:
+1. 在计算节点上正确启动所有服务
+2. 在调度节点上处理模板拼接
+3. 实现流式文本生成
+4. 大大减少显存使用，使得大模型能在有限资源上运行
+
+---
+
+_**User**_
+
+在启动worker时使用numa
+
+---
+
+_**Assistant**_
+
+<think>
+看起来主要的问题是想要确保在启动worker时正确使用NUMA节点分配，以优化多CPU和多GPU环境下的性能。我需要检查当前的worker启动逻辑，并确保它正确使用NUMA配置。
+
+从提供的文件列表来看，start.sh是主要的启动脚本，而ktransformers/worker.py包含worker的实现逻辑。我已经看到worker.py中有使用numactl的代码，但可能需要更多调整。
+</think>
+
+# 优化NUMA节点分配以提高性能
+
+我注意到您提到了要在启动worker时使用NUMA优化。目前的start.sh脚本已经通过worker.py中的`start_worker_process`函数使用了NUMA，但我们可以进一步优化这个过程，确保资源分配更加合理。
+
+首先，让我们优化worker.py中的NUMA节点分配逻辑：
+
+```python:ktransformers/worker.py
+def start_worker_process(worker_id: int, base_port: int, num_workers: int, kvcache_address: str = None, embedding_address: str = None):
+    """启动单个 worker 进程，使用NUMA优化"""
+    # 计算 NUMA 节点
+    numa_nodes = get_numa_nodes()
+    
+    # 更智能地分配NUMA节点
+    if len(numa_nodes) >= 2:
+        # 多NUMA节点环境 - 前半数worker使用节点0，后半数使用节点1
+        node_id = 0 if worker_id < (num_workers // 2) else 1
+    else:
+        # 单NUMA节点环境 - 全部使用节点0
+        node_id = 0
+    
+    # 计算GPU ID - 确保每个节点的worker均匀分配到可用GPU
+    if torch.cuda.device_count() >= 2:
+        # 多GPU环境 - 前半数worker使用GPU 0，后半数使用GPU 1
+        gpu_id = 0 if worker_id < (num_workers // 2) else 1
+    else:
+        # 单GPU环境 - 全部使用GPU 0
+        gpu_id = 0
+    
+    # 计算端口
+    port = base_port + worker_id
+    
+    # 构建numactl命令
+    cmd = [
+        'numactl',
+        f'--cpunodebind={node_id}',
+        f'--membind={node_id}',
+        'python',
+        '-m',
+        'ktransformers.worker',
+        f'--worker_address=10.21.22.206:{port}',
+        f'--worker_id={worker_id}',
+        f'--num_workers={num_workers}',
+        f'--gpu_id={gpu_id}'  # 传递GPU ID作为参数
+    ]
+    
+    # 添加KV缓存服务器地址（如果有）
+    if kvcache_address:
+        cmd.append(f'--kvcache_address={kvcache_address}')
+    
+    # 添加嵌入服务器地址（如果有）
+    if embedding_address:
+        cmd.append(f'--embedding_address={embedding_address}')
+    
+    logger.info(f"Starting worker {worker_id} on NUMA node {node_id}, GPU {gpu_id}, port {port}")
+    subprocess.Popen(cmd)
+```
+
+然后，我们需要修改ModelWorker类的初始化方法，接受新的`gpu_id`参数：
+
+```python:ktransformers/worker.py
+def __init__(self, address: str, worker_id: int = 0, num_workers: int = 1, 
+             kvcache_address: str = None, embedding_address: str = None, gpu_id: int = None):
+    self.worker_id = worker_id
+    self.num_workers = num_workers
+    self.kvcache_address = kvcache_address
+    self.embedding_address = embedding_address
+    
+    # 如果提供了KV Cache服务器地址，则连接
+    if self.kvcache_address:
+        self.kvcache_context = zmq.Context()
+        self.kvcache_socket = self.kvcache_context.socket(zmq.REQ)
+        self.kvcache_socket.connect(f"tcp://{kvcache_address}")
+        logger.info(f"Worker {worker_id} connected to KV Cache Server at {kvcache_address}")
+    else:
+        self.kvcache_socket = None
+        logger.info(f"Worker {worker_id} running without KV Cache Server")
+    
+    # 如果提供了嵌入服务器地址，则连接
+    if self.embedding_address:
+        self.embedding_context = zmq.Context()
+        self.embedding_socket = self.embedding_context.socket(zmq.REQ)
+        self.embedding_socket.connect(f"tcp://{embedding_address}")
+        logger.info(f"Worker {worker_id} connected to Embedding Server at {embedding_address}")
+    else:
+        self.embedding_socket = None
+        logger.info(f"Worker {worker_id} running without Embedding Server")
+    
+    # 设置 GPU 设备
+    if torch.cuda.is_available():
+        # 使用指定的GPU ID或根据worker_id自动分配
+        self.gpu_id = gpu_id if gpu_id is not None else (0 if worker_id < (num_workers // 2) else 1)
+        torch.cuda.set_device(self.gpu_id)
+        logger.info(f"Worker {worker_id} using GPU {self.gpu_id}")
+        
+        # 创建内存管理器，根据不同GPU可能分配不同的显存大小
+        if self.gpu_id == 0:
+
+---
+
+_**User**_
+
+(ds) root@compute06:/archive/liugu/ds/ktransformers# tail -f embedding_server.log
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/modeling_utils.py", line 3916, in from_pretrained
+    ) = cls._load_pretrained_model(
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/modeling_utils.py", line 4390, in _load_pretrained_model
+    new_error_msgs, offload_index, state_dict_index = _load_state_dict_into_meta_model(
+                                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/modeling_utils.py", line 918, in _load_state_dict_into_meta_model
+    raise ValueError(f"{param_name} doesn't have any device set.")
+ValueError: embed_tokens.weight doesn't have any device set
+
+---
+
+_**Assistant**_
+
+<think>
+这是一个与设备映射相关的错误。在Embedding Server中加载模型时，我们尝试将嵌入层和lm_head加载到CUDA设备上，但看起来没有正确设置设备。这个错误通常发生在使用"auto"设备映射或者设备映射不完整时。
+
+我们需要修复`embedding_server.py`中的`_load_embedding_layer`方法，确保正确设置设备。问题可能出在以下几个方面：
+
+1. 使用`AutoModel.from_pretrained`时设备映射不正确
+2. 在创建了嵌入层之后没有将其成功转移到指定设备
+3. 可能需要更详细的设备映射而不仅仅是指定几个顶级模块
+
+让我重写这部分代码以解决问题。
+</think>
+
+这个错误表明在嵌入服务器中加载模型时存在设备映射问题。让我们修复`embedding_server.py`中的`_load_embedding_layer`方法：
+
+```python:ktransformers/embedding_server.py
+def _load_embedding_layer(self):
+    """只加载嵌入层和输出层"""
+    try:
+        logger.info("Loading embedding layers to CUDA...")
+        
+        # 使用更具体的加载方式，避免设备映射问题
+        # 首先初始化一个空模型
+        from transformers import AutoModelForCausalLM
+        
+        # 使用低级API直接加载模型
+        model = AutoModelForCausalLM.from_pretrained(
+            self.model_path,
+            config=self.config,
+            torch_dtype=torch.float16,
+            low_cpu_mem_usage=True,
+            device_map="cpu"  # 先加载到CPU
+        )
+        
+        # 手动提取和移动嵌入层到GPU
+        if hasattr(model, "model") and hasattr(model.model, "embed_tokens"):
+            self.embed_tokens = model.model.embed_tokens.to("cuda:0")
+            logger.info(f"Embedding loaded to cuda:0, dimension: {self.embed_tokens.embedding_dim}")
+        else:
+            logger.error("Could not find embedding layer in model")
+            raise ValueError("Embedding layer not found")
+        
+        # 手动提取和移动LM头到GPU
+        if hasattr(model, "lm_head"):
+            self.lm_head = model.lm_head.to("cuda:0")
+            logger.info(f"LM head loaded to cuda:0, shape: {self.lm_head.weight.shape}")
+        else:
+            logger.error("Could not find lm_head in model")
+            raise ValueError("LM head not found")
+        
+        # 删除不需要的模型部分以节省内存
+        del model
+        torch.cuda.empty_cache()
+        gc.collect()
+        
+        logger.info("Successfully loaded embedding layer and lm_head to GPU")
+    except Exception as e:
+        logger.error(f"Error loading embedding layer: {str(e)}")
+        raise
+```
+
+这个修复方案解决了几个关键问题：
+
+1. 使用`device_map="cpu"`先将整个模型加载到CPU，避免自动设备映射的复杂性
+2. 然后手动将所需的子模块移动到CUDA设备
+3. 使用`to("cuda:0")`明确指定设备，而不是依赖于device_map
+4. 删除原始模型以节省内存
+
+同时，为了进一步增强错误处理和调试能力，我们可以在`main`中添加更多日志信息：
+
+```python:ktransformers/embedding_server.py
+def main():
+    parser = argparse.ArgumentParser(description="Embedding Server")
+    parser.add_argument("--server_address", type=str, default="0.0.0.0:29700",
+                      help="Address to listen for requests")
+    parser.add_argument("--model_path", type=str, required=True,
+                      help="Path to the model")
+    parser.add_argument("--skip_tokenizer", type=str, choices=["true", "false"], default="true",
+                      help="Skip loading tokenizer (will be handled by scheduler)")
+    parser.add_argument("--cuda_visible_devices", type=str, default="0",
+                      help="Specify which CUDA devices to use, e.g. '0'")
+    
+    args = parser.parse_args()
+    
+    # 设置CUDA设备
+    os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_visible_devices
+    
+    # 输出CUDA信息
+    if torch.cuda.is_available():
+        logger.info(f"CUDA available: {torch.cuda.is_available()}")
+        logger.info(f"CUDA device count: {torch.cuda.device_count()}")
+        logger.info(f"CUDA current device: {torch.cuda.current_device()}")
+        logger.info(f"CUDA device name: {torch.cuda.get_device_name(0)}")
+    else:
+        logger.warning("CUDA not available, using CPU only!")
+    
+    # 启动嵌入服务器
+    skip_tokenizer = args.skip_tokenizer.lower() == "true"
+    try:
+        server = EmbeddingServer(args.server_address, args.model_path, skip_tokenizer)
+        server.run()
+    except Exception as e:
+        logger.error(f"Failed to start embedding server: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        sys.exit(1)
+```
+
+这些修改将帮助解决当前的设备映射错误，并确保嵌入层被正确加载到GPU上。
+
+需要修改`start.sh`中相应的命令行：
+
+```bash:start.sh
+# 启动嵌入服务器
+echo "启动嵌入服务器..."
+PYTHONPATH=$PYTHONPATH python -m ktransformers.embedding_server --server_address ${COMPUTE_IP}:29700 --model_path $MODEL_PATH --skip_tokenizer true --cuda_visible_devices 0 > embedding_server.log 2>&1 &
+```
+
+这样就可以明确指定使用哪个GPU设备，避免设备映射问题。
+
+---
+
+_**User**_
+
+我有两块GPU
+
+---
+
+_**Assistant**_
+
+
 
 ---
 

@@ -66,21 +66,21 @@ kill_existing_processes() {
 start_compute_services() {
     echo "在计算服务器 (compute06) 上启动服务..."
     
-    # 启动嵌入服务器
+    # 启动嵌入服务器 (使用GPU 0)
     echo "启动嵌入服务器..."
-    PYTHONPATH=$PYTHONPATH python -m ktransformers.embedding_server --server_address ${COMPUTE_IP}:29700 --model_path $MODEL_PATH --skip_tokenizer true > embedding_server.log 2>&1 &
+    PYTHONPATH=$PYTHONPATH python -m ktransformers.embedding_server --server_address ${COMPUTE_IP}:29700 --model_path $MODEL_PATH --skip_tokenizer true --cuda_visible_devices 0 > embedding_server.log 2>&1 &
     
     # 等待嵌入服务器启动
     sleep 3
     
-    # 启动 KV Cache 服务器
+    # 启动 KV Cache 服务器 (使用GPU 1)
     echo "启动 KV Cache 服务器..."
-    PYTHONPATH=$PYTHONPATH python -m ktransformers.kvcache_server --server_address ${COMPUTE_IP}:29600 --num_workers 8 > kvcache_server.log 2>&1 &
+    CUDA_VISIBLE_DEVICES=1 PYTHONPATH=$PYTHONPATH python -m ktransformers.kvcache_server --server_address ${COMPUTE_IP}:29600 --num_workers 8 > kvcache_server.log 2>&1 &
     
     # 等待 KV Cache 服务器启动
     sleep 3
     
-    # 启动 Worker 进程
+    # 启动 Worker 进程 (workers分布在两块GPU上)
     echo "启动 Worker 进程..."
     PYTHONPATH=$PYTHONPATH python -m ktransformers.worker --base_port 29500 --num_workers 8 --kvcache_address ${COMPUTE_IP}:29600 --embedding_address ${COMPUTE_IP}:29700 > worker.log 2>&1 &
     

@@ -11,6 +11,8 @@ from transformers import AutoTokenizer, AutoModel, AutoConfig
 import time
 import gc
 from typing import Dict, Any, List, Optional
+import os
+import sys
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -54,41 +56,43 @@ class EmbeddingServer:
     def _load_embedding_layer(self):
         """只加载嵌入层和输出层"""
         try:
-            # 尝试直接加载嵌入层
-            device_map = {
-                "model.embed_tokens": "cuda:0",
-                "lm_head": "cuda:0"
-            }
+            logger.info("Loading embedding layers to CUDA...")
             
-            self.model = AutoModel.from_pretrained(
+            # 使用更具体的加载方式，避免设备映射问题
+            # 首先初始化一个空模型
+            from transformers import AutoModelForCausalLM
+            
+            # 使用低级API直接加载模型
+            model = AutoModelForCausalLM.from_pretrained(
                 self.model_path,
                 config=self.config,
-                device_map=device_map,
                 torch_dtype=torch.float16,
-                low_cpu_mem_usage=True
+                low_cpu_mem_usage=True,
+                device_map="cpu"  # 先加载到CPU
             )
             
-            # 分离出嵌入层和输出层
-            if hasattr(self.model, "model") and hasattr(self.model.model, "embed_tokens"):
-                self.embed_tokens = self.model.model.embed_tokens
-                logger.info(f"Embedding dimension: {self.embed_tokens.embedding_dim}")
+            # 手动提取和移动嵌入层到GPU
+            if hasattr(model, "model") and hasattr(model.model, "embed_tokens"):
+                self.embed_tokens = model.model.embed_tokens.to("cuda:0")
+                logger.info(f"Embedding loaded to cuda:0, dimension: {self.embed_tokens.embedding_dim}")
             else:
                 logger.error("Could not find embedding layer in model")
                 raise ValueError("Embedding layer not found")
             
-            if hasattr(self.model, "lm_head"):
-                self.lm_head = self.model.lm_head
-                logger.info(f"LM head shape: {self.lm_head.weight.shape}")
+            # 手动提取和移动LM头到GPU
+            if hasattr(model, "lm_head"):
+                self.lm_head = model.lm_head.to("cuda:0")
+                logger.info(f"LM head loaded to cuda:0, shape: {self.lm_head.weight.shape}")
             else:
                 logger.error("Could not find lm_head in model")
                 raise ValueError("LM head not found")
             
             # 删除不需要的模型部分以节省内存
-            delattr(self.model, "model")
+            del model
             torch.cuda.empty_cache()
             gc.collect()
             
-            logger.info("Successfully loaded embedding layer and lm_head")
+            logger.info("Successfully loaded embedding layer and lm_head to GPU")
         except Exception as e:
             logger.error(f"Error loading embedding layer: {str(e)}")
             raise
@@ -269,13 +273,33 @@ def main():
                       help="Path to the model")
     parser.add_argument("--skip_tokenizer", type=str, choices=["true", "false"], default="true",
                       help="Skip loading tokenizer (will be handled by scheduler)")
+    parser.add_argument("--cuda_visible_devices", type=str, default="0",
+                      help="Specify which CUDA devices to use, e.g. '0'")
     
     args = parser.parse_args()
     
+    # 设置CUDA设备
+    os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_visible_devices
+    
+    # 输出CUDA信息
+    if torch.cuda.is_available():
+        logger.info(f"CUDA available: {torch.cuda.is_available()}")
+        logger.info(f"CUDA device count: {torch.cuda.device_count()}")
+        logger.info(f"CUDA current device: {torch.cuda.current_device()}")
+        logger.info(f"CUDA device name: {torch.cuda.get_device_name(0)}")
+    else:
+        logger.warning("CUDA not available, using CPU only!")
+    
     # 启动嵌入服务器
     skip_tokenizer = args.skip_tokenizer.lower() == "true"
-    server = EmbeddingServer(args.server_address, args.model_path, skip_tokenizer)
-    server.run()
+    try:
+        server = EmbeddingServer(args.server_address, args.model_path, skip_tokenizer)
+        server.run()
+    except Exception as e:
+        logger.error(f"Failed to start embedding server: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        sys.exit(1)
 
 if __name__ == "__main__":
     main() 

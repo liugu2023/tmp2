@@ -99,11 +99,13 @@ class KVCacheLayer(torch.nn.Module):
         return result
 
 class ModelWorker:
-    def __init__(self, address: str, worker_id: int = 0, num_workers: int = 1, kvcache_address: str = None, embedding_address: str = None):
+    def __init__(self, address: str, worker_id: int = 0, num_workers: int = 1, 
+                 kvcache_address: str = None, embedding_address: str = None, gpu_id: int = None):
         self.worker_id = worker_id
         self.num_workers = num_workers
         self.kvcache_address = kvcache_address
         self.embedding_address = embedding_address
+        self.gpu_id = gpu_id
         
         # 如果提供了KV Cache服务器地址，则连接
         if self.kvcache_address:
@@ -127,8 +129,13 @@ class ModelWorker:
         
         # 设置 GPU 设备
         if torch.cuda.is_available():
-            # 根据 worker_id 分配 GPU
-            self.gpu_id = 0 if worker_id < 4 else 1
+            # 使用指定的GPU ID或根据worker_id自动分配
+            if self.gpu_id is None:
+                # 如果没有指定GPU ID，则根据worker_id分配
+                self.gpu_id = 0 if worker_id < (num_workers // 2) else 1
+            
+            # 设置设备
+            self.device = f"cuda:{self.gpu_id}"
             torch.cuda.set_device(self.gpu_id)
             logger.info(f"Worker {worker_id} using GPU {self.gpu_id}")
             
@@ -136,6 +143,7 @@ class ModelWorker:
             self.memory_manager = LayerMemoryManager(self.gpu_id, "3GiB")
         else:
             self.gpu_id = None
+            self.device = "cpu"
             logger.warning("CUDA not available, using CPU only.")
         
         # 设置 ZMQ 服务器
@@ -563,16 +571,21 @@ def main():
                         help='Address of KV Cache Server (e.g., "10.21.22.206:29600")')
     parser.add_argument('--embedding_address', type=str, default=None,
                         help='Address of Embedding Server (e.g., "10.21.22.206:29700")')
+    parser.add_argument('--gpu_id', type=int, default=None,
+                        help='Specific GPU ID to use (default: auto-assign based on worker_id)')
     args = parser.parse_args()
     
     if args.worker_address:
         # 单个 worker 进程模式
-        worker = ModelWorker(args.worker_address, args.worker_id, args.num_workers, args.kvcache_address, args.embedding_address)
+        worker = ModelWorker(args.worker_address, args.worker_id, args.num_workers, 
+                             args.kvcache_address, args.embedding_address, args.gpu_id)
         worker.run()
     else:
         # 主进程模式，启动多个 worker
         for worker_id in range(args.num_workers):
-            start_worker_process(worker_id, args.base_port, args.num_workers, args.kvcache_address, args.embedding_address)
+            gpu_id = 0 if worker_id < (args.num_workers // 2) else 1
+            start_worker_process(worker_id, args.base_port, args.num_workers, 
+                                args.kvcache_address, args.embedding_address, gpu_id)
         
         # 等待所有进程
         try:
@@ -581,7 +594,8 @@ def main():
         except KeyboardInterrupt:
             logger.info("Shutting down all workers...")
 
-def start_worker_process(worker_id: int, base_port: int, num_workers: int, kvcache_address: str = None, embedding_address: str = None):
+def start_worker_process(worker_id: int, base_port: int, num_workers: int, 
+                        kvcache_address: str = None, embedding_address: str = None, gpu_id: int = None):
     """启动单个 worker 进程"""
     # 计算 NUMA 节点
     numa_nodes = get_numa_nodes()
@@ -603,6 +617,10 @@ def start_worker_process(worker_id: int, base_port: int, num_workers: int, kvcac
         f'--num_workers={num_workers}'
     ]
     
+    # 添加GPU ID（如果指定）
+    if gpu_id is not None:
+        cmd.append(f'--gpu_id={gpu_id}')
+    
     # 添加KV缓存服务器地址（如果有）
     if kvcache_address:
         cmd.append(f'--kvcache_address={kvcache_address}')
@@ -611,7 +629,7 @@ def start_worker_process(worker_id: int, base_port: int, num_workers: int, kvcac
     if embedding_address:
         cmd.append(f'--embedding_address={embedding_address}')
     
-    logger.info(f"Starting worker {worker_id} on NUMA node {node_id} with port {port}")
+    logger.info(f"Starting worker {worker_id} on NUMA node {node_id}, GPU {gpu_id}, port {port}")
     subprocess.Popen(cmd)
 
 if __name__ == '__main__':

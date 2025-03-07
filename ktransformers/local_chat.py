@@ -52,7 +52,38 @@ class DistributedModel:
         else:
             raise ValueError("Must provide either worker_address or scheduler_address")
 
+        # 初始化后检查模型状态
+        if self.use_scheduler:
+            self._check_model_status()
+
+    def _check_model_status(self):
+        """检查模型是否已加载，避免重复加载"""
+        try:
+            logger.info("Checking model status...")
+            self.socket.send_pyobj({"command": "status"})
+            response = self.socket.recv_pyobj()
+            
+            if response.get('status') == 'success' and response.get('model_loaded', False):
+                logger.info("Model already loaded, skipping load step")
+                self.model_loaded = True
+                print("模型已经加载完成，可以开始对话")
+                return True
+            else:
+                logger.info("Model not loaded yet")
+                return False
+        except Exception as e:
+            logger.error(f"Error checking model status: {e}")
+            return False
+
     def load_model(self, model_path: str, gguf_path: str):
+        if self.model_loaded:
+            logger.info("Model already loaded, skipping load step")
+            return True
+        
+        # 先检查模型状态，避免重复加载
+        if self.use_scheduler and self._check_model_status():
+            return True
+        
         message = {
             'command': 'load_model',
             'model_path': model_path,

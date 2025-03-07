@@ -8,6 +8,8 @@ import logging
 import time
 import argparse
 import torch
+import json
+import os
 from typing import Dict, Any, List
 from transformers import AutoTokenizer
 
@@ -36,6 +38,11 @@ class SchedulerServer:
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         logger.info(f"Tokenizer loaded successfully")
         
+        # 添加会话状态管理
+        self.model_loaded = False
+        self.session_file = "scheduler_session.json"
+        self._load_session_state()
+        
         # 统计信息
         self.stats = {
             "total_requests": 0,
@@ -43,6 +50,53 @@ class SchedulerServer:
             "active_sessions": 0,
             "total_tokens_processed": 0
         }
+    
+    def _load_session_state(self):
+        """从文件加载会话状态"""
+        try:
+            if os.path.exists(self.session_file):
+                with open(self.session_file, 'r') as f:
+                    state = json.load(f)
+                    self.model_loaded = state.get('model_loaded', False)
+                    logger.info(f"Loaded session state: model_loaded={self.model_loaded}")
+            else:
+                logger.info("No session state file found, starting fresh")
+        except Exception as e:
+            logger.error(f"Error loading session state: {e}")
+    
+    def _save_session_state(self):
+        """保存会话状态到文件"""
+        try:
+            state = {
+                'model_loaded': self.model_loaded,
+                'timestamp': time.time()
+            }
+            with open(self.session_file, 'w') as f:
+                json.dump(state, f)
+            logger.info("Saved session state")
+        except Exception as e:
+            logger.error(f"Error saving session state: {e}")
+    
+    def check_model_status(self):
+        """检查模型是否已加载"""
+        if self.model_loaded:
+            # 如果我们认为模型已加载，再向计算节点确认一次
+            try:
+                self.compute_socket.send_pyobj({"command": "status"})
+                response = self.compute_socket.recv_pyobj()
+                if response.get('status') == 'ready' and response.get('model_loaded', False):
+                    return True
+                else:
+                    # 状态不一致，更新本地状态
+                    self.model_loaded = False
+                    self._save_session_state()
+                    return False
+            except Exception as e:
+                logger.error(f"Error checking model status: {e}")
+                self.model_loaded = False
+                self._save_session_state()
+                return False
+        return False
     
     def run(self):
         """运行调度器主循环"""
@@ -60,9 +114,24 @@ class SchedulerServer:
                     # 处理关闭命令
                     self.client_socket.send_pyobj({"status": "shutdown"})
                     break
+                elif command == "status":
+                    # 返回状态信息，包括模型加载状态
+                    is_model_loaded = self.check_model_status()
+                    self.client_socket.send_pyobj({
+                        "status": "success", 
+                        "model_loaded": is_model_loaded
+                    })
                 elif command == "stats":
                     # 返回统计信息
                     response = self._get_stats()
+                    self.client_socket.send_pyobj(response)
+                elif command == "load_model":
+                    # 转发加载模型命令并更新状态
+                    self.compute_socket.send_pyobj(client_request)
+                    response = self.compute_socket.recv_pyobj()
+                    if response.get('status') == 'success':
+                        self.model_loaded = True
+                        self._save_session_state()
                     self.client_socket.send_pyobj(response)
                 elif command == "chat":
                     # 处理聊天请求 - 只进行模板拼接，不做embedding
@@ -84,13 +153,12 @@ class SchedulerServer:
                         logger.error(f"Error forwarding request: {str(e)}")
                         self.client_socket.send_pyobj({
                             "status": "error",
-                            "error": f"Scheduler error: {str(e)}"
+                            "error": f"Request forwarding error: {str(e)}"
                         })
         finally:
-            logger.info("Shutting down scheduler...")
-            self.client_socket.close()
-            self.compute_socket.close()
-            self.context.term()
+            # 保存会话状态
+            self._save_session_state()
+            logger.info("Scheduler shutdown")
     
     def _handle_chat_request(self, client_request):
         """处理聊天请求 - 只进行模板拼接，不做embedding"""

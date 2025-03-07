@@ -531,6 +531,15 @@ class ModelWorker:
                         self.load_model(message['model_path'], message['gguf_path'])
                         self.socket.send_pyobj({'status': 'success'})
                     
+                    elif command == 'status':
+                        # 返回模型状态
+                        status = {
+                            'status': 'ready',
+                            'model_loaded': hasattr(self, 'model') and self.model is not None,
+                            'worker_id': self.worker_id
+                        }
+                        self.socket.send_pyobj(status)
+                    
                     elif command == 'generate':
                         result = self.generate(message['data'])
                         self.socket.send_pyobj(result)

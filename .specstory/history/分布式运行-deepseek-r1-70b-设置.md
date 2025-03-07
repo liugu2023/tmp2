@@ -9190,7 +9190,400 @@ _**User**_
 
 _**Assistant**_
 
+<think>
+根据信息，我们需要优化系统以充分利用两块GPU。目前你已经为embedding server添加了CUDA设备选择参数，但我们可以进一步优化worker.py和start.sh，让两块GPU更均衡地参与计算。
 
+关键策略:
+1. 将embedding server放在GPU 0上运行
+2. 将不同worker分布在两块GPU上
+3. 在worker.py中添加GPU设备选择参数
+4. 在start.sh中调整启动命令，明确指定各个服务使用的GPU
+</think>
+
+# 优化双GPU使用策略
+
+既然有两块GPU，我们应该更有效地利用它们。让我调整代码以适应双GPU环境：
+
+```python:ktransformers/worker.py
+def __init__(self, address: str, worker_id: int = 0, num_workers: int = 1, 
+             kvcache_address: str = None, embedding_address: str = None, gpu_id: int = None):
+    self.worker_id = worker_id
+    self.num_workers = num_workers
+    self.kvcache_address = kvcache_address
+    self.embedding_address = embedding_address
+    self.gpu_id = gpu_id
+    
+    # 如果提供了KV Cache服务器地址，则连接
+    if self.kvcache_address:
+        self.kvcache_context = zmq.Context()
+        self.kvcache_socket = self.kvcache_context.socket(zmq.REQ)
+        self.kvcache_socket.connect(f"tcp://{kvcache_address}")
+        logger.info(f"Worker {worker_id} connected to KV Cache Server at {kvcache_address}")
+    else:
+        self.kvcache_socket = None
+        logger.info(f"Worker {worker_id} running without KV Cache Server")
+    
+    # 如果提供了嵌入服务器地址，则连接
+    if self.embedding_address:
+        self.embedding_context = zmq.Context()
+        self.embedding_socket = self.embedding_context.socket(zmq.REQ)
+        self.embedding_socket.connect(f"tcp://{embedding_address}")
+        logger.info(f"Worker {worker_id} connected to Embedding Server at {embedding_address}")
+    else:
+        self.embedding_socket = None
+        logger.info(f"Worker {worker_id} running without Embedding Server")
+    
+    # 设置 GPU 设备
+    if torch.cuda.is_available():
+        # 使用指定的GPU ID或根据worker_id自动分配
+        if self.gpu_id is None:
+            # 如果没有指定GPU ID，则根据worker_id分配
+            self.gpu_id = 0 if worker_id < (num_workers // 2) else 1
+        
+        # 设置设备
+        self.device = f"cuda:{self.gpu_id}"
+        torch.cuda.set_device(self.gpu_id)
+        logger.info(f"Worker {worker_id} using GPU {self.gpu_id}")
+        
+        # 创建内存管理器
+        self.memory_manager = LayerMemoryManager(self.gpu_id, "3GiB")
+    else:
+        self.gpu_id = None
+        self.device = "cpu"
+        logger.warning("CUDA not available, using CPU only.")
+```
+
+
+然后，我们需要修改命令行参数解析部分来接受gpu_id参数：
+
+```python:ktransformers/worker.py
+def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--base_port', type=int, default=29500)
+    parser.add_argument('--num_workers', type=int, default=8)
+    parser.add_argument('--worker_address', type=str, required=False)
+    parser.add_argument('--worker_id', type=int, default=0)
+    parser.add_argument('--kvcache_address', type=str, default=None,
+                        help='Address of KV Cache Server (e.g., "10.21.22.206:29600")')
+    parser.add_argument('--embedding_address', type=str, default=None,
+                        help='Address of Embedding Server (e.g., "10.21.22.206:29700")')
+    parser.add_argument('--gpu_id', type=int, default=None,
+                        help='Specific GPU ID to use (default: auto-assign based on worker_id)')
+    args = parser.parse_args()
+    
+    if args.worker_address:
+        # 单个 worker 进程模式
+        worker = ModelWorker(args.worker_address, args.worker_id, args.num_workers, 
+                             args.kvcache_address, args.embedding_address, args.gpu_id)
+        worker.run()
+    else:
+        # 主进程模式，启动多个 worker
+        for worker_id in range(args.num_workers):
+            gpu_id = 0 if worker_id < (args.num_workers // 2) else 1
+            start_worker_process(worker_id, args.base_port, args.num_workers, 
+                                args.kvcache_address, args.embedding_address, gpu_id)
+```
+
+
+现在，我们需要修改`start_worker_process`函数来接受和传递gpu_id参数：
+
+```python:ktransformers/worker.py
+def start_worker_process(worker_id: int, base_port: int, num_workers: int, 
+                        kvcache_address: str = None, embedding_address: str = None, gpu_id: int = None):
+    """启动单个 worker 进程"""
+    # 计算 NUMA 节点
+    numa_nodes = get_numa_nodes()
+    node_id = 0 if worker_id < 4 else 1  # 前4个进程在节点0，后4个在节点1
+    
+    # 计算端口
+    port = base_port + worker_id
+    
+    # 使用 numactl 启动进程
+    cmd = [
+        'numactl',
+        f'--cpunodebind={node_id}',
+        f'--membind={node_id}',
+        'python',
+        '-m',
+        'ktransformers.worker',
+        f'--worker_address=10.21.22.206:{port}',
+        f'--worker_id={worker_id}',
+        f'--num_workers={num_workers}'
+    ]
+    
+    # 添加GPU ID（如果指定）
+    if gpu_id is not None:
+        cmd.append(f'--gpu_id={gpu_id}')
+    
+    # 添加KV缓存服务器地址（如果有）
+    if kvcache_address:
+        cmd.append(f'--kvcache_address={kvcache_address}')
+    
+    # 添加嵌入服务器地址（如果有）
+    if embedding_address:
+        cmd.append(f'--embedding_address={embedding_address}')
+    
+    logger.info(f"Starting worker {worker_id} on NUMA node {node_id}, GPU {gpu_id}, port {port}")
+    subprocess.Popen(cmd)
+```
+
+
+现在，让我们修改start.sh，添加一个选项来使用KV Cache服务器的GPU配置：
+
+```bash:start.sh
+# 启动计算服务器上的服务
+start_compute_services() {
+    echo "在计算服务器 (compute06) 上启动服务..."
+    
+    # 启动嵌入服务器 (使用GPU 0)
+    echo "启动嵌入服务器..."
+    PYTHONPATH=$PYTHONPATH python -m ktransformers.embedding_server --server_address ${COMPUTE_IP}:29700 --model_path $MODEL_PATH --skip_tokenizer true --cuda_visible_devices 0 > embedding_server.log 2>&1 &
+    
+    # 等待嵌入服务器启动
+    sleep 3
+    
+    # 启动 KV Cache 服务器 (使用GPU 1)
+    echo "启动 KV Cache 服务器..."
+    CUDA_VISIBLE_DEVICES=1 PYTHONPATH=$PYTHONPATH python -m ktransformers.kvcache_server --server_address ${COMPUTE_IP}:29600 --num_workers 8 > kvcache_server.log 2>&1 &
+    
+    # 等待 KV Cache 服务器启动
+    sleep 3
+    
+    # 启动 Worker 进程 (workers分布在两块GPU上)
+    echo "启动 Worker 进程..."
+    PYTHONPATH=$PYTHONPATH python -m ktransformers.worker --base_port 29500 --num_workers 8 --kvcache_address ${COMPUTE_IP}:29600 --embedding_address ${COMPUTE_IP}:29700 > worker.log 2>&1 &
+    
+    echo "所有服务已启动"
+    echo "KV Cache 服务器日志: kvcache_server.log"
+    echo "嵌入服务器日志: embedding_server.log"
+    echo "Worker 进程日志: worker.log"
+}
+```
+
+
+这些修改优化了双GPU的使用:
+
+1. **嵌入服务器** 使用GPU 0处理词表查询
+2. **KV Cache服务器** 使用GPU 1存储共享KV缓存
+3. **Worker进程** 分为两组:
+   - 前4个worker (0-3) 使用GPU 0
+   - 后4个worker (4-7) 使用GPU 1
+4. **NUMA绑定** 还是保持原来的分配：
+   - worker 0-3 绑定到NUMA节点0
+   - worker 4-7 绑定到NUMA节点1
+
+这种设置充分利用了两块GPU的计算能力，同时通过NUMA绑定确保CPU与内存访问的局部性，从而提高整体性能。
+
+---
+
+_**User**_
+
+现在客户端意外断连，重连后即使模型已经加载完成，也不会进入对话状态
+
+---
+
+_**Assistant**_
+
+<think>
+我需要找出为什么客户端重连后无法进入对话状态的问题。这可能与以下几个因素有关：
+
+1. 客户端连接状态没有正确恢复
+2. 服务端不知道模型已经加载完成
+3. 某些状态信息丢失导致客户端需要重新初始化
+
+让我检查`local_chat.py`和`scheduler.py`中的相关代码，看看客户端连接和模型加载状态是如何管理的。
+</think>
+
+# 修复客户端重连问题
+
+我注意到当客户端意外断连再重连后，系统没有能够正确恢复到对话状态。这是因为服务端没有保持客户端会话状态。让我们来修复这个问题。
+
+## 1. 修改scheduler.py添加会话管理
+
+```python:ktransformers/scheduler.py
+"""
+任务调度服务器
+负责处理用户请求，拼接聊天模板并转发到计算节点
+"""
+
+import zmq
+import logging
+import time
+import argparse
+import torch
+import json
+import os
+from typing import Dict, Any, List
+from transformers import AutoTokenizer
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class SchedulerServer:
+    def __init__(self, server_address: str, compute_address: str, model_path: str):
+        # 初始化ZMQ上下文
+        self.context = zmq.Context()
+        
+        # 设置面向客户端的套接字
+        self.client_socket = self.context.socket(zmq.REP)
+        self.client_socket.bind(f"tcp://{server_address}")
+        logger.info(f"Scheduler listening for clients at {server_address}")
+        
+        # 设置面向计算节点的套接字
+        self.compute_socket = self.context.socket(zmq.REQ)
+        self.compute_address = compute_address
+        self.compute_socket.connect(f"tcp://{compute_address}")
+        logger.info(f"Connected to compute node at {compute_address}")
+        
+        # 加载tokenizer
+        self.model_path = model_path
+        logger.info(f"Loading tokenizer from {model_path}")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        logger.info(f"Tokenizer loaded successfully")
+        
+        # 添加会话状态管理
+        self.model_loaded = False
+        self.session_file = "scheduler_session.json"
+        self._load_session_state()
+        
+        # 统计信息
+        self.stats = {
+            "total_requests": 0,
+            "start_time": time.time(),
+            "active_sessions": 0,
+            "total_tokens_processed": 0
+        }
+    
+    def _load_session_state(self):
+        """从文件加载会话状态"""
+        try:
+            if os.path.exists(self.session_file):
+                with open(self.session_file, 'r') as f:
+                    state = json.load(f)
+                    self.model_loaded = state.get('model_loaded', False)
+                    logger.info(f"Loaded session state: model_loaded={self.model_loaded}")
+            else:
+                logger.info("No session state file found, starting fresh")
+        except Exception as e:
+            logger.error(f"Error loading session state: {e}")
+    
+    def _save_session_state(self):
+        """保存会话状态到文件"""
+        try:
+            state = {
+                'model_loaded': self.model_loaded,
+                'timestamp': time.time()
+            }
+            with open(self.session_file, 'w') as f:
+                json.dump(state, f)
+            logger.info("Saved session state")
+        except Exception as e:
+            logger.error(f"Error saving session state: {e}")
+    
+    def check_model_status(self):
+        """检查模型是否已加载"""
+        if self.model_loaded:
+            # 如果我们认为模型已加载，再向计算节点确认一次
+            try:
+                self.compute_socket.send_pyobj({"command": "status"})
+                response = self.compute_socket.recv_pyobj()
+                if response.get('status') == 'ready' and response.get('model_loaded', False):
+                    return True
+                else:
+                    # 状态不一致，更新本地状态
+                    self.model_loaded = False
+                    self._save_session_state()
+                    return False
+            except Exception as e:
+                logger.error(f"Error checking model status: {e}")
+                self.model_loaded = False
+                self._save_session_state()
+                return False
+        return False
+    
+    def run(self):
+        """运行调度器主循环"""
+        logger.info("Scheduler server ready to receive requests")
+        try:
+            while True:
+                # 接收来自客户端的请求
+                client_request = self.client_socket.recv_pyobj()
+                self.stats["total_requests"] += 1
+                
+                command = client_request.get("command")
+                logger.info(f"Received {command} request from client")
+                
+                if command == "shutdown":
+                    # 处理关闭命令
+                    self.client_socket.send_pyobj({"status": "shutdown"})
+                    break
+                elif command == "status":
+                    # 返回状态信息，包括模型加载状态
+                    is_model_loaded = self.check_model_status()
+                    self.client_socket.send_pyobj({
+                        "status": "success", 
+                        "model_loaded": is_model_loaded
+                    })
+                elif command == "stats":
+                    # 返回统计信息
+                    response = self._get_stats()
+                    self.client_socket.send_pyobj(response)
+                elif command == "load_model":
+                    # 转发加载模型命令并更新状态
+                    self.compute_socket.send_pyobj(client_request)
+                    response = self.compute_socket.recv_pyobj()
+                    if response.get('status') == 'success':
+                        self.model_loaded = True
+                        self._save_session_state()
+                    self.client_socket.send_pyobj(response)
+                elif command == "chat":
+                    # 处理聊天请求 - 只进行模板拼接，不做embedding
+                    self._handle_chat_request(client_request)
+                else:
+                    # 转发所有其他命令到计算节点
+                    try:
+                        # 将请求转发到计算节点
+                        self.compute_socket.send_pyobj(client_request)
+                        
+                        # 如果是generate命令，则处理流式响应
+                        if command == "generate":
+                            self._handle_streaming_response()
+                        else:
+                            # 普通命令直接转发响应
+                            compute_response = self.compute_socket.recv_pyobj()
+                            self.client_socket.send_pyobj(compute_response)
+                    except Exception as e:
+                        logger.error(f"Error forwarding request: {str(e)}")
+                        self.client_socket.send_pyobj({
+                            "status": "error",
+                            "error": f"Request forwarding error: {str(e)}"
+                        })
+        finally:
+            # 保存会话状态
+            self._save_session_state()
+            logger.info("Scheduler shutdown")
+```
+
+## 2. 修改local_chat.py添加状态检查
+
+```python:ktransformers/local_chat.py
+def __init__(self, model_path: str = None, scheduler_address: str = None, **kwargs):
+    # 现有代码...
+    
+    # 初始化后检查模型状态
+    if self.use_scheduler:
+        self._check_model_status()
+
+def _check_model_status(self):
+    """检查模型是否已加载，避免重复加载"""
+    try:
+        logger.info("Checking model status...")
+        self.socket.send_pyobj({"command": "status"})
+        response = self.socket.recv_pyobj()
+        
+        if response.get('status') == 'success' and response.get('model_loaded', False):
+            logger.info("Model already
 
 ---
 

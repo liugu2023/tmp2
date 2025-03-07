@@ -23,6 +23,13 @@ is_compute_node() {
 kill_existing_processes() {
     echo "检测并杀死已存在的进程..."
     
+    # 杀死嵌入服务器进程 (端口 29700)
+    EMBEDDING_PID=$(netstat -tunlp 2>/dev/null | grep ":29700" | awk '{print $7}' | cut -d'/' -f1)
+    if [ ! -z "$EMBEDDING_PID" ]; then
+        echo "正在杀死嵌入服务器进程 (PID: $EMBEDDING_PID)..."
+        kill -9 $EMBEDDING_PID
+    fi
+    
     # 杀死 KV Cache Server 进程 (端口 29600)
     KVCACHE_PID=$(netstat -tunlp 2>/dev/null | grep ":29600" | awk '{print $7}' | cut -d'/' -f1)
     if [ ! -z "$KVCACHE_PID" ]; then
@@ -59,6 +66,13 @@ kill_existing_processes() {
 start_compute_services() {
     echo "在计算服务器 (compute06) 上启动服务..."
     
+    # 启动嵌入服务器
+    echo "启动嵌入服务器..."
+    PYTHONPATH=$PYTHONPATH python -m ktransformers.embedding_server --server_address ${COMPUTE_IP}:29700 --model_path $MODEL_PATH > embedding_server.log 2>&1 &
+    
+    # 等待嵌入服务器启动
+    sleep 3
+    
     # 启动 KV Cache 服务器
     echo "启动 KV Cache 服务器..."
     PYTHONPATH=$PYTHONPATH python -m ktransformers.kvcache_server --server_address ${COMPUTE_IP}:29600 --num_workers 8 > kvcache_server.log 2>&1 &
@@ -68,10 +82,11 @@ start_compute_services() {
     
     # 启动 Worker 进程
     echo "启动 Worker 进程..."
-    PYTHONPATH=$PYTHONPATH python -m ktransformers.worker --base_port 29500 --num_workers 8 --kvcache_address ${COMPUTE_IP}:29600 > worker.log 2>&1 &
+    PYTHONPATH=$PYTHONPATH python -m ktransformers.worker --base_port 29500 --num_workers 8 --kvcache_address ${COMPUTE_IP}:29600 --embedding_address ${COMPUTE_IP}:29700 > worker.log 2>&1 &
     
     echo "所有服务已启动"
     echo "KV Cache 服务器日志: kvcache_server.log"
+    echo "嵌入服务器日志: embedding_server.log"
     echo "Worker 进程日志: worker.log"
 }
 
@@ -142,7 +157,7 @@ if [ $# -eq 0 ]; then
         ps aux | grep "python.*ktransformers" | grep -v grep
         
         echo "端口监听状态:"
-        netstat -tunlp 2>/dev/null | grep -E ":(29500|29501|29502|29503|29504|29505|29506|29507|29600)"
+        netstat -tunlp 2>/dev/null | grep -E ":(29500|29501|29502|29503|29504|29505|29506|29507|29600|29700)"
     elif is_scheduler_node; then
         echo "检测到调度节点 (login)..."
         kill_existing_processes

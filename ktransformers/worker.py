@@ -74,11 +74,36 @@ class LayerMemoryManager:
             torch.cuda.empty_cache()
             gc.collect()
 
+class KVCacheLayer(torch.nn.Module):
+    """代理层，用于从KV Cache获取结果"""
+    
+    def __init__(self, worker, layer_id):
+        super().__init__()
+        self.worker = worker
+        self.layer_id = layer_id
+    
+    def forward(self, hidden_states, attention_mask=None, **kwargs):
+        """从KV缓存获取结果，而不是本地计算"""
+        request_id = kwargs.get('request_id', str(uuid.uuid4()))
+        
+        # 从KV缓存服务器获取计算结果
+        result = self.worker.retrieve_kv_cache(request_id, self.layer_id)
+        
+        if result is None:
+            # 如果结果不可用，记录错误
+            logger.error(f"Layer {self.layer_id} result not available in KV cache")
+            # 创建一个形状匹配的张量，但全是0
+            # 这不是理想的解决方案，但可以防止程序崩溃
+            return torch.zeros_like(hidden_states)
+        
+        return result
+
 class ModelWorker:
-    def __init__(self, address: str, worker_id: int = 0, num_workers: int = 1, kvcache_address: str = None):
+    def __init__(self, address: str, worker_id: int = 0, num_workers: int = 1, kvcache_address: str = None, embedding_address: str = None):
         self.worker_id = worker_id
         self.num_workers = num_workers
         self.kvcache_address = kvcache_address
+        self.embedding_address = embedding_address
         
         # 如果提供了KV Cache服务器地址，则连接
         if self.kvcache_address:
@@ -89,6 +114,16 @@ class ModelWorker:
         else:
             self.kvcache_socket = None
             logger.info(f"Worker {worker_id} running without KV Cache Server")
+        
+        # 如果提供了嵌入服务器地址，则连接
+        if self.embedding_address:
+            self.embedding_context = zmq.Context()
+            self.embedding_socket = self.embedding_context.socket(zmq.REQ)
+            self.embedding_socket.connect(f"tcp://{embedding_address}")
+            logger.info(f"Worker {worker_id} connected to Embedding Server at {embedding_address}")
+        else:
+            self.embedding_socket = None
+            logger.info(f"Worker {worker_id} running without Embedding Server")
         
         # 设置 GPU 设备
         if torch.cuda.is_available():
@@ -190,17 +225,6 @@ class ModelWorker:
         """加载模型并分配层"""
         logger.info(f"Worker {self.worker_id} loading model from {model_path}")
         
-        # 设置内存分配
-        max_memory = {
-            0: "3GiB" if self.worker_id < 4 else None,    # 前4个进程使用 GPU 0，每个3GB
-            1: "3GiB" if self.worker_id >= 4 else None,   # 后4个进程使用 GPU 1，每个3GB
-            'cpu': "138GiB"  # CPU 内存
-        }
-        
-        # 配置设备映射
-        # 我们将大多数层放在CPU上，只在需要计算时移动到GPU
-        device_map = "auto"
-        
         # 加载配置
         logger.info(f"Loading model config...")
         config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
@@ -223,101 +247,100 @@ class ModelWorker:
         self.my_layers = list(range(start_layer, end_layer))
         logger.info(f"Worker {self.worker_id} is responsible for layers {self.my_layers}")
         
-        # 加载模型
-        logger.info(f"Loading model to CPU first...")
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            config=config,
-            device_map="cpu",  # 先全部加载到CPU
-            torch_dtype=torch.float16,
-            low_cpu_mem_usage=True
-        )
+        # 设置设备映射 - 关键改进
+        # 我们将只加载自己负责的层到内存中
+        device_map = {}
         
-        # 保存原始forward方法
-        self.original_forward = self.model.forward
+        # 将基础模型放在CPU上
+        device_map['model.embed_tokens'] = 'cpu'
+        device_map['model.norm'] = 'cpu'
+        device_map['lm_head'] = 'cpu'
         
-        # 重写forward方法以实现分布式层处理
-        def distributed_forward(self, *args, **kwargs):
-            # 获取当前请求ID
-            request_id = kwargs.pop('request_id', str(uuid.uuid4()))
-            
-            # 检查这是否是我们负责的层
-            layer_id = kwargs.pop('layer_id', None)
-            
-            if layer_id is not None and layer_id in self.my_layers:
-                # 这是我们负责的层，将其移动到GPU
-                layer = self.model.model.layers[layer_id]
-                self.memory_manager.move_to_gpu(layer)
-                
-                # 执行前向传播
-                result = layer(*args, **kwargs)
-                
-                # 将结果存储到KV缓存
-                if self.kvcache_socket:
-                    self.store_kv_cache(request_id, layer_id, result)
-                
-                # 完成后将层移回CPU
-                self.memory_manager.move_to_cpu(layer)
-                
-                return result
-            elif self.kvcache_socket:
-                # 不是我们负责的层，从KV缓存获取结果
-                return self.retrieve_kv_cache(request_id, layer_id)
+        # 只将自己负责的层映射到此worker
+        for i in range(total_layers):
+            if i in self.my_layers:
+                # 我们负责的层 - 初始放在CPU上，计算时会移到GPU
+                device_map[f'model.layers.{i}'] = 'cpu'
             else:
-                # 如果没有KV缓存服务器，执行正常的前向传播
-                return self.original_forward(*args, **kwargs)
+                # 不负责的层映射到'meta'设备(不加载参数)
+                device_map[f'model.layers.{i}'] = 'meta'
         
-        # 应用新的forward方法
-        self.model.forward = distributed_forward
+        logger.info(f"Device map for worker {self.worker_id}: {device_map}")
         
-        # 记录模型已加载
-        logger.info(f"Model loaded successfully by Worker {self.worker_id}")
-        logger.info(f"Worker {self.worker_id} is responsible for layers: {self.my_layers}")
+        # 加载模型 - 只加载我们负责的层
+        logger.info(f"Loading model (only responsible layers)...")
+        try:
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                config=config,
+                device_map=device_map,  # 使用我们自定义的设备映射
+                torch_dtype=torch.float16,
+                low_cpu_mem_usage=True
+            )
+            
+            # 替换不负责的层使用KV缓存层
+            model_layers = self.model.model.layers
+            for i in range(total_layers):
+                if i not in self.my_layers and hasattr(model_layers, str(i)):
+                    logger.info(f"Replacing layer {i} with KVCacheLayer proxy")
+                    # 创建一个代理层，它会从KV缓存服务器获取结果
+                    model_layers[i] = KVCacheLayer(self, i)
+            
+            logger.info(f"Model loaded successfully")
+        except Exception as e:
+            logger.error(f"Error loading model: {e}")
+            raise
         
         # 加载tokenizer
         logger.info(f"Loading tokenizer...")
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         logger.info(f"Tokenizer loaded successfully")
         
+        # 设置模型的钩子，管理GPU内存
         self.setup_model_hooks()
     
     def setup_model_hooks(self):
         """设置模型钩子，以便在推理过程中处理层交换"""
         # 获取所有层
-        if hasattr(self.model, 'model') and hasattr(self.model.model, 'layers'):
-            layers = self.model.model.layers
-        else:
+        if not hasattr(self.model, 'model') or not hasattr(self.model.model, 'layers'):
             logger.warning("无法获取模型层，跳过钩子设置")
             return
         
-        # 为每一层添加前向传播钩子
-        for i, layer in enumerate(layers):
-            # 跳过不属于此worker的层
-            if i not in self.my_layers:
+        layers = self.model.model.layers
+        
+        # 只处理我们负责的层
+        for layer_id in self.my_layers:
+            if not hasattr(layers, str(layer_id)):
                 continue
             
+            layer = layers[layer_id]
+            
             # 保存原始forward方法
-            original_forward = layer.forward
+            if not hasattr(layer, '_original_forward'):
+                layer._original_forward = layer.forward
             
             # 创建新的forward方法
-            def make_forward_hook(layer_idx, orig_forward):
-                def hooked_forward(*args, **kwargs):
-                    # 在计算前将层移动到GPU
-                    self.memory_manager.move_to_gpu(layers[layer_idx])
-                    
-                    # 执行原始forward
-                    result = orig_forward(*args, **kwargs)
-                    
-                    # 计算完成后将层移回CPU
-                    self.memory_manager.move_to_cpu(layers[layer_idx])
-                    
-                    return result
-                return hooked_forward
-            
-            # 应用新的forward方法
-            layer.forward = make_forward_hook(i, original_forward)
+            def make_hook(*args, **kwargs):
+                # 移动到GPU
+                logger.debug(f"Moving layer {layer_id} to GPU")
+                self.memory_manager.move_to_gpu(layers[layer_id])
+                
+                # 执行计算
+                result = layer._original_forward(*args, **kwargs)
+                
+                # 获取request_id并存储结果到KV缓存
+                request_id = kwargs.get('request_id', None)
+                if request_id and self.kvcache_socket:
+                    self.store_kv_cache(request_id, layer_id, result)
+                
+                # 计算后移回CPU
+                logger.debug(f"Moving layer {layer_id} back to CPU")
+                self.memory_manager.move_to_cpu(layers[layer_id])
+                
+                return result
+            layer.forward = make_hook
         
-        logger.info(f"设置了 {len(self.my_layers)} 个层的钩子函数")
+        logger.info(f"Set up hooks for {len(self.my_layers)} layers")
     
     class CustomStreamer(TextStreamer):
         """自定义文本生成流式处理器"""
@@ -464,16 +487,18 @@ def main():
     parser.add_argument('--worker_id', type=int, default=0)
     parser.add_argument('--kvcache_address', type=str, default=None,
                         help='Address of KV Cache Server (e.g., "10.21.22.206:29600")')
+    parser.add_argument('--embedding_address', type=str, default=None,
+                        help='Address of Embedding Server (e.g., "10.21.22.206:29700")')
     args = parser.parse_args()
     
     if args.worker_address:
         # 单个 worker 进程模式
-        worker = ModelWorker(args.worker_address, args.worker_id, args.num_workers, args.kvcache_address)
+        worker = ModelWorker(args.worker_address, args.worker_id, args.num_workers, args.kvcache_address, args.embedding_address)
         worker.run()
     else:
         # 主进程模式，启动多个 worker
         for worker_id in range(args.num_workers):
-            start_worker_process(worker_id, args.base_port, args.num_workers, args.kvcache_address)
+            start_worker_process(worker_id, args.base_port, args.num_workers, args.kvcache_address, args.embedding_address)
         
         # 等待所有进程
         try:
@@ -482,7 +507,7 @@ def main():
         except KeyboardInterrupt:
             logger.info("Shutting down all workers...")
 
-def start_worker_process(worker_id: int, base_port: int, num_workers: int, kvcache_address: str = None):
+def start_worker_process(worker_id: int, base_port: int, num_workers: int, kvcache_address: str = None, embedding_address: str = None):
     """启动单个 worker 进程"""
     # 计算 NUMA 节点
     numa_nodes = get_numa_nodes()
@@ -507,6 +532,10 @@ def start_worker_process(worker_id: int, base_port: int, num_workers: int, kvcac
     # 添加KV缓存服务器地址（如果有）
     if kvcache_address:
         cmd.append(f'--kvcache_address={kvcache_address}')
+    
+    # 添加嵌入服务器地址（如果有）
+    if embedding_address:
+        cmd.append(f'--embedding_address={embedding_address}')
     
     logger.info(f"Starting worker {worker_id} on NUMA node {node_id} with port {port}")
     subprocess.Popen(cmd)

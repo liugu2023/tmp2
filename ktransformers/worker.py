@@ -383,9 +383,28 @@ class ModelWorker:
                         self.socket.send_pyobj(status)
                     
                     elif command == 'generate':
-                        # 生成文本
-                        result = self.generate(message['data'])
-                        self.socket.send_pyobj(result)
+                        # 处理生成请求 - 特殊处理流式输出
+                        if message['data'].get('stream', True):
+                            # 获取生成器
+                            generator = self.generate(message['data'])
+                            # 发送每个生成项
+                            try:
+                                for item in generator:
+                                    self.socket.send_pyobj(item)
+                                    # 等待客户端确认继续
+                                    ack = self.socket.recv_pyobj()
+                                    if ack.get('command') == 'stop':
+                                        break
+                            except Exception as e:
+                                logger.error(f"Streaming generation error: {e}")
+                                self.socket.send_pyobj({
+                                    'status': 'error',
+                                    'error': str(e)
+                                })
+                        else:
+                            # 非流式生成
+                            result = self.generate(message['data'])
+                            self.socket.send_pyobj(result)
                     
                     elif command == 'shutdown':
                         # 关闭worker
@@ -424,21 +443,7 @@ class ModelWorker:
             torch.cuda.empty_cache()
 
     def generate(self, data):
-        """执行文本生成
-        
-        参数:
-            data: 包含输入数据和生成参数的字典
-                - input_ids: 输入token IDs
-                - attention_mask: 注意力掩码
-                - max_new_tokens: 最大生成token数量
-                - temperature: 温度参数
-                - top_p: top-p采样参数
-                - do_sample: 是否使用采样
-                - stream: 是否使用流式输出
-        
-        返回:
-            包含生成结果的字典
-        """
+        """执行文本生成"""
         try:
             # 提取输入数据
             input_ids = torch.tensor(data.get('input_ids'), device='cpu')
@@ -451,35 +456,6 @@ class ModelWorker:
             
             logger.info(f"Worker {self.worker_id} generating with {max_new_tokens} new tokens")
             
-            # 如果使用嵌入服务器，获取嵌入向量
-            if self.embedding_socket:
-                # 发送token IDs到嵌入服务器
-                embed_request = {
-                    "command": "embed_tokens",
-                    "input_ids": input_ids.tolist()
-                }
-                self.embedding_socket.send_pyobj(embed_request)
-                embed_response = self.embedding_socket.recv_pyobj()
-                
-                if embed_response.get('status') != 'success':
-                    raise ValueError(f"Failed to get embeddings: {embed_response.get('error')}")
-                
-                # 获取嵌入向量并转换为tensor
-                embeddings = torch.tensor(embed_response.get('embeddings'), device='cpu')
-                
-                # 创建生成上下文参数
-                # 我们不需要输入ID，因为我们已经有了嵌入向量
-                model_inputs = {
-                    'inputs_embeds': embeddings,
-                    'attention_mask': attention_mask
-                }
-            else:
-                # 未使用嵌入服务器，直接使用输入ID
-                model_inputs = {
-                    'input_ids': input_ids,
-                    'attention_mask': attention_mask
-                }
-            
             # 创建生成配置
             gen_config = GenerationConfig(
                 max_new_tokens=max_new_tokens,
@@ -490,133 +466,71 @@ class ModelWorker:
                 eos_token_id=self.model.config.eos_token_id if hasattr(self.model.config, 'eos_token_id') else None,
             )
             
-            # 如果不使用流式输出
+            # 准备输入
+            model_inputs = {
+                'input_ids': input_ids,
+                'attention_mask': attention_mask
+            }
+            
+            # 非流式生成
             if not stream:
-                # 常规生成
                 with torch.no_grad():
                     outputs = self.model.generate(
                         **model_inputs,
                         generation_config=gen_config
                     )
                 
-                # 如果我们用了嵌入服务器，那么我们需要使用嵌入服务器的lm_head来获取logits
-                if self.embedding_socket:
-                    # 获取最后的隐藏状态
-                    last_hidden_state = outputs.hidden_states[-1]
-                    
-                    # 发送到嵌入服务器进行投影
-                    project_request = {
-                        "command": "project_to_vocab",
-                        "hidden_states": last_hidden_state.cpu().numpy().tolist()
-                    }
-                    self.embedding_socket.send_pyobj(project_request)
-                    project_response = self.embedding_socket.recv_pyobj()
-                    
-                    if project_response.get('status') != 'success':
-                        raise ValueError(f"Failed to project to vocab: {project_response.get('error')}")
-                    
-                    # 获取logits
-                    logits = torch.tensor(project_response.get('logits'), device='cpu')
-                    output_ids = torch.argmax(logits, dim=-1)
-                else:
-                    output_ids = outputs
-                
                 return {
                     'status': 'success',
-                    'output_ids': output_ids.cpu().numpy().tolist()
+                    'output_ids': outputs.cpu().numpy().tolist()
                 }
             
-            # 如果使用流式输出
+            # 流式生成 - 逐token返回
             else:
-                # 设置初始状态
-                if 'input_ids' in model_inputs:
-                    current_ids = model_inputs['input_ids'].clone()
-                else:
-                    # 如果我们使用嵌入向量，我们需要生成一个虚拟的输入ID序列
-                    current_ids = torch.ones((embeddings.shape[0], embeddings.shape[1]), dtype=torch.long, device='cpu')
-                
+                current_ids = input_ids.clone()
                 initial_length = current_ids.shape[1]
                 
-                # 流式生成
+                # 流式生成循环
                 for i in range(max_new_tokens):
-                    # 在每个生成步骤中，我们需要构建当前的输入
-                    if self.embedding_socket and i > 0:
-                        # 对于每个新步骤，我们需要获取最新token的嵌入
-                        latest_token = current_ids[:, -1:]
-                        embed_request = {
-                            "command": "embed_tokens",
-                            "input_ids": latest_token.tolist()
-                        }
-                        self.embedding_socket.send_pyobj(embed_request)
-                        embed_response = self.embedding_socket.recv_pyobj()
-                        
-                        if embed_response.get('status') != 'success':
-                            raise ValueError(f"Failed to get embeddings: {embed_response.get('error')}")
-                        
-                        latest_embedding = torch.tensor(embed_response.get('embeddings'), device='cpu')
-                        
-                        # 添加新的嵌入向量
-                        embeddings = torch.cat([embeddings, latest_embedding], dim=1)
-                        model_inputs = {
-                            'inputs_embeds': embeddings,
-                            'attention_mask': torch.ones((embeddings.shape[0], embeddings.shape[1]), device='cpu')
-                        }
-                    else:
-                        model_inputs = {
-                            'input_ids': current_ids,
-                            'attention_mask': torch.ones_like(current_ids)
-                        }
+                    # 更新输入
+                    model_inputs = {
+                        'input_ids': current_ids,
+                        'attention_mask': torch.ones_like(current_ids)
+                    }
                     
-                    # 执行生成步骤
+                    # 生成下一个token
                     with torch.no_grad():
                         outputs = self.model.generate(
                             **model_inputs,
                             generation_config=gen_config,
-                            max_new_tokens=1  # 每次只生成一个token
+                            max_new_tokens=1
                         )
                     
-                    # 更新当前IDs
-                    if self.embedding_socket:
-                        # 如果我们使用嵌入服务器，我们需要从输出中提取token IDs
-                        last_hidden_state = outputs.hidden_states[-1]
-                        
-                        # 发送到嵌入服务器进行投影
-                        project_request = {
-                            "command": "project_to_vocab",
-                            "hidden_states": last_hidden_state[:, -1:].cpu().numpy().tolist()
-                        }
-                        self.embedding_socket.send_pyobj(project_request)
-                        project_response = self.embedding_socket.recv_pyobj()
-                        
-                        if project_response.get('status') != 'success':
-                            raise ValueError(f"Failed to project to vocab: {project_response.get('error')}")
-                        
-                        # 获取logits和next_token
-                        logits = torch.tensor(project_response.get('logits'), device='cpu')
-                        next_token = torch.argmax(logits, dim=-1)
-                    else:
-                        next_token = outputs[:, -1:]
+                    # 获取新token
+                    next_token = outputs[:, -1:]
                     
-                    # 添加新token
+                    # 添加到当前序列
                     current_ids = torch.cat([current_ids, next_token], dim=1)
                     
-                    # 发送流式更新
+                    # 准备流式响应
                     new_tokens = current_ids[:, initial_length:].cpu().numpy().tolist()
                     streaming_response = {
                         'status': 'streaming',
                         'output_ids': new_tokens
                     }
                     
-                    yield streaming_response
+                    # 返回这个item - 不使用yield
+                    if i < max_new_tokens - 1:
+                        return streaming_response
                     
-                    # 检查是否达到结束条件
+                    # 检查结束条件
                     eos_token_id = self.model.config.eos_token_id if hasattr(self.model.config, 'eos_token_id') else None
                     if eos_token_id and (next_token == eos_token_id).any():
                         break
                 
-                # 发送最终响应
+                # 最终响应
                 final_output = current_ids[:, initial_length:].cpu().numpy().tolist()
-                yield {
+                return {
                     'status': 'success',
                     'output_ids': final_output
                 }

@@ -4913,6 +4913,681 @@ _**User**_
 
 _**Assistant**_
 
+<think>
+我需要编写一个shell脚本，它会：
+
+1. 检测当前主机名是否是login或compute06
+2. 根据主机名执行不同的操作
+3. 检测并杀死占用相关端口的进程（端口范围29500-29600）
+4. 启动相应的服务
+
+这个脚本应该有两部分：
+- 在compute06上启动KV Cache服务器和worker进程
+- 在login上启动客户端
+
+我将创建一个start.sh脚本来实现这个功能。
+</think>
+
+```bash:start.sh
+#!/bin/bash
+
+# 设置路径
+PYTHONPATH=/archive/liugu/ds/ktransformers
+MODEL_PATH=/archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/
+GGUF_PATH=/archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/
+
+# 获取主机名
+HOSTNAME=$(hostname)
+
+# 杀死已有进程函数
+kill_existing_processes() {
+    echo "检测并杀死已存在的进程..."
+    
+    # 杀死 KV Cache Server 进程 (端口 29600)
+    KVCACHE_PID=$(netstat -tunlp 2>/dev/null | grep ":29600" | awk '{print $7}' | cut -d'/' -f1)
+    if [ ! -z "$KVCACHE_PID" ]; then
+        echo "正在杀死 KV Cache Server 进程 (PID: $KVCACHE_PID)..."
+        kill -9 $KVCACHE_PID
+    fi
+    
+    # 杀死 Worker 进程 (端口 29500-29507)
+    for PORT in $(seq 29500 29507); do
+        WORKER_PID=$(netstat -tunlp 2>/dev/null | grep ":$PORT" | awk '{print $7}' | cut -d'/' -f1)
+        if [ ! -z "$WORKER_PID" ]; then
+            echo "正在杀死 Worker 进程 (端口: $PORT, PID: $WORKER_PID)..."
+            kill -9 $WORKER_PID
+        fi
+    done
+    
+    # 杀死所有 python 含有 ktransformers 的进程
+    echo "杀死所有相关 Python 进程..."
+    ps aux | grep "python.*ktransformers" | grep -v grep | awk '{print $2}' | xargs -r kill -9
+    
+    # 等待进程完全终止
+    sleep 2
+    echo "所有旧进程已终止"
+}
+
+# 启动计算服务器上的服务
+start_compute_services() {
+    echo "在计算服务器上启动服务..."
+    
+    # 启动 KV Cache 服务器
+    echo "启动 KV Cache 服务器..."
+    PYTHONPATH=$PYTHONPATH python -m ktransformers.kvcache_server --server_address 10.21.22.206:29600 --num_workers 8 > kvcache_server.log 2>&1 &
+    
+    # 等待 KV Cache 服务器启动
+    sleep 3
+    
+    # 启动 Worker 进程
+    echo "启动 Worker 进程..."
+    PYTHONPATH=$PYTHONPATH python -m ktransformers.worker --base_port 29500 --num_workers 8 --kvcache_address 10.21.22.206:29600 > worker.log 2>&1 &
+    
+    echo "所有服务已启动"
+    echo "KV Cache 服务器日志: kvcache_server.log"
+    echo "Worker 进程日志: worker.log"
+}
+
+# 启动登录节点上的客户端
+start_login_client() {
+    echo "在登录节点上启动客户端..."
+    
+    PYTHONPATH=$PYTHONPATH python -m ktransformers.local_chat \
+        --model_path $MODEL_PATH \
+        --gguf_path $GGUF_PATH \
+        --worker_address "10.21.22.206:29500" \
+        --max_new_tokens 50
+}
+
+# 检查GPU状态（仅在计算节点上）
+check_gpu_status() {
+    if command -v nvidia-smi &> /dev/null; then
+        echo "GPU 状态:"
+        nvidia-smi --query-gpu=index,name,memory.used,memory.total,temperature.gpu --format=csv,noheader
+    else
+        echo "无法检查 GPU 状态（nvidia-smi 不可用）"
+    fi
+}
+
+# 根据主机名执行不同操作
+if [[ "$HOSTNAME" == *"compute06"* ]]; then
+    echo "在计算服务器上运行..."
+    kill_existing_processes
+    check_gpu_status
+    start_compute_services
+    
+    # 显示各个进程的状态
+    echo "服务状态:"
+    ps aux | grep "python.*ktransformers" | grep -v grep
+    
+    echo "端口监听状态:"
+    netstat -tunlp 2>/dev/null | grep -E ":(29500|29501|29502|29503|29504|29505|29506|29507|29600)"
+    
+elif [[ "$HOSTNAME" == *"login"* ]]; then
+    echo "在登录节点上运行..."
+    start_login_client
+else
+    echo "未知主机: $HOSTNAME"
+    echo "请在 compute06 或 login 节点上运行此脚本"
+    exit 1
+fi
+```
+
+这个脚本的主要功能：
+
+1. **环境设置**：
+   - 设置PYTHONPATH和模型路径
+
+2. **进程管理**：
+   - 检测并杀死已有的服务进程
+   - 确保端口29500-29507和29600没有被占用
+
+3. **计算节点功能**：
+   - 启动KV Cache服务器（端口29600）
+   - 启动8个Worker进程（端口29500-29507）
+   - 将日志输出到文件
+   - 显示GPU状态和进程状态
+
+4. **登录节点功能**：
+   - 启动客户端连接到计算节点
+
+使用方法：
+```bash
+# 在compute06上启动服务:
+chmod +x start.sh
+./start.sh
+
+# 在login节点上启动客户端:
+chmod +x start.sh
+./start.sh
+```
+
+这个脚本会自动检测当前环境并执行相应操作，让您可以快速启动或重启整个系统。
+
+---
+
+_**User**_
+
+(ds) root@compute06:/archive/liugu/ds/ktransformers# ./start.sh
+在计算服务器上运行...
+检测并杀死已存在的进程...
+杀死所有相关 Python 进程...
+所有旧进程已终止
+GPU 状态:
+0, Tesla P100-PCIE-16GB, 0 MiB, 16384 MiB, 39
+1, Tesla P100-PCIE-16GB, 0 MiB, 16384 MiB, 38
+在计算服务器上启动服务...
+启动 KV Cache 服务器...
+启动 Worker 进程...
+所有服务已启动
+KV Cache 服务器日志: kvcache_server.log
+Worker 进程日志: worker.log
+服务状态:
+root       86406  132  0.2 3580496 339216 pts/1  Dl+  14:37   0:03 python -m ktransformers.kvcache_server --server_address 10.21.22.206:29600 --num_workers 8
+root       86419  0.0  0.0  20572  8576 pts/1    R+   14:37   0:00 python -m ktransformers.worker --base_port 29500 --num_workers 8 --kvcache_address 10.21.22.206:29600
+端口监听状态:
+(ds) root@compute06:/archive/liugu/ds/ktransformers#
+
+
+---
+
+_**Assistant**_
+
+<think>
+从输出看，服务已经成功启动了。我可以看到两个Python进程在运行：
+1. KV Cache服务器在端口29600
+2. Worker进程管理器（主进程，它会负责启动8个工作进程）
+
+但是，在"端口监听状态"部分没有看到预期的输出，这可能表明worker进程还没有完全启动并开始监听在这些端口上。这可能是因为：
+
+1. worker进程启动需要一些时间
+2. 可能有错误发生，需要查看日志文件
+
+让我编写一个检查脚本来帮助用户监控日志和服务状态。
+</think>
+
+看起来服务已经启动，但有些问题需要解决。我们需要检查日志文件来了解问题所在。我会创建一个检查状态的脚本：
+
+```bash:check_status.sh
+#!/bin/bash
+
+# 设置路径
+PYTHONPATH=/archive/liugu/ds/ktransformers
+
+# 检查服务状态
+echo "===== 服务状态 ====="
+ps aux | grep "python.*ktransformers" | grep -v grep
+
+# 检查端口监听状态
+echo -e "\n===== 端口监听状态 ====="
+netstat -tunlp 2>/dev/null | grep -E ":(29500|29501|29502|29503|29504|29505|29506|29507|29600)"
+
+# 检查GPU状态
+echo -e "\n===== GPU状态 ====="
+nvidia-smi --query-gpu=index,name,memory.used,memory.total,utilization.gpu --format=csv,noheader
+
+# 检查日志文件
+echo -e "\n===== KV Cache服务器日志 (最后15行) ====="
+if [ -f kvcache_server.log ]; then
+    tail -n 15 kvcache_server.log
+else
+    echo "日志文件未找到: kvcache_server.log"
+fi
+
+echo -e "\n===== Worker进程日志 (最后15行) ====="
+if [ -f worker.log ]; then
+    tail -n 15 worker.log
+else
+    echo "日志文件未找到: worker.log"
+fi
+
+# 提供修复建议
+echo -e "\n===== 解决方案 ====="
+if ! netstat -tunlp 2>/dev/null | grep -q ":29600"; then
+    echo "KV Cache服务器未正常启动，请查看kvcache_server.log获取详细信息"
+fi
+
+if ! netstat -tunlp 2>/dev/null | grep -q -E ":(29500|29501|29502|29503|29504|29505|29506|29507)"; then
+    echo "Worker进程未正常启动，请查看worker.log获取详细信息"
+fi
+```
+
+使用方法：
+```bash
+chmod +x check_status.sh
+./check_status.sh
+```
+
+此外，我建议修改原始的start.sh脚本，在启动服务后等待更长时间：
+
+```diff:start.sh
+# 启动 Worker 进程
+echo "启动 Worker 进程..."
+PYTHONPATH=$PYTHONPATH python -m ktransformers.worker --base_port 29500 --num_workers 8 --kvcache_address 10.21.22.206:29600 > worker.log 2>&1 &
+
+# 等待服务启动
+-echo "所有服务已启动"
++echo "等待服务启动..."
++sleep 10  # 增加等待时间，让进程有足够时间启动
++echo "所有服务已启动"
+```
+
+问题的可能原因：
+1. Worker进程启动后没有正确绑定端口
+2. KV Cache服务器加载有问题
+3. 工作进程之间的通信配置错误
+
+运行check_status.sh后，我们可以查看日志文件来找出具体问题。
+
+---
+
+_**User**_
+
+来，咱们这样，现在不是分三部分吗，100上的任务调度进程，206上的KVcache进程和100上的客户端，咱们改一下，让客户端可以在内网任何一个设备上运行，两个节点的完整ip地址为10.21.22.*
+
+---
+
+_**Assistant**_
+
+<think>
+好的，我理解用户的需求。他们想要让系统更灵活，可以在内网任何设备上运行客户端。现在系统分为三部分：
+1. 10.21.22.100上的任务调度进程
+2. 10.21.22.206上的KVCache进程
+3. 客户端（需要能在内网任何10.21.22.*设备上运行）
+
+我需要修改start.sh脚本，让它能适应这种灵活部署的需求，并允许在任何内网机器上启动客户端。
+</think>
+
+让我修改 start.sh 脚本，使客户端可以在内网任何一个设备上运行：
+
+```bash:start.sh
+#!/bin/bash
+
+# 设置路径
+PYTHONPATH=/archive/liugu/ds/ktransformers
+MODEL_PATH=/archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/
+GGUF_PATH=/archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/
+
+# 获取主机名和IP地址
+HOSTNAME=$(hostname)
+IP_ADDRESS=$(hostname -I | awk '{print $1}')
+SCHEDULER_IP="10.21.22.100"
+COMPUTE_IP="10.21.22.206"
+
+# 检查是哪个节点
+is_scheduler_node() {
+    [[ "$IP_ADDRESS" == "$SCHEDULER_IP" ]] && return 0 || return 1
+}
+
+is_compute_node() {
+    [[ "$IP_ADDRESS" == "$COMPUTE_IP" ]] && return 0 || return 1
+}
+
+# 杀死已有进程函数
+kill_existing_processes() {
+    echo "检测并杀死已存在的进程..."
+    
+    # 杀死 KV Cache Server 进程 (端口 29600)
+    KVCACHE_PID=$(netstat -tunlp 2>/dev/null | grep ":29600" | awk '{print $7}' | cut -d'/' -f1)
+    if [ ! -z "$KVCACHE_PID" ]; then
+        echo "正在杀死 KV Cache Server 进程 (PID: $KVCACHE_PID)..."
+        kill -9 $KVCACHE_PID
+    fi
+    
+    # 杀死 Worker 进程 (端口 29500-29507)
+    for PORT in $(seq 29500 29507); do
+        WORKER_PID=$(netstat -tunlp 2>/dev/null | grep ":$PORT" | awk '{print $7}' | cut -d'/' -f1)
+        if [ ! -z "$WORKER_PID" ]; then
+            echo "正在杀死 Worker 进程 (端口: $PORT, PID: $WORKER_PID)..."
+            kill -9 $WORKER_PID
+        fi
+    done
+    
+    # 杀死所有 python 含有 ktransformers 的进程
+    echo "杀死所有相关 Python 进程..."
+    ps aux | grep "python.*ktransformers" | grep -v grep | awk '{print $2}' | xargs -r kill -9
+    
+    # 等待进程完全终止
+    sleep 2
+    echo "所有旧进程已终止"
+}
+
+# 启动计算服务器上的服务
+start_compute_services() {
+    echo "在计算服务器上启动服务..."
+    
+    # 启动 KV Cache 服务器
+    echo "启动 KV Cache 服务器..."
+    PYTHONPATH=$PYTHONPATH python -m ktransformers.kvcache_server --server_address ${COMPUTE_IP}:29600 --num_workers 8 > kvcache_server.log 2>&1 &
+    
+    # 等待 KV Cache 服务器启动
+    sleep 3
+    
+    # 启动 Worker 进程
+    echo "启动 Worker 进程..."
+    PYTHONPATH=$PYTHONPATH python -m ktransformers.worker --base_port 29500 --num_workers 8 --kvcache_address ${COMPUTE_IP}:29600 > worker.log 2>&1 &
+    
+    echo "所有服务已启动"
+    echo "KV Cache 服务器日志: kvcache_server.log"
+    echo "Worker 进程日志: worker.log"
+}
+
+# 启动调度节点上的服务
+start_scheduler_services() {
+    echo "在调度节点上启动服务..."
+    
+    # 启动调度器
+    echo "启动任务调度器..."
+    PYTHONPATH=$PYTHONPATH python -m ktransformers.scheduler --server_address ${SCHEDULER_IP}:29400 --compute_address ${COMPUTE_IP}:29500 > scheduler.log 2>&1 &
+    
+    echo "调度服务已启动"
+    echo "调度器日志: scheduler.log"
+}
+
+# 启动客户端（在任何节点上）
+start_client() {
+    echo "在客户端节点 (${IP_ADDRESS}) 上启动客户端..."
+    
+    PYTHONPATH=$PYTHONPATH python -m ktransformers.local_chat \
+        --model_path $MODEL_PATH \
+        --gguf_path $GGUF_PATH \
+        --scheduler_address "${SCHEDULER_IP}:29400" \
+        --max_new_tokens 50
+    
+    echo "客户端已退出"
+}
+
+# 检查GPU状态（仅在计算节点上）
+check_gpu_status() {
+    if command -v nvidia-smi &> /dev/null; then
+        echo "GPU 状态:"
+        nvidia-smi --query-gpu=index,name,memory.used,memory.total,temperature.gpu --format=csv,noheader
+    else
+        echo "无法检查 GPU 状态（nvidia-smi 不可用）"
+    fi
+}
+
+# 显示帮助信息
+show_help() {
+    echo "使用方法: $0 [选项]"
+    echo "选项:"
+    echo "  --compute   启动计算节点服务 (在 ${COMPUTE_IP} 上运行)"
+    echo "  --scheduler 启动调度节点服务 (在 ${SCHEDULER_IP} 上运行)"
+    echo "  --client    启动客户端 (可在任何内网节点上运行)"
+    echo "  --help      显示此帮助信息"
+    echo ""
+    echo "示例:"
+    echo "  $0 --compute   # 在计算节点上启动KV缓存和Worker服务"
+    echo "  $0 --scheduler # 在调度节点上启动调度服务"
+    echo "  $0 --client    # 在任何节点上启动客户端"
+}
+
+# 默认参数处理
+if [ $# -eq 0 ]; then
+    # 根据IP地址自动检测模式
+    if is_compute_node; then
+        kill_existing_processes
+        check_gpu_status
+        start_compute_services
+        
+        # 显示各个进程的状态
+        echo "服务状态:"
+        ps aux | grep "python.*ktransformers" | grep -v grep
+        
+        echo "端口监听状态:"
+        netstat -tunlp 2>/dev/null | grep -E ":(29500|29501|29502|29503|29504|29505|29506|29507|29600)"
+    elif is_scheduler_node; then
+        kill_existing_processes
+        start_scheduler_services
+        
+        # 显示进程状态
+        echo "服务状态:"
+        ps aux | grep "python.*ktransformers" | grep -v grep
+        
+        echo "端口监听状态:"
+        netstat -tunlp 2>/dev/null | grep -E ":(29400)"
+    else
+        # 默认作为客户端
+        start_client
+    fi
+else
+    # 处理命令行参数
+    case "$1" in
+        --compute)
+            if ! is_compute_node; then
+                echo "警告：当前节点不是计算节点 (${COMPUTE_IP})，服务可能无法正确运行"
+                read -p "是否继续？ (y/n): " confirm
+                [[ $confirm != "y" ]] && exit 1
+            fi
+            kill_existing_processes
+            check_gpu_status
+            start_compute_services
+            ;;
+        --scheduler)
+            if ! is_scheduler_node; then
+                echo "警告：当前节点不是调度节点 (${SCHEDULER_IP})，服务可能无法正确运行"
+                read -p "是否继续？ (y/n): " confirm
+                [[ $confirm != "y" ]] && exit 1
+            fi
+            kill_existing_processes
+            start_scheduler_services
+            ;;
+        --client)
+            start_client
+            ;;
+        --help)
+            show_help
+            ;;
+        *)
+            echo "未知选项: $1"
+            show_help
+            exit 1
+            ;;
+    esac
+fi
+```
+
+现在我们需要创建一个简单的调度器脚本，作为客户端和计算节点之间的桥梁：
+
+```python:ktransformers/scheduler.py
+"""
+任务调度服务器
+负责转发客户端请求到计算节点
+"""
+
+import zmq
+import logging
+import time
+import argparse
+from typing import Dict, Any
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class SchedulerServer:
+    def __init__(self, server_address: str, compute_address: str):
+        # 初始化ZMQ上下文
+        self.context = zmq.Context()
+        
+        # 设置面向客户端的套接字
+        self.client_socket = self.context.socket(zmq.REP)
+        self.client_socket.bind(f"tcp://{server_address}")
+        logger.info(f"Scheduler listening for clients at {server_address}")
+        
+        # 设置面向计算节点的套接字
+        self.compute_socket = self.context.socket(zmq.REQ)
+        self.compute_address = compute_address
+        self.compute_socket.connect(f"tcp://{compute_address}")
+        logger.info(f"Connected to compute node at {compute_address}")
+        
+        # 统计信息
+        self.stats = {
+            "total_requests": 0,
+            "start_time": time.time(),
+            "active_sessions": 0
+        }
+    
+    def run(self):
+        """运行调度器主循环"""
+        logger.info("Scheduler server ready to receive requests")
+        try:
+            while True:
+                # 接收来自客户端的请求
+                client_request = self.client_socket.recv_pyobj()
+                self.stats["total_requests"] += 1
+                
+                command = client_request.get("command")
+                logger.info(f"Received {command} request from client")
+                
+                if command == "shutdown":
+                    # 处理关闭命令
+                    self.client_socket.send_pyobj({"status": "shutdown"})
+                    break
+                elif command == "stats":
+                    # 返回统计信息
+                    response = self._get_stats()
+                    self.client_socket.send_pyobj(response)
+                else:
+                    # 转发所有其他命令到计算节点
+                    try:
+                        # 将请求转发到计算节点
+                        self.compute_socket.send_pyobj(client_request)
+                        
+                        # 如果是generate命令，则处理流式响应
+                        if command == "generate":
+                            self._handle_streaming_response()
+                        else:
+                            # 普通命令直接转发响应
+                            compute_response = self.compute_socket.recv_pyobj()
+                            self.client_socket.send_pyobj(compute_response)
+                    except Exception as e:
+                        logger.error(f"Error forwarding request: {str(e)}")
+                        self.client_socket.send_pyobj({
+                            "status": "error",
+                            "error": f"Scheduler error: {str(e)}"
+                        })
+        finally:
+            logger.info("Shutting down scheduler...")
+            self.client_socket.close()
+            self.compute_socket.close()
+            self.context.term()
+    
+    def _handle_streaming_response(self):
+        """处理来自计算节点的流式响应"""
+        # 接收来自计算节点的流式响应并转发给客户端
+        while True:
+            compute_response = self.compute_socket.recv_pyobj()
+            
+            # 转发响应给客户端
+            self.client_socket.send_pyobj(compute_response)
+            
+            # 如果是最终响应，退出循环
+            if compute_response.get('status') == 'success':
+                break
+            
+            # 如果是流式响应，等待客户端确认
+            if compute_response.get('status') == 'streaming':
+                client_ack = self.client_socket.recv_pyobj()
+                self.compute_socket.send_pyobj(client_ack)
+    
+    def _get_stats(self) -> Dict[str, Any]:
+        """获取调度器统计信息"""
+        current_time = time.time()
+        uptime = current_time - self.stats["start_time"]
+        
+        return {
+            "status": "success",
+            "total_requests": self.stats["total_requests"],
+            "uptime": uptime,
+            "active_sessions": self.stats["active_sessions"],
+            "compute_node": self.compute_address
+        }
+
+def main():
+    parser = argparse.ArgumentParser(description="KTransformers Scheduler Server")
+    parser.add_argument('--server_address', type=str, default="0.0.0.0:29400",
+                        help='Address to listen for client connections')
+    parser.add_argument('--compute_address', type=str, default="10.21.22.206:29500",
+                        help='Address of compute node worker')
+    args = parser.parse_args()
+    
+    server = SchedulerServer(args.server_address, args.compute_address)
+    server.run()
+
+if __name__ == "__main__":
+    main()
+```
+
+此外，我们需要修改 local_chat.py 来支持连接到调度器：
+
+```python:ktransformers/local_chat.py
+# 修改 DistributedModel 类
+class DistributedModel:
+    def __init__(self, worker_address: str = None, scheduler_address: str = None):
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.REQ)
+        
+        if scheduler_address:
+            # 连接到调度器
+            self.socket.connect(f"tcp://{scheduler_address}")
+            logger.info(f"Connected to scheduler at {scheduler_address}")
+            self.use_scheduler = True
+        elif worker_address:
+            # 直接连接到worker
+            self.socket.connect(f"tcp://{worker_address}")
+            logger.info(f"Connected to worker at {worker_address}")
+            self.use_scheduler = False
+        else:
+            raise ValueError("Must provide either worker_address or scheduler_address")
+
+# 在 main 函数中添加调度器支持
+def main():
+    # ... 现有代码 ...
+    parser.add_argument('--scheduler_address', type=str, default=None,
+                        help='Address of scheduler for distributed mode (e.g., "10.21.22.100:29400")')
+    args = parser.parse_args()
+
+    if args.scheduler_address or args.worker_address:
+        # 分布式模式
+        logger.info("Running in distributed mode")
+        model = DistributedModel(args.worker_address, args.scheduler_address)
+        # ... 其余代码保持不变 ...
+```
+
+使用这些修改后，你可以：
+
+1. 在计算节点 (10.21.22.206) 上运行：
+```bash
+./start.sh --compute
+```
+
+2. 在调度节点 (10.21.22.100) 上运行：
+```bash
+./start.sh --scheduler
+```
+
+3. 在任何内网节点上运行客户端：
+```bash
+./start.sh --client
+```
+
+或者直接运行脚本，它会自动检测节点类型并启动相应的服务：
+```bash
+./start.sh
+```
+
+这样就可以在内网的任何10.21.22.*设备上运行客户端了。
+
+---
+
+_**User**_
+
+任务调度器，也就是100需要负责预处理输入数据的
+
+---
+
+_**Assistant**_
+
 
 
 ---

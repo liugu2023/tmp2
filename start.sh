@@ -5,8 +5,20 @@ PYTHONPATH=/archive/liugu/ds/ktransformers
 MODEL_PATH=/archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/
 GGUF_PATH=/archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/
 
-# 获取主机名
+# 获取主机名和IP地址
 HOSTNAME=$(hostname)
+IP_ADDRESS=$(hostname -I | awk '{print $1}')
+SCHEDULER_IP="10.21.22.100"
+COMPUTE_IP="10.21.22.206"
+
+# 检查是哪个节点
+is_scheduler_node() {
+    [[ "$IP_ADDRESS" == "$SCHEDULER_IP" ]] && return 0 || return 1
+}
+
+is_compute_node() {
+    [[ "$IP_ADDRESS" == "$COMPUTE_IP" ]] && return 0 || return 1
+}
 
 # 杀死已有进程函数
 kill_existing_processes() {
@@ -43,29 +55,46 @@ start_compute_services() {
     
     # 启动 KV Cache 服务器
     echo "启动 KV Cache 服务器..."
-    PYTHONPATH=$PYTHONPATH python -m ktransformers.kvcache_server --server_address 10.21.22.206:29600 --num_workers 8 > kvcache_server.log 2>&1 &
+    PYTHONPATH=$PYTHONPATH python -m ktransformers.kvcache_server --server_address ${COMPUTE_IP}:29600 --num_workers 8 > kvcache_server.log 2>&1 &
     
     # 等待 KV Cache 服务器启动
     sleep 3
     
     # 启动 Worker 进程
     echo "启动 Worker 进程..."
-    PYTHONPATH=$PYTHONPATH python -m ktransformers.worker --base_port 29500 --num_workers 8 --kvcache_address 10.21.22.206:29600 > worker.log 2>&1 &
+    PYTHONPATH=$PYTHONPATH python -m ktransformers.worker --base_port 29500 --num_workers 8 --kvcache_address ${COMPUTE_IP}:29600 > worker.log 2>&1 &
     
     echo "所有服务已启动"
     echo "KV Cache 服务器日志: kvcache_server.log"
     echo "Worker 进程日志: worker.log"
 }
 
-# 启动登录节点上的客户端
-start_login_client() {
-    echo "在登录节点上启动客户端..."
+# 启动调度节点上的服务
+start_scheduler_services() {
+    echo "在调度节点上启动服务..."
+    
+    # 启动调度器
+    echo "启动任务调度器..."
+    PYTHONPATH=$PYTHONPATH python -m ktransformers.scheduler \
+        --server_address ${SCHEDULER_IP}:29400 \
+        --compute_address ${COMPUTE_IP}:29500 \
+        --model_path $MODEL_PATH > scheduler.log 2>&1 &
+    
+    echo "调度服务已启动"
+    echo "调度器日志: scheduler.log"
+}
+
+# 启动客户端（在任何节点上）
+start_client() {
+    echo "在客户端节点 (${IP_ADDRESS}) 上启动客户端..."
     
     PYTHONPATH=$PYTHONPATH python -m ktransformers.local_chat \
         --model_path $MODEL_PATH \
         --gguf_path $GGUF_PATH \
-        --worker_address "10.21.22.206:29500" \
+        --scheduler_address "${SCHEDULER_IP}:29400" \
         --max_new_tokens 50
+    
+    echo "客户端已退出"
 }
 
 # 检查GPU状态（仅在计算节点上）
@@ -78,25 +107,81 @@ check_gpu_status() {
     fi
 }
 
-# 根据主机名执行不同操作
-if [[ "$HOSTNAME" == *"compute06"* ]]; then
-    echo "在计算服务器上运行..."
-    kill_existing_processes
-    check_gpu_status
-    start_compute_services
-    
-    # 显示各个进程的状态
-    echo "服务状态:"
-    ps aux | grep "python.*ktransformers" | grep -v grep
-    
-    echo "端口监听状态:"
-    netstat -tunlp 2>/dev/null | grep -E ":(29500|29501|29502|29503|29504|29505|29506|29507|29600)"
-    
-elif [[ "$HOSTNAME" == *"login"* ]]; then
-    echo "在登录节点上运行..."
-    start_login_client
+# 显示帮助信息
+show_help() {
+    echo "使用方法: $0 [选项]"
+    echo "选项:"
+    echo "  --compute   启动计算节点服务 (在 ${COMPUTE_IP} 上运行)"
+    echo "  --scheduler 启动调度节点服务 (在 ${SCHEDULER_IP} 上运行)"
+    echo "  --client    启动客户端 (可在任何内网节点上运行)"
+    echo "  --help      显示此帮助信息"
+    echo ""
+    echo "示例:"
+    echo "  $0 --compute   # 在计算节点上启动KV缓存和Worker服务"
+    echo "  $0 --scheduler # 在调度节点上启动调度服务"
+    echo "  $0 --client    # 在任何节点上启动客户端"
+}
+
+# 默认参数处理
+if [ $# -eq 0 ]; then
+    # 根据IP地址自动检测模式
+    if is_compute_node; then
+        kill_existing_processes
+        check_gpu_status
+        start_compute_services
+        
+        # 显示各个进程的状态
+        echo "服务状态:"
+        ps aux | grep "python.*ktransformers" | grep -v grep
+        
+        echo "端口监听状态:"
+        netstat -tunlp 2>/dev/null | grep -E ":(29500|29501|29502|29503|29504|29505|29506|29507|29600)"
+    elif is_scheduler_node; then
+        kill_existing_processes
+        start_scheduler_services
+        
+        # 显示进程状态
+        echo "服务状态:"
+        ps aux | grep "python.*ktransformers" | grep -v grep
+        
+        echo "端口监听状态:"
+        netstat -tunlp 2>/dev/null | grep -E ":(29400)"
+    else
+        # 默认作为客户端
+        start_client
+    fi
 else
-    echo "未知主机: $HOSTNAME"
-    echo "请在 compute06 或 login 节点上运行此脚本"
-    exit 1
+    # 处理命令行参数
+    case "$1" in
+        --compute)
+            if ! is_compute_node; then
+                echo "警告：当前节点不是计算节点 (${COMPUTE_IP})，服务可能无法正确运行"
+                read -p "是否继续？ (y/n): " confirm
+                [[ $confirm != "y" ]] && exit 1
+            fi
+            kill_existing_processes
+            check_gpu_status
+            start_compute_services
+            ;;
+        --scheduler)
+            if ! is_scheduler_node; then
+                echo "警告：当前节点不是调度节点 (${SCHEDULER_IP})，服务可能无法正确运行"
+                read -p "是否继续？ (y/n): " confirm
+                [[ $confirm != "y" ]] && exit 1
+            fi
+            kill_existing_processes
+            start_scheduler_services
+            ;;
+        --client)
+            start_client
+            ;;
+        --help)
+            show_help
+            ;;
+        *)
+            echo "未知选项: $1"
+            show_help
+            exit 1
+            ;;
+    esac
 fi 

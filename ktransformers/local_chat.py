@@ -35,26 +35,84 @@ def import_local_modules():
             prefill_and_generate, get_compute_capability, Config, flashinfer_enabled)
 
 class DistributedModel:
-    def __init__(self, worker_address: str):
+    def __init__(self, worker_address: str = None, scheduler_address: str = None):
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.REQ)
-        self.socket.connect(f"tcp://{worker_address}")
-        logger.info(f"Connected to worker at {worker_address}")
         
+        if scheduler_address:
+            # 连接到调度器
+            self.socket.connect(f"tcp://{scheduler_address}")
+            logger.info(f"Connected to scheduler at {scheduler_address}")
+            self.use_scheduler = True
+        elif worker_address:
+            # 直接连接到worker
+            self.socket.connect(f"tcp://{worker_address}")
+            logger.info(f"Connected to worker at {worker_address}")
+            self.use_scheduler = False
+        else:
+            raise ValueError("Must provide either worker_address or scheduler_address")
+
     def load_model(self, model_path: str, gguf_path: str):
         message = {
             'command': 'load_model',
             'model_path': model_path,
             'gguf_path': gguf_path
         }
-        logger.info("Requesting model load from worker...")
+        logger.info("Requesting model load...")
         self.socket.send_pyobj(message)
         response = self.socket.recv_pyobj()
         if response['status'] != 'success':
             raise Exception(f"Failed to load model: {response.get('error')}")
-        logger.info("Model loaded successfully on worker")
+        logger.info("Model loaded successfully")
+
+    def generate_from_messages(self, messages, **kwargs):
+        """使用聊天消息直接生成文本，由调度器处理tokenization"""
+        try:
+            if not self.use_scheduler:
+                raise ValueError("This method requires a scheduler connection")
+                
+            logger.info("Preparing chat request...")
+            message = {
+                'command': 'chat',
+                'messages': messages,
+                **kwargs
+            }
+            
+            logger.info("Sending chat request to scheduler...")
+            self.socket.send_pyobj(message)
+            
+            # 接收流式响应
+            full_text = ""
+            while True:
+                response = self.socket.recv_pyobj()
+                
+                if response['status'] == 'error':
+                    raise Exception(f"Generation failed: {response.get('error')}")
+                
+                if response['status'] == 'streaming':
+                    # 打印新生成的文本部分
+                    new_text = response['text'][len(full_text):]
+                    if new_text:
+                        print(new_text, end='', flush=True)
+                    full_text = response['text']
+                    
+                    # 发送确认
+                    self.socket.send_pyobj({'status': 'received'})
+                    
+                    # 如果生成结束，退出循环
+                    if response.get('finished', False):
+                        print()  # 换行
+                
+                elif response['status'] == 'success':
+                    # 最终的完整响应
+                    return response['output_ids']
+        
+        except Exception as e:
+            logger.error(f"Error in generate_from_messages: {str(e)}")
+            raise
 
     def generate(self, input_ids, attention_mask, **kwargs):
+        """原始的generate方法，用于与worker直接通信"""
         try:
             logger.info("Preparing generation request...")
             message = {
@@ -90,7 +148,6 @@ class DistributedModel:
                     # 如果生成结束，退出循环
                     if response.get('finished', False):
                         print()  # 换行
-                        # 不要在这里 break，等待最终的 token IDs
                 
                 elif response['status'] == 'success':
                     # 最终的完整响应
@@ -101,14 +158,14 @@ class DistributedModel:
             raise
 
     def shutdown(self):
-        """发送关闭命令给worker"""
+        """发送关闭命令"""
         try:
-            logger.info("Sending shutdown command to worker...")
+            logger.info("Sending shutdown command...")
             message = {'command': 'shutdown'}
             self.socket.send_pyobj(message)
             response = self.socket.recv_pyobj()
             if response['status'] == 'shutdown':
-                logger.info("Worker shutdown successfully")
+                logger.info("Shutdown successful")
             self.socket.close()
             self.context.term()
         except Exception as e:
@@ -129,22 +186,30 @@ def main():
     parser.add_argument('--gguf_path', type=str, required=True)
     parser.add_argument('--worker_address', type=str, default=None,
                       help='Address of worker for distributed mode (e.g., "10.21.22.206:29500")')
+    parser.add_argument('--scheduler_address', type=str, default=None,
+                      help='Address of scheduler for distributed mode (e.g., "10.21.22.100:29400")')
     parser.add_argument('--max_new_tokens', type=int, default=300)
+    parser.add_argument('--temperature', type=float, default=0.7)
+    parser.add_argument('--top_p', type=float, default=0.9)
     args = parser.parse_args()
 
-    if args.worker_address:
+    if args.scheduler_address or args.worker_address:
         # 分布式模式
         logger.info("Running in distributed mode")
-        model = DistributedModel(args.worker_address)
+        model = DistributedModel(args.worker_address, args.scheduler_address)
         model.load_model(args.model_path, args.gguf_path)
-        tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+        
+        # 当使用调度器时，无需在客户端加载tokenizer
+        tokenizer = None
+        if args.worker_address and not args.scheduler_address:
+            tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
         
         try:
             while True:
                 content = input("Chat: ")
                 if content.lower() in ['quit', 'exit']:
                     logger.info("Shutting down...")
-                    model.shutdown()  # 发送关闭命令
+                    model.shutdown()
                     break
                 elif content == "":
                     content = "Please write a piece of quicksort code in C++."
@@ -156,23 +221,34 @@ def main():
                 logger.info("Creating chat messages...")
                 messages = [{"role": "user", "content": content}]
                 
-                logger.info("Tokenizing input...")
-                input_tensor = tokenizer.apply_chat_template(
-                    messages, add_generation_prompt=True, return_tensors="pt"
-                )
+                logger.info("Starting chat...")
+                if args.scheduler_address:
+                    # 使用调度器进行预处理的方法
+                    outputs = model.generate_from_messages(
+                        messages,
+                        max_new_tokens=args.max_new_tokens,
+                        temperature=args.temperature,
+                        top_p=args.top_p,
+                        do_sample=True
+                    )
+                else:
+                    # 直接连接worker的原始方法
+                    logger.info("Tokenizing input...")
+                    input_tensor = tokenizer.apply_chat_template(
+                        messages, add_generation_prompt=True, return_tensors="pt"
+                    )
+                    
+                    logger.info("Starting generation...")
+                    outputs = model.generate(
+                        input_tensor,
+                        torch.ones_like(input_tensor),
+                        max_new_tokens=args.max_new_tokens,
+                        temperature=args.temperature,
+                        top_p=args.top_p,
+                        do_sample=True
+                    )
                 
-                logger.info("Starting generation...")
-                outputs = model.generate(
-                    input_tensor,
-                    torch.ones_like(input_tensor),
-                    max_new_tokens=args.max_new_tokens,
-                    temperature=0.7,
-                    top_p=0.9,
-                    do_sample=True
-                )
-                
-                # 不需要再次解码和打印，因为已经在流式输出中完成了
-                if outputs is not None:  # 添加检查
+                if outputs is not None:
                     logger.info("Generation completed successfully")
                 else:
                     logger.warning("No output tokens received")

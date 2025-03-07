@@ -54,47 +54,145 @@ class EmbeddingServer:
         logger.info("Embedding server initialization complete")
     
     def _load_embedding_layer(self):
-        """只加载嵌入层和输出层"""
+        """只加载嵌入层和输出层，不加载完整模型"""
         try:
-            logger.info("Loading embedding layers to CUDA...")
+            logger.info("开始加载嵌入层和输出层...")
             
-            # 使用更具体的加载方式，避免设备映射问题
-            # 首先初始化一个空模型
-            from transformers import AutoModelForCausalLM
+            # 创建模型参数匹配模式
+            model_name = os.path.basename(self.model_path.rstrip("/"))
+            logger.info(f"检测到模型: {model_name}")
             
-            # 使用低级API直接加载模型
-            model = AutoModelForCausalLM.from_pretrained(
-                self.model_path,
-                config=self.config,
-                torch_dtype=torch.float16,
-                low_cpu_mem_usage=True,
-                device_map="cpu"  # 先加载到CPU
-            )
+            # 加载模型配置
+            from transformers import AutoConfig
+            config = AutoConfig.from_pretrained(self.model_path, trust_remote_code=True)
             
-            # 手动提取和移动嵌入层到GPU
-            if hasattr(model, "model") and hasattr(model.model, "embed_tokens"):
-                self.embed_tokens = model.model.embed_tokens.to("cuda:0")
-                logger.info(f"Embedding loaded to cuda:0, dimension: {self.embed_tokens.embedding_dim}")
+            # 检测模型类型，确定参数路径模式
+            if 'llama' in model_name.lower() or hasattr(config, 'model_type') and config.model_type == 'llama':
+                embed_key = 'model.embed_tokens.weight'
+                lm_head_key = 'lm_head.weight'
+                logger.info("检测到LLaMA类型模型")
+            elif 'mistral' in model_name.lower() or hasattr(config, 'model_type') and config.model_type == 'mistral':
+                embed_key = 'model.embed_tokens.weight'
+                lm_head_key = 'lm_head.weight'
+                logger.info("检测到Mistral类型模型")
+            elif 'bloom' in model_name.lower() or hasattr(config, 'model_type') and config.model_type == 'bloom':
+                embed_key = 'transformer.word_embeddings.weight'
+                lm_head_key = 'lm_head.weight'
+                logger.info("检测到Bloom类型模型")
             else:
-                logger.error("Could not find embedding layer in model")
-                raise ValueError("Embedding layer not found")
+                # 默认为通用路径
+                embed_key = 'model.embed_tokens.weight'
+                lm_head_key = 'lm_head.weight'
+                logger.info(f"未识别具体模型类型，使用默认路径模式: {embed_key}, {lm_head_key}")
             
-            # 手动提取和移动LM头到GPU
-            if hasattr(model, "lm_head"):
-                self.lm_head = model.lm_head.to("cuda:0")
-                logger.info(f"LM head loaded to cuda:0, shape: {self.lm_head.weight.shape}")
-            else:
-                logger.error("Could not find lm_head in model")
-                raise ValueError("LM head not found")
+            # 从模型检查点只加载词表相关参数
+            import torch
+            from pathlib import Path
             
-            # 删除不需要的模型部分以节省内存
-            del model
+            # 检查是否有safetensors格式文件
+            from safetensors.torch import load_file as load_safetensors
+            
+            # 寻找权重文件
+            weights_path = Path(self.model_path)
+            safetensors_files = list(weights_path.glob("*.safetensors"))
+            pytorch_files = list(weights_path.glob("pytorch_model*.bin"))
+            
+            # 创建空的嵌入层和LM头，稍后加载权重
+            vocab_size = config.vocab_size
+            hidden_size = config.hidden_size
+            
+            # 创建模型组件
+            from torch import nn
+            self.embed_tokens = nn.Embedding(vocab_size, hidden_size)
+            self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
+            
+            # 函数：从权重文件中加载特定层
+            def find_and_load_tensor(file_path, key, safetensors_format=False):
+                try:
+                    if safetensors_format:
+                        weights = load_safetensors(file_path)
+                    else:
+                        weights = torch.load(file_path, map_location='cpu')
+                    
+                    if key in weights:
+                        logger.info(f"在 {file_path.name} 中找到 {key}")
+                        return weights[key]
+                    return None
+                except Exception as e:
+                    logger.warning(f"读取 {file_path} 出错: {e}")
+                    return None
+            
+            # 加载嵌入层权重
+            embed_loaded = False
+            lm_head_loaded = False
+            
+            # 先尝试safetensors格式
+            for sf in safetensors_files:
+                if not embed_loaded:
+                    embed_tensor = find_and_load_tensor(sf, embed_key, safetensors_format=True)
+                    if embed_tensor is not None:
+                        logger.info(f"从 {sf.name} 加载嵌入层, 大小: {embed_tensor.shape}")
+                        self.embed_tokens.weight.data.copy_(embed_tensor)
+                        embed_loaded = True
+                
+                if not lm_head_loaded:
+                    lm_head_tensor = find_and_load_tensor(sf, lm_head_key, safetensors_format=True)
+                    if lm_head_tensor is not None:
+                        logger.info(f"从 {sf.name} 加载LM头, 大小: {lm_head_tensor.shape}")
+                        self.lm_head.weight.data.copy_(lm_head_tensor)
+                        lm_head_loaded = True
+                
+                if embed_loaded and lm_head_loaded:
+                    break
+            
+            # 如果safetensors中未找到，尝试PyTorch格式
+            if not (embed_loaded and lm_head_loaded):
+                for pf in pytorch_files:
+                    if not embed_loaded:
+                        embed_tensor = find_and_load_tensor(pf, embed_key)
+                        if embed_tensor is not None:
+                            logger.info(f"从 {pf.name} 加载嵌入层, 大小: {embed_tensor.shape}")
+                            self.embed_tokens.weight.data.copy_(embed_tensor)
+                            embed_loaded = True
+                    
+                    if not lm_head_loaded:
+                        lm_head_tensor = find_and_load_tensor(pf, lm_head_key)
+                        if lm_head_tensor is not None:
+                            logger.info(f"从 {pf.name} 加载LM头, 大小: {lm_head_tensor.shape}")
+                            self.lm_head.weight.data.copy_(lm_head_tensor)
+                            lm_head_loaded = True
+                    
+                    if embed_loaded and lm_head_loaded:
+                        break
+            
+            # 检查是否成功加载
+            if not embed_loaded:
+                raise ValueError(f"未能找到嵌入层权重: {embed_key}")
+            if not lm_head_loaded:
+                raise ValueError(f"未能找到LM头权重: {lm_head_key}")
+            
+            # 将模型移动到GPU
+            logger.info("将嵌入层和LM头移至CUDA设备")
+            self.embed_tokens = self.embed_tokens.to("cuda:0")
+            self.lm_head = self.lm_head.to("cuda:0")
+            
+            # 设置为评估模式
+            self.embed_tokens.eval()
+            self.lm_head.eval()
+            
+            # 显示内存使用情况
+            logger.info(f"CUDA内存使用: {torch.cuda.memory_allocated()/1024**2:.2f} MB")
+            
+            # 清理
             torch.cuda.empty_cache()
             gc.collect()
             
-            logger.info("Successfully loaded embedding layer and lm_head to GPU")
+            logger.info("嵌入层和LM头加载完成")
+            return True
         except Exception as e:
-            logger.error(f"Error loading embedding layer: {str(e)}")
+            logger.error(f"加载嵌入层出错: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
             raise
     
     def run(self):

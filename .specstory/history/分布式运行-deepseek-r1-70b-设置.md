@@ -7033,7 +7033,313 @@ _**User**_
 
 _**Assistant**_
 
+<think>
+从代码看起来，目前的问题是模型可能只加载到了KV缓存服务器上，而没有正确地在worker进程中加载模型的各层。这可能是因为我们做了分层管理的修改，但没有正确实现模型加载或层的分配逻辑。
 
+让我分析一下目前的代码，特别是worker.py中load_model函数的实现：
+
+1. 目前worker.py中实现了LayerMemoryManager类用于管理模型层在GPU上的动态加载和卸载
+2. 但在load_model方法中，没有看到明确的层分配逻辑
+3. 我们可能需要在加载模型后，为每个worker明确分配它负责的层，并保持其他层在CPU上
+
+我认为问题出在load_model函数中，需要添加层分配的逻辑。
+</think>
+
+看起来我们需要修改`load_model`方法，确保模型层被正确分配给各个worker。目前模型只加载到了KV Cache服务器上，而没有在每个worker上正确分配模型层。
+
+这里是修复方案：
+
+```python:ktransformers/worker.py
+def load_model(self, model_path: str, gguf_path: str):
+    """加载模型并分配层"""
+    logger.info(f"Worker {self.worker_id} loading model from {model_path}")
+    
+    # 设置内存分配
+    max_memory = {
+        0: "3GiB" if self.worker_id < 4 else None,    # 前4个进程使用 GPU 0，每个3GB
+        1: "3GiB" if self.worker_id >= 4 else None,   # 后4个进程使用 GPU 1，每个3GB
+        'cpu': "138GiB"  # CPU 内存
+    }
+    
+    # 配置设备映射
+    # 我们将大多数层放在CPU上，只在需要计算时移动到GPU
+    device_map = "auto"
+    
+    # 加载配置
+    logger.info(f"Loading model config...")
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    
+    # 获取模型总层数
+    if hasattr(config, 'num_hidden_layers'):
+        total_layers = config.num_hidden_layers
+    elif hasattr(config, 'n_layers'):
+        total_layers = config.n_layers
+    else:
+        total_layers = 32  # 默认值
+    
+    logger.info(f"Model has {total_layers} layers in total")
+    
+    # 计算每个worker负责的层
+    layers_per_worker = total_layers // self.num_workers
+    start_layer = self.worker_id * layers_per_worker
+    end_layer = start_layer + layers_per_worker if self.worker_id < self.num_workers - 1 else total_layers
+    
+    self.my_layers = list(range(start_layer, end_layer))
+    logger.info(f"Worker {self.worker_id} is responsible for layers {self.my_layers}")
+    
+    # 加载模型
+    logger.info(f"Loading model to CPU first...")
+    self.model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        config=config,
+        device_map="cpu",  # 先全部加载到CPU
+        torch_dtype=torch.float16,
+        low_cpu_mem_usage=True
+    )
+    
+    # 保存原始forward方法
+    self.original_forward = self.model.forward
+    
+    # 重写forward方法以实现分布式层处理
+    def distributed_forward(self, *args, **kwargs):
+        # 获取当前请求ID
+        request_id = kwargs.pop('request_id', str(uuid.uuid4()))
+        
+        # 检查这是否是我们负责的层
+        layer_id = kwargs.pop('layer_id', None)
+        
+        if layer_id is not None and layer_id in self.my_layers:
+            # 这是我们负责的层，将其移动到GPU
+            layer = self.model.model.layers[layer_id]
+            self.memory_manager.move_to_gpu(layer)
+            
+            # 执行前向传播
+            result = layer(*args, **kwargs)
+            
+            # 将结果存储到KV缓存
+            if self.kvcache_socket:
+                self.store_kv_cache(request_id, layer_id, result)
+            
+            # 完成后将层移回CPU
+            self.memory_manager.move_to_cpu(layer)
+            
+            return result
+        elif self.kvcache_socket:
+            # 不是我们负责的层，从KV缓存获取结果
+            return self.retrieve_kv_cache(request_id, layer_id)
+        else:
+            # 如果没有KV缓存服务器，执行正常的前向传播
+            return self.original_forward(*args, **kwargs)
+    
+    # 应用新的forward方法
+    self.model.forward = distributed_forward
+    
+    # 记录模型已加载
+    logger.info(f"Model loaded successfully by Worker {self.worker_id}")
+    logger.info(f"Worker {self.worker_id} is responsible for layers: {self.my_layers}")
+    
+    # 加载tokenizer
+    logger.info(f"Loading tokenizer...")
+    self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    logger.info(f"Tokenizer loaded successfully")
+```
+
+
+
+此外，我们还需要添加一个拦截模型的`generate`方法，以确保分布式计算能够正常工作：
+
+```python:ktransformers/worker.py
+def generate(self, input_data):
+    """使用分布式层处理生成tokens"""
+    try:
+        # 提取输入数据
+        input_ids = torch.tensor(input_data.get('input_ids'))
+        attention_mask = torch.tensor(input_data.get('attention_mask'))
+        max_new_tokens = input_data.get('max_new_tokens', 50)
+        temperature = input_data.get('temperature', 0.7)
+        top_p = input_data.get('top_p', 0.9)
+        
+        # 创建一个唯一的请求ID
+        request_id = str(uuid.uuid4())
+        self.current_requests[request_id] = {'start_time': time.time()}
+        
+        # 记录输入数据大小
+        logger.info(f"Input shape: {input_ids.shape}")
+        
+        # 创建流式输出器
+        streamer = None
+        if input_data.get('stream', True):
+            streamer = self.create_streamer(request_id)
+        
+        # 保存原始forward方法
+        original_forward = self.model.forward
+        
+        # 修改模型的forward方法以使用request_id
+        def forward_with_request_id(*args, **kwargs):
+            kwargs['request_id'] = request_id
+            return self.model.forward(*args, **kwargs)
+        
+        # 应用修改后的forward方法
+        self.model.forward = forward_with_request_id
+        
+        # 记录开始时间
+        start_time = time.time()
+        
+        # 生成输出
+        logger.info(f"Starting generation with max_new_tokens={max_new_tokens}")
+        outputs = self.model.generate(
+            input_ids=input_ids.unsqueeze(0) if input_ids.dim() == 1 else input_ids,
+            attention_mask=attention_mask.unsqueeze(0) if attention_mask.dim() == 1 else attention_mask,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            do_sample=input_data.get('do_sample', True),
+            streamer=streamer
+        )
+        
+        # 恢复原始forward方法
+        self.model.forward = original_forward
+        
+        # 清理KV缓存
+        if self.kvcache_socket:
+            self.clear_kv_cache(request_id)
+        
+        # 记录性能统计
+        end_time = time.time()
+        generation_time = end_time - start_time
+        tokens_generated = len(outputs[0]) - len(input_ids[0])
+        
+        logger.info("Generation statistics:")
+        logger.info(f"- Total time: {generation_time:.2f} seconds")
+        logger.info(f"- Tokens generated: {tokens_generated}")
+        logger.info(f"- Speed: {tokens_generated/generation_time:.2f} tokens/sec")
+        
+        # 清理当前请求记录
+        if request_id in self.current_requests:
+            del self.current_requests[request_id]
+        
+        # 最终返回完整的 token ids
+        return {
+            'status': 'success',
+            'output_ids': outputs.cpu().numpy().tolist()
+        }
+    except Exception as e:
+        logger.error(f"Generation error: {str(e)}")
+        return {
+            'status': 'error',
+            'error': str(e)
+        }
+```
+
+
+
+我们还需要添加一个方法来拦截模型的各层，以便在需要时将它们移动到GPU：
+
+```python:ktransformers/worker.py
+def setup_model_hooks(self):
+    """设置模型钩子，以便在推理过程中处理层交换"""
+    # 获取所有层
+    if hasattr(self.model, 'model') and hasattr(self.model.model, 'layers'):
+        layers = self.model.model.layers
+    else:
+        logger.warning("无法获取模型层，跳过钩子设置")
+        return
+    
+    # 为每一层添加前向传播钩子
+    for i, layer in enumerate(layers):
+        # 跳过不属于此worker的层
+        if i not in self.my_layers:
+            continue
+        
+        # 保存原始forward方法
+        original_forward = layer.forward
+        
+        # 创建新的forward方法
+        def make_forward_hook(layer_idx, orig_forward):
+            def hooked_forward(*args, **kwargs):
+                # 在计算前将层移动到GPU
+                self.memory_manager.move_to_gpu(layers[layer_idx])
+                
+                # 执行原始forward
+                result = orig_forward(*args, **kwargs)
+                
+                # 计算完成后将层移回CPU
+                self.memory_manager.move_to_cpu(layers[layer_idx])
+                
+                return result
+            return hooked_forward
+        
+        # 应用新的forward方法
+        layer.forward = make_forward_hook(i, original_forward)
+    
+    logger.info(f"设置了 {len(self.my_layers)} 个层的钩子函数")
+```
+
+
+
+这些修改解决了以下问题：
+
+1. **层分配**: 每个worker明确知道它负责的模型层
+2. **内存管理**: 层仅在需要计算时才加载到GPU
+3. **分布式处理**: 不同worker处理不同的层，通过KV缓存同步结果
+4. **动态GPU使用**: 减少了显存消耗，使模型能在有限资源上运行
+
+这样我们的大模型就可以被正确地分布在多个worker上，而不仅仅是KV缓存服务器。
+
+---
+
+_**User**_
+
+Traceback (most recent call last):
+  File "<frozen runpy>", line 189, in _run_module_as_main
+  File "<frozen runpy>", line 159, in _get_module_details
+  File "<frozen importlib._bootstrap_external>", line 1074, in get_code
+  File "<frozen importlib._bootstrap_external>", line 1004, in source_to_code
+  File "<frozen importlib._bootstrap>", line 241, in _call_with_frames_removed
+  File "/archive/liugu/ds/ktransformers/ktransformers/local_chat.py", line 24
+    from ktransformers.optimize.optimize import optimize_and_load_gguf
+    ^
+IndentationError: expected an indented block after function definition on line 23
+
+---
+
+_**Assistant**_
+
+<think>
+The error message shows that there's an indentation error in the `local_chat.py` file. The specific error is on line 24. It seems like line 23 has a function definition, but the function body (which should be indented) is missing, and instead there's an import statement that should be outside the function.
+
+Let's fix the `local_chat.py` file.
+</think>
+
+让我来修复`local_chat.py`文件中的缩进问题：
+
+```python:ktransformers/local_chat.py
+"""
+Description  :  
+Author       : Boxin Zhang, Azure-Tang
+Version      : 0.1.0
+Copyright (c) 2024 by KVCache.AI, All Rights Reserved. 
+"""
+
+import os
+import platform
+import sys
+import zmq
+import argparse
+import logging
+import locale
+import torch
+from transformers import AutoTokenizer
+import time
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# 只在非分布式模式下导入这些模块
+def import_local_modules():
+    from ktransformers.optimize.optimize import optimize_and_load_gguf
+    from ktransformers.models.modeling_deepseek import DeepseekV2ForCausalLM
+    from ktransformers.models.modeling_qwen2_m
 
 ---
 

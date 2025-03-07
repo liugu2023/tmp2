@@ -21,15 +21,15 @@ logger = logging.getLogger(__name__)
 
 # 只在非分布式模式下导入这些模块
 def import_local_modules():
-from ktransformers.optimize.optimize import optimize_and_load_gguf
-from ktransformers.models.modeling_deepseek import DeepseekV2ForCausalLM
-from ktransformers.models.modeling_qwen2_moe import Qwen2MoeForCausalLM
-from ktransformers.models.modeling_deepseek_v3 import DeepseekV3ForCausalLM
-from ktransformers.models.modeling_llama import LlamaForCausalLM
-from ktransformers.models.modeling_mixtral import MixtralForCausalLM
-from ktransformers.util.utils import prefill_and_generate, get_compute_capability
-from ktransformers.server.config.config import Config
-from ktransformers.operators.flashinfer_wrapper import flashinfer_enabled
+    from ktransformers.optimize.optimize import optimize_and_load_gguf
+    from ktransformers.models.modeling_deepseek import DeepseekV2ForCausalLM
+    from ktransformers.models.modeling_qwen2_moe import Qwen2MoeForCausalLM
+    from ktransformers.models.modeling_deepseek_v3 import DeepseekV3ForCausalLM
+    from ktransformers.models.modeling_llama import LlamaForCausalLM
+    from ktransformers.models.modeling_mixtral import MixtralForCausalLM
+    from ktransformers.util.utils import prefill_and_generate, get_compute_capability
+    from ktransformers.server.config.config import Config
+    from ktransformers.operators.flashinfer_wrapper import flashinfer_enabled
     return (optimize_and_load_gguf, DeepseekV2ForCausalLM, Qwen2MoeForCausalLM,
             DeepseekV3ForCausalLM, LlamaForCausalLM, MixtralForCausalLM,
             prefill_and_generate, get_compute_capability, Config, flashinfer_enabled)
@@ -91,95 +91,90 @@ class DistributedModel:
                 
                 if response['status'] == 'streaming':
                     # 打印新生成的文本部分
-                    new_text = response['text'][len(full_text):]
-                    if new_text:
-                        print(new_text, end='', flush=True)
-                    full_text = response['text']
+                    text = response.get('text', '')
+                    print(text, end='', flush=True)
+                    full_text += text
                     
-                    # 发送确认
+                    # 向服务器确认接收
                     self.socket.send_pyobj({'status': 'received'})
-                    
-                    # 如果生成结束，退出循环
-                    if response.get('finished', False):
-                        print()  # 换行
                 
-                elif response['status'] == 'success':
-                    # 最终的完整响应
-                    return response['output_ids']
-        
+                if response['status'] == 'success':
+                    # 生成完成
+                    logger.info("Generation completed")
+                    break
+            
+            return full_text
         except Exception as e:
             logger.error(f"Error in generate_from_messages: {str(e)}")
-            raise
+            return None
 
-    def generate(self, input_ids, attention_mask, **kwargs):
-        """原始的generate方法，用于与worker直接通信"""
-        try:
-            logger.info("Preparing generation request...")
-            message = {
-                'command': 'generate',
-                'data': {
-                    'input_ids': input_ids.cpu().numpy().tolist(),
-                    'attention_mask': attention_mask.cpu().numpy().tolist(),
-                    **kwargs
-                }
-            }
-            
-            logger.info("Starting generation...")
-            self.socket.send_pyobj(message)
-            
-            # 接收流式响应
-            full_text = ""
-            while True:
-                response = self.socket.recv_pyobj()
-                
-                if response['status'] == 'error':
-                    raise Exception(f"Generation failed: {response.get('error')}")
-                
-                if response['status'] == 'streaming':
-                    # 打印新生成的文本部分
-                    new_text = response['text'][len(full_text):]
-                    if new_text:
-                        print(new_text, end='', flush=True)
-                    full_text = response['text']
-                    
-                    # 发送确认
-                    self.socket.send_pyobj({'status': 'received'})
-                    
-                    # 如果生成结束，退出循环
-                    if response.get('finished', False):
-                        print()  # 换行
-                
-                elif response['status'] == 'success':
-                    # 最终的完整响应
-                    return torch.tensor(response['output_ids'])
+    def generate(self, input_ids, attention_mask, max_new_tokens=50, temperature=0.7, top_p=0.9, do_sample=True):
+        input_data = {
+            'input_ids': input_ids.numpy().tolist(),
+            'attention_mask': attention_mask.numpy().tolist(),
+            'max_new_tokens': max_new_tokens,
+            'temperature': temperature,
+            'top_p': top_p,
+            'do_sample': do_sample
+        }
+        message = {'command': 'generate', 'data': input_data}
         
-        except Exception as e:
-            logger.error(f"Error in generate: {str(e)}")
-            raise
-
+        logger.info("Sending generate request...")
+        self.socket.send_pyobj(message)
+        
+        # 处理流式输出
+        full_text = ""
+        tokens = []
+        
+        while True:
+            response = self.socket.recv_pyobj()
+            
+            if response['status'] == 'error':
+                logger.error(f"Generation error: {response.get('error')}")
+                return None
+            
+            if response['status'] == 'streaming':
+                text_chunk = response.get('text', '')
+                token_chunk = response.get('tokens', [])
+                tokens.extend(token_chunk)
+                
+                print(text_chunk, end='', flush=True)
+                full_text += text_chunk
+                
+                self.socket.send_pyobj({'status': 'received'})
+            
+            if response['status'] == 'success':
+                output_ids = response.get('output_ids', [])[0]
+                logger.info(f"Generation completed, output length: {len(output_ids)}")
+                return torch.tensor([output_ids])
+        
     def shutdown(self):
-        """发送关闭命令"""
+        """关闭连接并释放资源"""
         try:
             logger.info("Sending shutdown command...")
-            message = {'command': 'shutdown'}
-            self.socket.send_pyobj(message)
+            self.socket.send_pyobj({'command': 'shutdown'})
             response = self.socket.recv_pyobj()
-            if response['status'] == 'shutdown':
-                logger.info("Shutdown successful")
+            logger.info(f"Shutdown response: {response}")
+        except Exception as e:
+            logger.error(f"Error during shutdown: {str(e)}")
+        finally:
             self.socket.close()
             self.context.term()
-    except Exception as e:
-            logger.error(f"Error during shutdown: {e}")
 
 def main():
-    # 设置终端编码
-    if sys.platform.startswith('win'):
-        sys.stdout.reconfigure(encoding='utf-8')
-        sys.stdin.reconfigure(encoding='utf-8')
-    else:
-        default_encoding = locale.getpreferredencoding()
-        sys.stdout = open(sys.stdout.fileno(), mode='w', encoding='utf-8', buffering=1)
-        sys.stdin = open(sys.stdin.fileno(), mode='r', encoding=default_encoding, buffering=1)
+    # 设置输入和输出的编码
+    default_encoding = locale.getpreferredencoding()
+    if default_encoding.lower() == 'ascii':
+        if platform.system() == 'Windows':
+            default_encoding = 'utf-8'
+        else:
+            default_encoding = locale.getlocale()[1]
+    if not default_encoding:
+        default_encoding = 'utf-8'
+    
+    # 设置标准输入输出的编码
+    sys.stdout = open(sys.stdout.fileno(), mode='w', encoding='utf-8', buffering=1)
+    sys.stdin = open(sys.stdin.fileno(), mode='r', encoding=default_encoding, buffering=1)
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_path', type=str, required=True)
@@ -212,14 +207,14 @@ def main():
                     model.shutdown()
                     break
                 elif content == "":
-                content = "Please write a piece of quicksort code in C++."
-        elif os.path.isfile(content):
+                    content = "Please write a piece of quicksort code in C++."
+                elif os.path.isfile(content):
                     logger.info(f"Reading from file: {content}")
                     with open(content, "r", encoding='utf-8') as f:
                         content = f.read()
-            
+                
                 logger.info("Creating chat messages...")
-        messages = [{"role": "user", "content": content}]
+                messages = [{"role": "user", "content": content}]
                 
                 logger.info("Starting chat...")
                 if args.scheduler_address:
@@ -234,9 +229,9 @@ def main():
                 else:
                     # 直接连接worker的原始方法
                     logger.info("Tokenizing input...")
-        input_tensor = tokenizer.apply_chat_template(
-            messages, add_generation_prompt=True, return_tensors="pt"
-        )
+                    input_tensor = tokenizer.apply_chat_template(
+                        messages, add_generation_prompt=True, return_tensors="pt"
+                    )
                     
                     logger.info("Starting generation...")
                     outputs = model.generate(

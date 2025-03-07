@@ -39,62 +39,73 @@ class DistributedModel:
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.REQ)
         
+        # 添加model_loaded属性初始化
+        self.model_loaded = False
+        
         if scheduler_address:
             # 连接到调度器
             self.socket.connect(f"tcp://{scheduler_address}")
-            logger.info(f"Connected to scheduler at {scheduler_address}")
             self.use_scheduler = True
+            logger.info(f"Connected to scheduler at {scheduler_address}")
         elif worker_address:
             # 直接连接到worker
             self.socket.connect(f"tcp://{worker_address}")
-            logger.info(f"Connected to worker at {worker_address}")
             self.use_scheduler = False
+            logger.info(f"Connected to worker at {worker_address}")
         else:
-            raise ValueError("Must provide either worker_address or scheduler_address")
-
+            raise ValueError("必须提供worker_address或scheduler_address参数")
+        
         # 初始化后检查模型状态
-        if self.use_scheduler:
+        if hasattr(self, 'use_scheduler') and self.use_scheduler:
             self._check_model_status()
 
     def _check_model_status(self):
         """检查模型是否已加载，避免重复加载"""
         try:
-            logger.info("Checking model status...")
+            logger.info("检查模型加载状态...")
             self.socket.send_pyobj({"command": "status"})
             response = self.socket.recv_pyobj()
             
             if response.get('status') == 'success' and response.get('model_loaded', False):
-                logger.info("Model already loaded, skipping load step")
+                logger.info("模型已经加载，跳过加载步骤")
                 self.model_loaded = True
                 print("模型已经加载完成，可以开始对话")
                 return True
             else:
-                logger.info("Model not loaded yet")
+                logger.info("模型尚未加载")
                 return False
         except Exception as e:
-            logger.error(f"Error checking model status: {e}")
+            logger.error(f"检查模型状态时出错: {e}")
             return False
 
-    def load_model(self, model_path: str, gguf_path: str):
-        if self.model_loaded:
-            logger.info("Model already loaded, skipping load step")
+    def load_model(self, model_path: str, gguf_path: str = None):
+        """加载模型"""
+        if hasattr(self, 'model_loaded') and self.model_loaded:
+            logger.info("模型已经加载，跳过加载步骤")
             return True
         
         # 先检查模型状态，避免重复加载
-        if self.use_scheduler and self._check_model_status():
+        if hasattr(self, 'use_scheduler') and self.use_scheduler and self._check_model_status():
             return True
         
-        message = {
+        # 发送加载模型的请求
+        logger.info(f"发送请求加载模型: {model_path}")
+        request = {
             'command': 'load_model',
             'model_path': model_path,
             'gguf_path': gguf_path
         }
-        logger.info("Requesting model load...")
-        self.socket.send_pyobj(message)
+        
+        self.socket.send_pyobj(request)
         response = self.socket.recv_pyobj()
-        if response['status'] != 'success':
-            raise Exception(f"Failed to load model: {response.get('error')}")
-        logger.info("Model loaded successfully")
+        
+        if response.get('status') == 'success':
+            logger.info("模型加载成功")
+            self.model_loaded = True
+            return True
+        else:
+            logger.error(f"加载模型失败: {response.get('error')}")
+            return False
 
     def generate_from_messages(self, messages, **kwargs):
         """使用聊天消息直接生成文本，由调度器处理tokenization"""

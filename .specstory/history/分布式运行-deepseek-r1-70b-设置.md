@@ -9583,7 +9583,95 @@ def _check_model_status(self):
         response = self.socket.recv_pyobj()
         
         if response.get('status') == 'success' and response.get('model_loaded', False):
-            logger.info("Model already
+            logger.info("Model already loaded, skipping load step")
+            self.model_loaded = True
+            print("模型已经加载完成，可以开始对话")
+            return True
+        else:
+            logger.info("Model not loaded yet")
+            return False
+    except Exception as e:
+        logger.error(f"Error checking model status: {e}")
+        return False
+
+def load_model(self):
+    """加载模型"""
+    if self.model_loaded:
+        logger.info("Model already loaded, skipping load step")
+        return True
+    
+    # 先检查模型状态，避免重复加载
+    if self.use_scheduler and self._check_model_status():
+        return True
+    
+    # 现有代码...
+```
+
+## 3. 修改worker.py添加状态响应
+
+```python:ktransformers/worker.py
+def run(self):
+    logger.info("Worker ready to receive requests")
+    try:
+        while True:
+            try:
+                message = self.socket.recv_pyobj()
+                command = message.get('command')
+                
+                if command == 'load_model':
+                    self.load_model(message['model_path'], message['gguf_path'])
+                    self.socket.send_pyobj({'status': 'success'})
+                
+                elif command == 'status':
+                    # 返回模型状态
+                    status = {
+                        'status': 'ready',
+                        'model_loaded': hasattr(self, 'model') and self.model is not None,
+                        'worker_id': self.worker_id
+                    }
+                    self.socket.send_pyobj(status)
+                
+                elif command == 'generate':
+                    result = self.generate(message['data'])
+                    self.socket.send_pyobj(result)
+                
+                # 其他处理...
+```
+
+## 实现的功能
+
+这些修改解决了客户端意外断连后重连的问题，通过以下机制：
+
+1. **持久化会话状态**：调度器现在会将模型加载状态保存到文件，即使进程重启也能恢复
+2. **状态检查机制**：提供了`status`命令来查询模型当前状态
+3. **状态一致性**：客户端可以查询模型状态，避免重复加载
+4. **状态确认**：调度器会向worker确认模型状态，确保状态一致性
+
+这样，即使客户端意外断开连接，再次连接时也能检测到模型已经加载，直接进入对话状态而不需要重新加载模型。
+
+如果需要，还可以添加更完善的会话管理，例如保存对话历史、用户设置等，以提供更好的用户体验。
+
+---
+
+_**User**_
+
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/archive/liugu/ds/ktransformers/ktransformers/local_chat.py", line 304, in <module>
+    main()
+  File "/archive/liugu/ds/ktransformers/ktransformers/local_chat.py", line 231, in main
+    model.load_model(args.model_path, args.gguf_path)
+  File "/archive/liugu/ds/ktransformers/ktransformers/local_chat.py", line 79, in load_model
+    if self.model_loaded:
+       ^^^^^^^^^^^^^^^^^
+AttributeError: 'DistributedModel' object has no attribute 'model_loaded'客户端问题
+
+---
+
+_**Assistant**_
+
+
 
 ---
 

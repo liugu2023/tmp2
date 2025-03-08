@@ -231,7 +231,7 @@ class ModelWorker:
         return response["status"] == "success"
     
     def load_model(self, model_path: str, gguf_path: str = None):
-        """加载模型并设置内存优化"""
+        """加载模型并设置内存优化 - 不使用量化"""
         logger.info(f"Worker {self.worker_id} loading model from {model_path}")
         
         try:
@@ -280,38 +280,18 @@ class ModelWorker:
             
             logger.info(f"Device map for worker {self.worker_id}: {device_map}")
             
-            # 加载模型 - 使用offload和8位量化进一步降低内存
+            # 加载模型 - 使用offload但不使用量化
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_path,
                 config=config,
                 device_map=device_map,
-                load_in_8bit_fp32_cpu_offload=True,  # 使用8位量化
                 low_cpu_mem_usage=True,
                 torch_dtype=torch.float16,
                 offload_folder=f"offload_folder_{self.worker_id}"
             )
             
-            # 应用8位量化 (可选)
-            if not hasattr(self.model, "is_quantized") or not self.model.is_quantized:
-                try:
-                    from transformers import BitsAndBytesConfig
-                    quantization_config = BitsAndBytesConfig(
-                        load_in_8bit_fp32_cpu_offload=True,
-                        llm_int8_enable_fp32_cpu_offload=True
-                    )
-                    logger.info("Applying 8-bit quantization")
-                    self.model = AutoModelForCausalLM.from_pretrained(
-                        model_path,
-                        config=config,
-                        device_map=device_map,
-                        quantization_config=quantization_config,
-                        low_cpu_mem_usage=True
-                    )
-                except Exception as e:
-                    logger.warning(f"Could not apply quantization: {e}")
-            
             # 设置钩子，实现按需加载GPU
-            self._setup_layer_hooks()
+            self.setup_layer_hooks()
             
             # 确保模型处于评估模式
             self.model.eval()
@@ -331,7 +311,7 @@ class ModelWorker:
             logger.error(traceback.format_exc())
             return {"status": "error", "error": str(e)}
 
-    def _setup_layer_hooks(self):
+    def setup_layer_hooks(self):
         """设置钩子实现动态层调度"""
         if not hasattr(self.model, 'model') or not hasattr(self.model.model, 'layers'):
             logger.warning("无法设置层管理钩子，模型结构不符合预期")

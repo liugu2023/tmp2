@@ -13747,6 +13747,204 @@ _**User**_
 
 _**Assistant**_
 
+<think>
+从提供的`ktransformers/local_chat_base.py`文件中，我能看到确实有专门的GGUF模型加载流程。看起来ktransformers库有自己的优化和加载GGUF模型的方法。
+
+关键代码部分：
+
+```python
+from ktransformers.optimize.optimize import optimize_and_load_gguf
+...
+optimize_and_load_gguf(model, optimize_config_path, gguf_path, config)
+```
+
+这表明ktransformers有一个专门的方法`optimize_and_load_gguf`用于加载和优化GGUF模型。
+
+要使用这个方法，需要以下参数：
+1. `model` - 预先创建的模型对象
+2. `optimize_config_path` - 优化规则的YAML文件路径
+3. `gguf_path` - GGUF模型文件的路径
+4. `config` - 模型配置对象
+
+所以在我们的worker.py中，如果要使用ktransformers自己的GGUF加载流程，应该尝试导入并使用这个函数，而不是使用ctransformers库。
+</think>
+
+# 使用 ktransformers 现有的 GGUF 加载流程
+
+您是正确的！从您提供的 `ktransformers/local_chat_base.py` 代码中可以看到，ktransformers 已经有了一套完整的 GGUF 模型加载流程。让我们修改 worker 代码来使用这个现有的加载方法：
+
+```python:ktransformers/worker.py
+def generate(self, data):
+    """使用 ktransformers 内置的 GGUF 加载和生成功能"""
+    try:
+        # 提取输入数据
+        input_ids = torch.tensor(data.get('input_ids'), device='cpu')
+        max_new_tokens = data.get('max_new_tokens', 512)
+        temperature = data.get('temperature', 0.7)
+        top_p = data.get('top_p', 0.9)
+        do_sample = data.get('do_sample', True)
+        stream = data.get('stream', True)
+        
+        logger.info(f"Worker {self.worker_id} generating with {max_new_tokens} new tokens")
+        
+        # 确定模型路径和GGUF路径
+        model_path = data.get('model_path', "/archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/")
+        gguf_path = data.get('gguf_path') or self.gguf_path
+        
+        # 如果模型尚未加载，使用ktransformers的方法加载
+        if not hasattr(self, 'gguf_loaded') or not self.gguf_loaded:
+            try:
+                logger.info(f"使用ktransformers内置方法加载GGUF模型")
+                
+                # 导入需要的模块
+                from transformers import AutoTokenizer, AutoConfig
+                from ktransformers.optimize.optimize import optimize_and_load_gguf
+                from ktransformers.models.modeling_llama import LlamaForCausalLM
+                
+                # 加载tokenizer和配置
+                logger.info(f"加载tokenizer和配置: {model_path}")
+                self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+                config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+                
+                # 使用meta设备创建模型
+                logger.info("在meta设备上创建模型...")
+                with torch.device("meta"):
+                    if config.architectures[0] == "LlamaForCausalLM":
+                        logger.info("使用自定义LlamaForCausalLM模型")
+                        config._attn_implementation = "eager"
+                        self.model = LlamaForCausalLM(config)
+                    else:
+                        logger.info(f"使用标准模型: {config.architectures[0]}")
+                        self.model = AutoModelForCausalLM.from_config(
+                            config, trust_remote_code=True
+                        )
+                
+                # 设置优化规则
+                ktransformer_rules_dir = os.path.join(
+                    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                    "ktransformers/optimize/optimize_rules/"
+                )
+                optimize_rule = os.path.join(ktransformer_rules_dir, "DeepSeek-R1-70B.yaml")
+                
+                # 优化并加载GGUF模型
+                logger.info(f"优化并加载GGUF模型: {gguf_path}")
+                logger.info(f"使用优化规则: {optimize_rule}")
+                optimize_and_load_gguf(self.model, optimize_rule, gguf_path, config)
+                
+                # 设置生成配置
+                from transformers import GenerationConfig
+                try:
+                    self.model.generation_config = GenerationConfig.from_pretrained(model_path)
+                except Exception as e:
+                    logger.warning(f"无法加载生成配置，使用默认值: {e}")
+                    gen_config = GenerationConfig(
+                        temperature=0.6,
+                        top_p=0.95,
+                        do_sample=True
+                    )
+                    self.model.generation_config = gen_config
+                
+                if self.model.generation_config.pad_token_id is None:
+                    self.model.generation_config.pad_token_id = self.model.generation_config.eos_token_id
+                
+                self.model.eval()
+                self.gguf_loaded = True
+                logger.info("GGUF模型加载完成")
+                
+            except Exception as e:
+                logger.error(f"GGUF模型加载失败: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+                self.gguf_loaded = False
+        
+        # 如果模型已成功加载，使用它生成文本
+        if hasattr(self, 'gguf_loaded') and self.gguf_loaded:
+            logger.info("准备使用GGUF模型生成...")
+            
+            # 准备输入
+            messages = [{"role": "user", "content": self.tokenizer.decode(input_ids[0], skip_special_tokens=True)}]
+            input_tensor = self.tokenizer.apply_chat_template(
+                messages, add_generation_prompt=True, return_tensors="pt"
+            )
+            
+            # 使用ktransformers内置的生成方法
+            from ktransformers.util.utils import prefill_and_generate
+            
+            # 将输入移至GPU
+            input_tensor = input_tensor.cuda()
+            
+            # 生成文本
+            logger.info("开始生成...")
+            generated = prefill_and_generate(
+                self.model, self.tokenizer, input_tensor, 
+                max_new_tokens, use_cuda_graph=False
+            )
+            
+            logger.info(f"生成完成: {generated[:100]}...")
+            
+            # 将生成的文本转换回token ID
+            generated_ids = self.tokenizer.encode(generated, return_tensors="pt")[0]
+            
+            # 提取新生成的部分
+            input_length = input_ids.shape[1]
+            if len(generated_ids) > input_length:
+                new_tokens = generated_ids[input_length:].tolist()
+            else:
+                new_tokens = [0]
+            
+            return {
+                'status': 'success',
+                'output_ids': [new_tokens]
+            }
+        
+        # 如果模型加载失败，使用基本生成方法
+        logger.info("使用基本生成方法(GGUF模型加载失败)...")
+        
+        # 基本生成代码...
+```
+
+
+### 在构造函数中更新路径处理
+
+```python:ktransformers/worker.py
+def __init__(self, address: str, worker_id: int = 0, num_workers: int = 1, 
+             kvcache_address: str = None, embedding_address: str = None, 
+             gpu_id: int = None, gguf_path: str = None):
+    # ...现有代码...
+    
+    # 保存GGUF模型路径
+    self.gguf_path = gguf_path
+    
+    # 如果未提供GGUF路径，尝试从环境变量获取
+    if self.gguf_path is None:
+        self.gguf_path = os.environ.get("GGUF_PATH", None)
+        if self.gguf_path:
+            logger.info(f"从环境变量获取GGUF路径: {self.gguf_path}")
+    
+    # 初始化GGUF加载状态
+    self.gguf_loaded = False
+```
+
+
+这种方法的优势在于：
+
+1. **使用现有代码**：利用了ktransformers内置的GGUF加载功能，包括优化规则
+2. **与系统集成**：使用了与系统其他部分相同的规则和优化
+3. **更好的性能**：ktransformers可能对特定模型做了优化
+4. **更少的依赖**：不需要额外安装ctransformers库
+
+使用这种方法，我们的代码能够更好地与ktransformers现有的GGUF处理流程集成，利用其内置的优化能力。
+
+---
+
+_**User**_
+
+这样，咱们只从model文件夹下获取配置文件和tokenizer，模型加载只使用GGUF
+
+---
+
+_**Assistant**_
+
 
 
 ---

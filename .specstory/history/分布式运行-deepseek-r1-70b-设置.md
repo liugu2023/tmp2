@@ -13345,6 +13345,80 @@ worker1-4使用GPU0,5-8使用GPU1
 
 _**Assistant**_
 
+<think>
+基于错误信息和您的描述，我需要修复一个问题：我们需要确保worker进程正确分配到两个GPU上，其中worker 1-4使用GPU 0，worker 5-8使用GPU 1。
+
+现在的问题是分配逻辑可能不正确。目前代码中是这样分配的：
+```python
+gpu_id = 0 if i < (args.num_workers // 2) else 1
+```
+
+这意味着对于8个worker，前4个(0,1,2,3)使用GPU 0，后4个(4,5,6,7)使用GPU 1。
+
+但根据您的要求，应该是worker 1-4使用GPU 0，worker 5-8使用GPU 1。这里有个微妙的差别，因为worker ID可能从0开始(0-7)或从1开始(1-8)。
+
+让我调整分配逻辑，确保worker 1-4使用GPU 0，worker 5-8使用GPU 1。
+</think>
+
+# 修复 GPU 分配逻辑
+
+从您的回复中我理解到您需要让 worker 1-4 使用 GPU 0，worker 5-8 使用 GPU 1。目前的分配逻辑可能不正确。让我们修改 GPU 分配逻辑：
+
+```python:ktransformers/worker.py
+# 多worker模式，启动多个进程
+logger.info(f"启动 {args.num_workers} 个worker进程...")
+
+processes = []
+for i in range(args.num_workers):
+    # 根据要求分配GPU：worker 1-4 -> GPU 0, worker 5-8 -> GPU 1
+    # worker ID从0开始，所以我们需要适当调整
+    gpu_id = 0 if i < 4 else 1
+    
+    # 构建命令
+    cmd = [
+        sys.executable, "-m", "ktransformers.worker",
+        "--worker_id", str(i),
+        "--gpu_id", str(gpu_id),
+        "--base_port", str(args.base_port),
+        "--num_workers", str(args.num_workers),
+    ]
+```
+
+这个修改会确保：
+- Worker ID 0-3 (对应显示的 Worker 1-4) 使用 GPU 0
+- Worker ID 4-7 (对应显示的 Worker 5-8) 使用 GPU 1
+
+您也可以在初始化时添加更明确的日志输出，以便确认分配是否正确：
+
+```python:ktransformers/worker.py
+def __init__(self, address: str, worker_id: int = 0, num_workers: int = 1, 
+             kvcache_address: str = None, embedding_address: str = None, 
+             gpu_id: int = None, gguf_path: str = None):
+    self.worker_id = worker_id
+    self.num_workers = num_workers
+    
+    # 设置CUDA设备
+    if gpu_id is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        self.gpu_id = 0  # 在设置了CUDA_VISIBLE_DEVICES后，设备总是0
+        logger.info(f"Worker {worker_id+1} 使用物理GPU {gpu_id}")
+    else:
+        self.gpu_id = None
+        logger.warning(f"Worker {worker_id+1} 没有分配GPU!")
+```
+
+这样，当worker启动时，您会看到明确的日志消息，显示每个worker使用哪个物理GPU。
+
+---
+
+_**User**_
+
+明明找到了GGUF文件，为什么使用基本生成方法而不是使用GGUF文件
+
+---
+
+_**Assistant**_
+
 
 
 ---

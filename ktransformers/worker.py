@@ -481,7 +481,7 @@ class ModelWorker:
             torch.cuda.empty_cache()
 
     def generate(self, data):
-        """使用备用方法执行生成"""
+        """使用GGUF模型或备用方法执行生成"""
         try:
             # 提取输入数据
             input_ids = torch.tensor(data.get('input_ids'), device='cpu')
@@ -497,6 +497,7 @@ class ModelWorker:
             gguf_path = data.get('gguf_path') or self.gguf_path
             
             # 检查GGUF路径是文件还是目录
+            gguf_model_path = None
             if gguf_path and os.path.exists(gguf_path):
                 if os.path.isdir(gguf_path):
                     # 如果是目录，找到第一个.gguf文件
@@ -509,17 +510,98 @@ class ModelWorker:
                         logger.info(f"找到GGUF模型文件: {gguf_model_path}")
                     else:
                         logger.warning(f"目录 {gguf_path} 中没有发现GGUF文件")
-                        gguf_model_path = None
                 else:
                     # 如果是文件，直接使用
                     gguf_model_path = gguf_path
                     logger.info(f"使用GGUF模型文件: {gguf_model_path}")
             else:
                 logger.warning(f"GGUF路径不存在: {gguf_path}")
-                gguf_model_path = None
             
-            # 尝试使用简单方法生成内容
-            logger.info("使用基本生成方法...")
+            # 尝试加载和使用GGUF模型
+            use_gguf = False
+            if gguf_model_path and os.path.exists(gguf_model_path):
+                # 加载tokenizer，如果尚未加载
+                if not hasattr(self, 'tokenizer') or self.tokenizer is None:
+                    try:
+                        from transformers import AutoTokenizer
+                        model_path = data.get('model_path', "/archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/")
+                        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+                        logger.info("成功加载tokenizer")
+                    except Exception as e:
+                        logger.error(f"tokenizer加载失败: {e}")
+                        self.tokenizer = None
+                
+                # 尝试加载GGUF模型
+                if not hasattr(self, 'gguf_model') or self.gguf_model is None:
+                    try:
+                        # 动态导入ctransformers
+                        import importlib.util
+                        if importlib.util.find_spec("ctransformers") is not None:
+                            from ctransformers import AutoModelForCausalLM as CTAutoModelForCausalLM
+                            
+                            logger.info(f"正在加载GGUF模型: {gguf_model_path}")
+                            # 加载模型
+                            self.gguf_model = CTAutoModelForCausalLM.from_pretrained(
+                                gguf_model_path,
+                                model_type="llama",
+                                gpu_layers=20,
+                                threads=8
+                            )
+                            logger.info("GGUF模型加载成功")
+                            use_gguf = True
+                        else:
+                            logger.error("未安装ctransformers库，无法加载GGUF模型")
+                    except Exception as e:
+                        logger.error(f"GGUF模型加载失败: {e}")
+                        import traceback
+                        logger.error(traceback.format_exc())
+                        self.gguf_model = None
+                else:
+                    # 已有加载的模型
+                    use_gguf = True
+                    logger.info("使用已加载的GGUF模型")
+            
+            # 如果成功加载了GGUF模型并有tokenizer
+            if use_gguf and hasattr(self, 'gguf_model') and self.gguf_model is not None and hasattr(self, 'tokenizer') and self.tokenizer is not None:
+                logger.info("使用GGUF模型生成文本")
+                try:
+                    # 准备输入
+                    input_text = self.tokenizer.decode(input_ids[0], skip_special_tokens=True)
+                    logger.info(f"输入文本: {input_text[:100]}...")
+                    
+                    # 生成文本
+                    generated_text = self.gguf_model(
+                        input_text,
+                        max_new_tokens=max_new_tokens,
+                        temperature=temperature,
+                        top_p=top_p
+                    )
+                    
+                    logger.info(f"GGUF模型生成完成: {generated_text[:100]}...")
+                    
+                    # 将生成的文本转换回token ID
+                    generated_ids = self.tokenizer.encode(generated_text, return_tensors="pt")[0]
+                    
+                    # 提取新生成的部分
+                    input_length = input_ids.shape[1]
+                    if len(generated_ids) > input_length:
+                        new_tokens = generated_ids[input_length:].tolist()
+                    else:
+                        # 生成结果可能只包含输入
+                        new_tokens = [0]  # 生成空token作为替代
+                    
+                    return {
+                        'status': 'success',
+                        'output_ids': [new_tokens]  # 保持与之前输出格式一致
+                    }
+                except Exception as e:
+                    logger.error(f"GGUF生成过程中出错: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+                    # 在失败时继续使用备用方法
+            
+            # 如果GGUF模型不可用或生成失败，使用基本生成方法
+            logger.info("使用基本生成方法(因GGUF模型不可用或生成失败)...")
             
             # 获取必要的配置
             current_ids = input_ids.clone()

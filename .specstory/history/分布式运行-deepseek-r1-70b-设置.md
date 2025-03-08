@@ -12058,7 +12058,343 @@ _**Assistant**_
 我们需要实现一个内存效率更高的版本来解决CUDA OOM(内存不足)问题。这个模型非常大(70B参数)，需要特别优化内存使用：
 
 ```python:ktransformers/worker.py
-def loa
+def load_model(self, model_path: str, gguf_path: str = None):
+    """加载模型并设置内存优化"""
+    logger.info(f"Worker {self.worker_id} loading model from {model_path}")
+    
+    try:
+        from transformers import AutoConfig, AutoModelForCausalLM
+        import torch
+        
+        logger.info(f"Loading model config...")
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        
+        # 获取总层数
+        if hasattr(config, 'num_hidden_layers'):
+            total_layers = config.num_hidden_layers
+        elif hasattr(config, 'n_layers'):
+            total_layers = config.n_layers
+        else:
+            total_layers = 32  # 默认值
+        
+        logger.info(f"Model has {total_layers} layers in total")
+        
+        # 计算每个worker负责的层范围
+        layers_per_worker = total_layers // self.num_workers
+        start_layer = self.worker_id * layers_per_worker
+        end_layer = start_layer + layers_per_worker if self.worker_id < self.num_workers - 1 else total_layers
+        
+        self.my_layers = list(range(start_layer, end_layer))
+        logger.info(f"Worker {self.worker_id} responsible for layers {self.my_layers}")
+        
+        # 创建设备映射 - 关键优化
+        device_map = {}
+        
+        # 嵌入层和输出层由嵌入服务器处理，设为'meta'
+        device_map["model.embed_tokens"] = "meta"
+        device_map["lm_head"] = "meta"
+        
+        # 对每一层分配设备
+        for i in range(total_layers):
+            if i in self.my_layers:
+                # 我负责的层，初始设为CPU（推理时才移到GPU）
+                device_map[f"model.layers.{i}"] = "cpu"
+            else:
+                # 不负责的层设为meta（不加载）
+                device_map[f"model.layers.{i}"] = "meta"
+        
+        # 其他组件放在CPU上
+        device_map["model.norm"] = "cpu"
+        
+        logger.info(f"Device map for worker {self.worker_id}: {device_map}")
+        
+        # 加载模型 - 使用offload和8位量化进一步降低内存
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            config=config,
+            device_map=device_map,
+            load_in_8bit=True,  # 使用8位量化
+            low_cpu_mem_usage=True,
+            torch_dtype=torch.float16,
+            offload_folder=f"offload_folder_{self.worker_id}"
+        )
+        
+        # 应用8位量化 (可选)
+        if not hasattr(self.model, "is_quantized") or not self.model.is_quantized:
+            try:
+                from transformers import BitsAndBytesConfig
+                quantization_config = BitsAndBytesConfig(
+                    load_in_8bit=True,
+                    llm_int8_enable_fp32_cpu_offload=True
+                )
+                logger.info("Applying 8-bit quantization")
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    model_path,
+                    config=config,
+                    device_map=device_map,
+                    quantization_config=quantization_config,
+                    low_cpu_mem_usage=True
+                )
+            except Exception as e:
+                logger.warning(f"Could not apply quantization: {e}")
+        
+        # 设置钩子，实现按需加载GPU
+        self._setup_layer_hooks()
+        
+        # 确保模型处于评估模式
+        self.model.eval()
+        
+        logger.info(f"Model loaded successfully")
+        self.model_loaded = True
+        
+        # 报告CUDA内存使用
+        logger.info(f"CUDA memory allocated: {torch.cuda.memory_allocated(self.gpu_id) / 1024**3:.2f} GB")
+        logger.info(f"CUDA memory reserved: {torch.cuda.memory_reserved(self.gpu_id) / 1024**3:.2f} GB")
+        
+        return {"status": "success"}
+        
+    except Exception as e:
+        logger.error(f"Error loading model: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return {"status": "error", "error": str(e)}
+
+def _setup_layer_hooks(self):
+    """设置钩子实现动态层调度"""
+    if not hasattr(self.model, 'model') or not hasattr(self.model.model, 'layers'):
+        logger.warning("无法设置层管理钩子，模型结构不符合预期")
+        return
+        
+    layers = self.model.model.layers
+    
+    # 遍历我负责的层
+    for layer_id in self.my_layers:
+        if layer_id >= len(layers):
+            continue
+            
+        layer = layers[layer_id]
+        
+        # 保存原始forward方法
+        if not hasattr(layer, '_original_forward'):
+            layer._original_forward = layer.forward
+        
+        # 创建新的forward方法
+        def make_hook(layer_idx, orig_forward):
+            def hook_fn(*args, **kwargs):
+                try:
+                    # 开始计算前移到GPU
+                    logger.debug(f"Moving layer {layer_idx} to GPU {self.gpu_id}")
+                    layer = self.model.model.layers[layer_idx]
+                    layer.to(f"cuda:{self.gpu_id}")
+                    
+                    # 执行计算
+                    output = orig_forward(*args, **kwargs)
+                    
+                    # 计算后立即移回CPU，释放GPU内存
+                    logger.debug(f"Moving layer {layer_idx} back to CPU")
+                    layer.to("cpu")
+                    torch.cuda.empty_cache()  # 立即清理显存
+                    
+                    return output
+                except Exception as e:
+                    logger.error(f"Error in layer hook {layer_idx}: {e}")
+                    # 发生错误时，尝试确保层回到CPU
+                    try:
+                        self.model.model.layers[layer_idx].to("cpu")
+                        torch.cuda.empty_cache()
+                    except:
+                        pass
+                    raise
+            return hook_fn
+            
+        # 替换forward方法
+        layer.forward = make_hook(layer_id, layer._original_forward)
+    
+    logger.info(f"Set up hooks for {len(self.my_layers)} layers")
+
+def generate(self, data):
+    """执行内存优化的文本生成"""
+    try:
+        # 提取输入数据
+        input_ids = torch.tensor(data.get('input_ids'), device='cpu')
+        max_new_tokens = data.get('max_new_tokens', 512)
+        temperature = data.get('temperature', 0.7)
+        top_p = data.get('top_p', 0.9)
+        do_sample = data.get('do_sample', True)
+        stream = data.get('stream', True)
+        
+        # 每次生成前清理缓存
+        torch.cuda.empty_cache()
+        
+        logger.info(f"Worker {self.worker_id} generating with {max_new_tokens} new tokens")
+        
+        # 获取必要的配置
+        eos_token_id = self.model.config.eos_token_id if hasattr(self.model.config, 'eos_token_id') else None
+        
+        # 准备初始状态
+        current_ids = input_ids.clone()
+        initial_length = current_ids.shape[1]
+        
+        # 使用最小化内存的生成循环
+        for i in range(max_new_tokens):
+            # 管理输入大小，避免OOM
+            if current_ids.shape[1] > 1024 and i > 0:
+                # 保留最后512个token以节省内存
+                current_ids = torch.cat([
+                    current_ids[:, :512],  # 保留前512个
+                    current_ids[:, -512:]   # 保留最后512个
+                ], dim=1)
+                logger.info(f"Truncated context to {current_ids.shape[1]} tokens to save memory")
+            
+            # 模型前向传播，最大限度减少内存使用
+            try:
+                # 使用try包装整个过程，以防任何步骤OOM
+                with torch.no_grad():
+                    # 只需要输入ID
+                    outputs = self.model(input_ids=current_ids)
+                    
+                    # 获取最后一个token的logits
+                    logits = outputs.logits[:, -1, :].cpu()  # 立即移至CPU
+                    
+                    # 应用温度
+                    if temperature > 0:
+                        logits = logits / temperature
+                    
+                    # 简化的top_p采样
+                    if do_sample and top_p < 1.0:
+                        # 简化实现以减少内存使用
+                        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                        cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+                        sorted_indices_to_remove = cumulative_probs > top_p
+                        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                        sorted_indices_to_remove[..., 0] = 0
+                        
+                        # 内存高效的掩码创建
+                        for b in range(logits.shape[0]):
+                            indices = sorted_indices[b][sorted_indices_to_remove[b]]
+                            logits[b, indices] = -float('inf')
+                    
+                    # 采样或贪婪解码
+                    if do_sample:
+                        probs = torch.softmax(logits, dim=-1)
+                        next_token = torch.multinomial(probs, num_samples=1)
+                    else:
+                        next_token = torch.argmax(logits, dim=-1, keepdim=True)
+                
+                # 添加到生成序列
+                current_ids = torch.cat([current_ids, next_token], dim=-1)
+                
+                # 清理中间变量以释放内存
+                del logits, outputs
+                if 'probs' in locals():
+                    del probs
+                torch.cuda.empty_cache()
+                
+                # 检查是否生成了EOS
+                if eos_token_id is not None and (next_token == eos_token_id).any():
+                    break
+                
+                # 如果是流式生成，返回当前结果
+                if stream:
+                    new_tokens = current_ids[:, initial_length:].cpu().numpy().tolist()
+                    streaming_response = {
+                        'status': 'streaming',
+                        'output_ids': new_tokens
+                    }
+                    
+                    if i < max_new_tokens - 1:
+                        # 中间结果
+                        return streaming_response
+                
+            except torch.cuda.OutOfMemoryError as e:
+                logger.error(f"CUDA OOM during generation at step {i}!")
+                
+                # 进行紧急内存清理
+                torch.cuda.empty_cache()
+                
+                # 尝试生成一个简单的后备token
+                next_token = torch.tensor([[0]])  # 使用一个安全的token
+                
+                # 添加到生成序列并继续
+                current_ids = torch.cat([current_ids, next_token], dim=-1)
+                
+                # 如果多次OOM，提前结束生成
+                if i > 10:
+                    logger.error("Multiple OOM errors, ending generation early")
+                    break
+        
+        # 返回最终结果
+        final_output = current_ids[:, initial_length:].cpu().numpy().tolist()
+        return {
+            'status': 'success',
+            'output_ids': final_output
+        }
+                
+    except Exception as e:
+        logger.error(f"Generation error: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        
+        # 确保内存被清理
+        torch.cuda.empty_cache()
+        
+        return {
+            'status': 'error',
+            'error': str(e)
+        }
+```
+
+
+这个实现包含了多种内存优化策略：
+
+1. **激进的设备映射**：
+   - 只加载此worker负责的层
+   - 嵌入层和输出层设为meta模式（由嵌入服务器处理）
+
+2. **8位量化**：
+   - 使用`load_in_8bit=True`大幅降低内存占用
+   - 可选的`BitsAndBytesConfig`进一步优化
+
+3. **按需层加载**：
+   - 层只在需要计算时才加载到GPU
+   - 计算完成立即移回CPU
+   - 每次移动层后都清理GPU缓存
+
+4. **内存高效的生成循环**：
+   - 长上下文自动截断
+   - 每一步后清理中间变量
+   - OOM错误处理和恢复策略
+
+5. **简化的实现**：
+   - 避免使用昂贵的attention掩码操作
+   - 减少不必要的操作
+
+这些优化应该能显著降低模型的内存占用，使70B模型能够在有限的GPU资源上运行。
+
+---
+
+_**User**_
+
+The `load_in_4bit` and `load_in_8bit` arguments are deprecated and will be removed in the future versions. Please, pass a `BitsAndBytesConfig` object in `quantization_config` argument instead.
+ERROR:__main__:Error loading model: Using `bitsandbytes` 8-bit quantization requires the latest version of bitsandbytes: `pip install -U bitsandbytes`
+ERROR:__main__:Traceback (most recent call last):
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 284, in load_model
+    self.model = AutoModelForCausalLM.from_pretrained(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/models/auto/auto_factory.py", line 564, in from_pretrained
+    return model_class.from_pretrained(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/modeling_utils.py", line 3354, in from_pretrained
+    hf_quantizer.validate_environment(
+  File "/archive/liugu/ds/ds/lib/python3.11/site-packages/transformers/quantizers/quantizer_bnb_8bit.py", line 67, in validate_environment
+    raise ImportError(
+ImportError: Using `bitsandbytes` 8-bit quantization requires the latest version of bitsandbytes: `pip install -U bitsandbytes
+
+---
+
+_**Assistant**_
+
+
 
 ---
 

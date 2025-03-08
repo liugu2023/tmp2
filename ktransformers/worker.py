@@ -285,7 +285,7 @@ class ModelWorker:
                 model_path,
                 config=config,
                 device_map=device_map,
-                load_in_8bit=True,  # 使用8位量化
+                load_in_8bit_fp32_cpu_offload=True,  # 使用8位量化
                 low_cpu_mem_usage=True,
                 torch_dtype=torch.float16,
                 offload_folder=f"offload_folder_{self.worker_id}"
@@ -296,7 +296,7 @@ class ModelWorker:
                 try:
                     from transformers import BitsAndBytesConfig
                     quantization_config = BitsAndBytesConfig(
-                        load_in_8bit=True,
+                        load_in_8bit_fp32_cpu_offload=True,
                         llm_int8_enable_fp32_cpu_offload=True
                     )
                     logger.info("Applying 8-bit quantization")

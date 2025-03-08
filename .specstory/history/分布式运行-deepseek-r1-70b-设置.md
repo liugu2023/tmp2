@@ -12907,6 +12907,161 @@ _**User**_
 
 _**Assistant**_
 
+<think>
+根据文件内容，我需要确定GGUF模型的路径。让我检查start.sh文件中的相关信息。
+
+在start.sh文件中，我看到这些变量定义：
+
+```shell
+# 设置路径
+PYTHONPATH=/archive/liugu/ds/ktransformers
+MODEL_PATH=/archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/
+GGUF_PATH=/archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/
+```
+
+这里明确定义了GGUF_PATH为`/archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/`。
+
+此外，在脚本中启动worker进程时应该会将这个路径传递给worker：
+
+```shell
+PYTHONPATH=$PYTHONPATH python -m ktransformers.worker --base_port 29500 --num_workers 8 --kvcache_address ${COMPUTE_IP}:29600 --embedding_address ${COMPUTE_IP}:29700 > worker.log 2>&1 &
+```
+
+但是，我没有看到直接传递GGUF_PATH的代码。
+
+我需要修改worker.py代码来正确获取GGUF模型路径:
+1. 首先，导入os模块用于访问环境变量和文件路径
+2. 在worker初始化时，记录gguf_path参数
+3. 在generate方法中，优先使用传入的gguf_path，其次使用worker初始化时的gguf_path，最后尝试使用环境变量
+
+这样可以灵活处理不同情况下的GGUF模型路径。
+</think>
+
+# GGUF模型路径配置
+
+在您的`start.sh`脚本中，GGUF模型位置被指定为：
+```shell
+GGUF_PATH=/archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/
+```
+
+但是这个路径可能没有正确传递给worker进程。让我们修改代码，确保worker能正确找到GGUF模型：
+
+```python:ktransformers/worker.py
+import os
+
+class ModelWorker:
+    def __init__(self, worker_id, gpu_id, num_workers=8, embedding_address=None, kvcache_address=None, gguf_path=None):
+        """初始化worker"""
+        self.worker_id = worker_id
+        self.gpu_id = gpu_id
+        self.num_workers = num_workers
+        
+        # 保存GGUF模型路径
+        self.gguf_path = gguf_path
+        
+        # 如果未提供GGUF路径，尝试从环境变量获取
+        if self.gguf_path is None:
+            self.gguf_path = os.environ.get("GGUF_PATH", None)
+            if self.gguf_path:
+                logger.info(f"从环境变量获取GGUF路径: {self.gguf_path}")
+        
+        # ZMQ设置和初始化其他组件...
+```
+
+然后，您需要修改`generate`方法，确保它能正确处理和找到GGUF模型：
+
+```python:ktransformers/worker.py
+def generate(self, data):
+    """使用GGUF模型替代原始模型进行推理"""
+    try:
+        # 提取输入数据
+        input_ids = torch.tensor(data.get('input_ids'), device='cpu')
+        max_new_tokens = data.get('max_new_tokens', 512)
+        temperature = data.get('temperature', 0.7)
+        top_p = data.get('top_p', 0.9)
+        do_sample = data.get('do_sample', True)
+        stream = data.get('stream', True)
+        
+        logger.info(f"Worker {self.worker_id} generating with {max_new_tokens} new tokens")
+        
+        # 确定GGUF模型路径
+        gguf_path = data.get('gguf_path') or self.gguf_path
+        
+        if gguf_path:
+            logger.info(f"使用GGUF模型路径: {gguf_path}")
+            
+            # 加载tokenizer，如果尚未加载
+            if not hasattr(self, 'tokenizer'):
+                try:
+                    from transformers import AutoTokenizer
+                    model_path = data.get('model_path', "/archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/")
+                    self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+                    logger.info("成功加载tokenizer")
+                except Exception as e:
+                    logger.error(f"tokenizer加载失败: {e}")
+                    self.tokenizer = None
+        
+        # 其余代码处理GGUF模型加载和推理...
+```
+
+您还需要修改`main`函数，从命令行参数接收GGUF路径：
+
+```python:ktransformers/worker.py
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--worker_id', type=int, default=0)
+    parser.add_argument('--gpu_id', type=int, default=0)
+    parser.add_argument('--base_port', type=int, default=29500)
+    parser.add_argument('--num_workers', type=int, default=8)
+    parser.add_argument('--embedding_address', type=str, default=None)
+    parser.add_argument('--kvcache_address', type=str, default=None)
+    parser.add_argument('--gguf_path', type=str, default=None,
+                        help='Path to the GGUF model directory')
+    args = parser.parse_args()
+    
+    # 创建worker对象
+    worker = ModelWorker(
+        worker_id=args.worker_id,
+        gpu_id=args.gpu_id,
+        num_workers=args.num_workers,
+        embedding_address=args.embedding_address,
+        kvcache_address=args.kvcache_address,
+        gguf_path=args.gguf_path
+    )
+    
+    # 运行worker
+    worker.run()
+```
+
+最后，您还需要修改`start.sh`脚本，确保将GGUF路径传递给worker进程：
+
+```bash:start.sh
+# 启动 Worker 进程
+echo "启动 Worker 进程..."
+PYTHONPATH=$PYTHONPATH python -m ktransformers.worker --base_port 29500 --num_workers 8 --kvcache_address ${COMPUTE_IP}:29600 --embedding_address ${COMPUTE_IP}:29700 --gguf_path $GGUF_PATH > worker.log 2>&1 &
+```
+
+这些修改应该能确保worker能找到并正确使用GGUF模型文件。
+
+---
+
+_**User**_
+
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 843, in <module>
+    main()
+    ^^^^^^
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 792, in main
+    worker = ModelWorker(
+             ^^^^^^^^^^^^
+TypeError: ModelWorker.__init__() missing 1 required positional argument: 'address'  worker进程报错
+
+---
+
+_**Assistant**_
+
 
 
 ---

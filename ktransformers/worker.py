@@ -102,7 +102,8 @@ class KVCacheLayer(torch.nn.Module):
 
 class ModelWorker:
     def __init__(self, address: str, worker_id: int = 0, num_workers: int = 1, 
-                 kvcache_address: str = None, embedding_address: str = None, gpu_id: int = None, gguf_path: str = None):
+                 kvcache_address: str = None, embedding_address: str = None, 
+                 gpu_id: int = None, gguf_path: str = None):
         self.worker_id = worker_id
         self.num_workers = num_workers
         self.kvcache_address = kvcache_address
@@ -160,8 +161,7 @@ class ModelWorker:
         # 设置 ZMQ 服务器
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.REP)
-        host, port = address.split(':')
-        self.socket.bind(f"tcp://0.0.0.0:{port}")
+        self.socket.bind(f"tcp://{address}")
         self.socket.setsockopt(zmq.RCVHWM, 0)
         self.socket.setsockopt(zmq.SNDHWM, 0)
         
@@ -785,11 +785,15 @@ def main():
     parser.add_argument('--embedding_address', type=str, default=None)
     parser.add_argument('--kvcache_address', type=str, default=None)
     parser.add_argument('--gguf_path', type=str, default=None,
-                        help='Path to the GGUF model directory')
+                       help='Path to the GGUF model directory')
     args = parser.parse_args()
+    
+    # 计算worker地址
+    worker_address = f"0.0.0.0:{args.base_port + args.worker_id}"
     
     # 创建worker对象
     worker = ModelWorker(
+        address=worker_address,  # 添加了必要的address参数
         worker_id=args.worker_id,
         gpu_id=args.gpu_id,
         num_workers=args.num_workers,

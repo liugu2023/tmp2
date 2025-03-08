@@ -82,7 +82,7 @@ start_compute_services() {
     
     # 启动 Worker 进程 (workers分布在两块GPU上)
     echo "启动 Worker 进程..."
-    PYTHONPATH=$PYTHONPATH python -m ktransformers.worker --base_port 29500 --num_workers 8 --kvcache_address ${COMPUTE_IP}:29600 --embedding_address ${COMPUTE_IP}:29700 > worker.log 2>&1 &
+    PYTHONPATH=$PYTHONPATH python -m ktransformers.worker --base_port 29500 --num_workers 8 --kvcache_address ${COMPUTE_IP}:29600 --embedding_address ${COMPUTE_IP}:29700 --gguf_path $GGUF_PATH > worker.log 2>&1 &
     
     echo "所有服务已启动"
     echo "KV Cache 服务器日志: kvcache_server.log"

@@ -12,6 +12,7 @@ import uuid
 import torch.nn.functional as F
 import gc
 import numpy as np
+import argparse
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -101,12 +102,21 @@ class KVCacheLayer(torch.nn.Module):
 
 class ModelWorker:
     def __init__(self, address: str, worker_id: int = 0, num_workers: int = 1, 
-                 kvcache_address: str = None, embedding_address: str = None, gpu_id: int = None):
+                 kvcache_address: str = None, embedding_address: str = None, gpu_id: int = None, gguf_path: str = None):
         self.worker_id = worker_id
         self.num_workers = num_workers
         self.kvcache_address = kvcache_address
         self.embedding_address = embedding_address
         self.gpu_id = gpu_id
+        
+        # 保存GGUF模型路径
+        self.gguf_path = gguf_path
+        
+        # 如果未提供GGUF路径，尝试从环境变量获取
+        if self.gguf_path is None:
+            self.gguf_path = os.environ.get("GGUF_PATH", None)
+            if self.gguf_path:
+                logger.info(f"从环境变量获取GGUF路径: {self.gguf_path}")
         
         # 如果提供了KV Cache服务器地址，则连接
         if self.kvcache_address:
@@ -473,6 +483,23 @@ class ModelWorker:
             
             logger.info(f"Worker {self.worker_id} generating with {max_new_tokens} new tokens")
             
+            # 确定GGUF模型路径
+            gguf_path = data.get('gguf_path') or self.gguf_path
+            
+            if gguf_path:
+                logger.info(f"使用GGUF模型路径: {gguf_path}")
+                
+                # 加载tokenizer，如果尚未加载
+                if not hasattr(self, 'tokenizer'):
+                    try:
+                        from transformers import AutoTokenizer
+                        model_path = data.get('model_path', "/archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/")
+                        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+                        logger.info("成功加载tokenizer")
+                    except Exception as e:
+                        logger.error(f"tokenizer加载失败: {e}")
+                        self.tokenizer = None
+            
             # 加载GGUF模型 - 如果提供了路径且还没加载
             if not hasattr(self, 'gguf_model') or self.gguf_model is None:
                 logger.info("原始Transformer模型存在兼容性问题，尝试使用GGUF模型")
@@ -750,38 +777,29 @@ class KVCacheLayerProxy(torch.nn.Module):
             }
 
 def main():
-    import argparse
     parser = argparse.ArgumentParser()
+    parser.add_argument('--worker_id', type=int, default=0)
+    parser.add_argument('--gpu_id', type=int, default=0)
     parser.add_argument('--base_port', type=int, default=29500)
     parser.add_argument('--num_workers', type=int, default=8)
-    parser.add_argument('--worker_address', type=str, required=False)
-    parser.add_argument('--worker_id', type=int, default=0)
-    parser.add_argument('--kvcache_address', type=str, default=None,
-                        help='Address of KV Cache Server (e.g., "10.21.22.206:29600")')
-    parser.add_argument('--embedding_address', type=str, default=None,
-                        help='Address of Embedding Server (e.g., "10.21.22.206:29700")')
-    parser.add_argument('--gpu_id', type=int, default=None,
-                        help='Specific GPU ID to use (default: auto-assign based on worker_id)')
+    parser.add_argument('--embedding_address', type=str, default=None)
+    parser.add_argument('--kvcache_address', type=str, default=None)
+    parser.add_argument('--gguf_path', type=str, default=None,
+                        help='Path to the GGUF model directory')
     args = parser.parse_args()
     
-    if args.worker_address:
-        # 单个 worker 进程模式
-        worker = ModelWorker(args.worker_address, args.worker_id, args.num_workers, 
-                             args.kvcache_address, args.embedding_address, args.gpu_id)
-        worker.run()
-    else:
-        # 主进程模式，启动多个 worker
-        for worker_id in range(args.num_workers):
-            gpu_id = 0 if worker_id < (args.num_workers // 2) else 1
-            start_worker_process(worker_id, args.base_port, args.num_workers, 
-                                args.kvcache_address, args.embedding_address, gpu_id)
-        
-        # 等待所有进程
-        try:
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            logger.info("Shutting down all workers...")
+    # 创建worker对象
+    worker = ModelWorker(
+        worker_id=args.worker_id,
+        gpu_id=args.gpu_id,
+        num_workers=args.num_workers,
+        embedding_address=args.embedding_address,
+        kvcache_address=args.kvcache_address,
+        gguf_path=args.gguf_path
+    )
+    
+    # 运行worker
+    worker.run()
 
 def start_worker_process(worker_id: int, base_port: int, num_workers: int, 
                         kvcache_address: str = None, embedding_address: str = None, gpu_id: int = None):

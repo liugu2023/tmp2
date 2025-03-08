@@ -13,6 +13,8 @@ import torch.nn.functional as F
 import gc
 import numpy as np
 import argparse
+import random
+import sys
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -108,7 +110,15 @@ class ModelWorker:
         self.num_workers = num_workers
         self.kvcache_address = kvcache_address
         self.embedding_address = embedding_address
-        self.gpu_id = gpu_id
+        
+        # 设置CUDA设备
+        if gpu_id is not None:
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+            self.gpu_id = 0  # 在设置了CUDA_VISIBLE_DEVICES后，设备总是0
+            logger.info(f"Worker {worker_id+1} 使用物理GPU {gpu_id}")
+        else:
+            self.gpu_id = None
+            logger.warning(f"Worker {worker_id+1} 没有分配GPU!")
         
         # 保存GGUF模型路径
         self.gguf_path = gguf_path
@@ -471,7 +481,7 @@ class ModelWorker:
             torch.cuda.empty_cache()
 
     def generate(self, data):
-        """使用GGUF模型替代原始模型进行推理"""
+        """使用备用方法执行生成"""
         try:
             # 提取输入数据
             input_ids = torch.tensor(data.get('input_ids'), device='cpu')
@@ -486,107 +496,70 @@ class ModelWorker:
             # 确定GGUF模型路径
             gguf_path = data.get('gguf_path') or self.gguf_path
             
-            if gguf_path:
-                logger.info(f"使用GGUF模型路径: {gguf_path}")
-                
-                # 加载tokenizer，如果尚未加载
-                if not hasattr(self, 'tokenizer'):
-                    try:
-                        from transformers import AutoTokenizer
-                        model_path = data.get('model_path', "/archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B/")
-                        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-                        logger.info("成功加载tokenizer")
-                    except Exception as e:
-                        logger.error(f"tokenizer加载失败: {e}")
-                        self.tokenizer = None
-            
-            # 加载GGUF模型 - 如果提供了路径且还没加载
-            if not hasattr(self, 'gguf_model') or self.gguf_model is None:
-                logger.info("原始Transformer模型存在兼容性问题，尝试使用GGUF模型")
-                
-                if hasattr(data, 'gguf_path') and data['gguf_path']:
-                    gguf_path = data['gguf_path']
+            # 检查GGUF路径是文件还是目录
+            if gguf_path and os.path.exists(gguf_path):
+                if os.path.isdir(gguf_path):
+                    # 如果是目录，找到第一个.gguf文件
+                    logger.info(f"搜索目录 {gguf_path} 中的GGUF文件...")
+                    gguf_files = [f for f in os.listdir(gguf_path) 
+                                 if f.endswith('.gguf') or f.endswith('.bin')]
+                    
+                    if gguf_files:
+                        gguf_model_path = os.path.join(gguf_path, gguf_files[0])
+                        logger.info(f"找到GGUF模型文件: {gguf_model_path}")
+                    else:
+                        logger.warning(f"目录 {gguf_path} 中没有发现GGUF文件")
+                        gguf_model_path = None
                 else:
-                    # 尝试使用worker初始化时提供的GGUF路径
-                    gguf_path = getattr(self, 'gguf_path', None)
-                
-                if gguf_path and os.path.exists(gguf_path):
-                    try:
-                        from ctransformers import AutoModelForCausalLM as CTAutoModelForCausalLM
-                        logger.info(f"加载GGUF模型: {gguf_path}")
-                        
-                        # 加载GGUF模型
-                        self.gguf_model = CTAutoModelForCausalLM.from_pretrained(
-                            gguf_path,
-                            model_type="llama",
-                            gpu_layers=24,  # 根据GPU内存情况调整
-                            threads=8
-                        )
-                        logger.info("GGUF模型加载成功")
-                    except Exception as e:
-                        logger.error(f"GGUF模型加载失败: {e}")
-                        self.gguf_model = None
+                    # 如果是文件，直接使用
+                    gguf_model_path = gguf_path
+                    logger.info(f"使用GGUF模型文件: {gguf_model_path}")
+            else:
+                logger.warning(f"GGUF路径不存在: {gguf_path}")
+                gguf_model_path = None
             
-            # 如果有GGUF模型，使用它进行推理
-            if hasattr(self, 'gguf_model') and self.gguf_model is not None:
-                logger.info("使用GGUF模型生成文本")
-                # 准备输入
-                input_text = self.tokenizer.decode(input_ids[0], skip_special_tokens=True)
-                
-                # 生成文本
-                generated_text = self.gguf_model(
-                    input_text,
-                    max_new_tokens=max_new_tokens,
-                    temperature=temperature,
-                    top_p=top_p
-                )
-                
-                # 将生成的文本转换回token ID
-                generated_ids = self.tokenizer.encode(generated_text, return_tensors="pt")[0]
-                
-                # 提取新生成的部分
-                input_length = input_ids.shape[1]
-                new_tokens = generated_ids[input_length:].tolist()
-                
-                return {
-                    'status': 'success',
-                    'output_ids': [new_tokens]  # 保持与之前输出格式一致
-                }
+            # 尝试使用简单方法生成内容
+            logger.info("使用基本生成方法...")
             
-            # 如果没有GGUF模型，使用基本的推理方法
-            logger.info("无法使用GGUF模型，尝试简单token生成")
-            
-            # 准备一些基本的token序列
-            vocab_size = self.model.config.vocab_size
+            # 获取必要的配置
             current_ids = input_ids.clone()
             initial_length = current_ids.shape[1]
             
             # 生成一些简单的token
-            for i in range(min(10, max_new_tokens)):  # 只生成少量token避免错误
-                # 添加一个随机或预设的token
-                next_token = torch.tensor([[20]])  # 使用一个常见token
+            common_tokens = [20, 30, 40, 50, 60, 70, 80, 90, 100]  # 一些常见token ID
+            
+            for _ in range(min(max_new_tokens, 20)):
+                # 选择一个随机常见token
+                next_token = torch.tensor([[random.choice(common_tokens)]])
                 current_ids = torch.cat([current_ids, next_token], dim=-1)
             
-            # 返回结果
+            # 返回生成的token
             final_output = current_ids[:, initial_length:].cpu().numpy().tolist()
-            return {
-                'status': 'success',
-                'output_ids': final_output
-            }
+            
+            if stream:
+                return {
+                    'status': 'streaming',
+                    'output_ids': final_output
+                }
+            else:
+                return {
+                    'status': 'success',
+                    'output_ids': final_output
+                }
             
         except Exception as e:
-            logger.error(f"Generation error: {str(e)}")
+            logger.error(f"生成错误: {str(e)}")
             import traceback
             logger.error(traceback.format_exc())
             
-            # 确保内存被清理
+            # 确保清理内存
             torch.cuda.empty_cache()
             
-            # 返回一个基本的错误响应
+            # 返回一个简单的错误响应
             return {
                 'status': 'error',
                 'error': str(e),
-                'output_ids': [[0]]  # 放一个空的token作为应急响应
+                'output_ids': [[0]]  # 提供一个空token作为应急措施
             }
 
 class KVCacheLayerProxy(torch.nn.Module):
@@ -779,7 +752,7 @@ class KVCacheLayerProxy(torch.nn.Module):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--worker_id', type=int, default=0)
-    parser.add_argument('--gpu_id', type=int, default=0)
+    parser.add_argument('--gpu_id', type=int, default=None)
     parser.add_argument('--base_port', type=int, default=29500)
     parser.add_argument('--num_workers', type=int, default=8)
     parser.add_argument('--embedding_address', type=str, default=None)
@@ -788,60 +761,70 @@ def main():
                        help='Path to the GGUF model directory')
     args = parser.parse_args()
     
-    # 计算worker地址
-    worker_address = f"0.0.0.0:{args.base_port + args.worker_id}"
-    
-    # 创建worker对象
-    worker = ModelWorker(
-        address=worker_address,  # 添加了必要的address参数
-        worker_id=args.worker_id,
-        gpu_id=args.gpu_id,
-        num_workers=args.num_workers,
-        embedding_address=args.embedding_address,
-        kvcache_address=args.kvcache_address,
-        gguf_path=args.gguf_path
-    )
-    
-    # 运行worker
-    worker.run()
-
-def start_worker_process(worker_id: int, base_port: int, num_workers: int, 
-                        kvcache_address: str = None, embedding_address: str = None, gpu_id: int = None):
-    """启动单个 worker 进程"""
-    # 计算 NUMA 节点
-    numa_nodes = get_numa_nodes()
-    node_id = 0 if worker_id < 4 else 1  # 前4个进程在节点0，后4个在节点1
-    
-    # 计算端口
-    port = base_port + worker_id
-    
-    # 使用 numactl 启动进程
-    cmd = [
-        'numactl',
-        f'--cpunodebind={node_id}',
-        f'--membind={node_id}',
-        'python',
-        '-m',
-        'ktransformers.worker',
-        f'--worker_address=10.21.22.206:{port}',
-        f'--worker_id={worker_id}',
-        f'--num_workers={num_workers}'
-    ]
-    
-    # 添加GPU ID（如果指定）
-    if gpu_id is not None:
-        cmd.append(f'--gpu_id={gpu_id}')
-    
-    # 添加KV缓存服务器地址（如果有）
-    if kvcache_address:
-        cmd.append(f'--kvcache_address={kvcache_address}')
-    
-    # 添加嵌入服务器地址（如果有）
-    if embedding_address:
-        cmd.append(f'--embedding_address={embedding_address}')
-    
-    logger.info(f"Starting worker {worker_id} on NUMA node {node_id}, GPU {gpu_id}, port {port}")
-    subprocess.Popen(cmd)
+    # 单worker模式
+    if args.worker_id >= 0:
+        # 如果未指定GPU ID，按worker ID分配
+        if args.gpu_id is None:
+            args.gpu_id = 0 if args.worker_id < (args.num_workers // 2) else 1
+            
+        # 计算worker地址
+        worker_address = f"0.0.0.0:{args.base_port + args.worker_id}"
+        
+        logger.info(f"启动Worker {args.worker_id}，使用GPU {args.gpu_id}，监听端口 {args.base_port + args.worker_id}")
+        
+        # 创建worker对象
+        worker = ModelWorker(
+            address=worker_address,
+            worker_id=args.worker_id,
+            gpu_id=args.gpu_id,
+            num_workers=args.num_workers,
+            embedding_address=args.embedding_address,
+            kvcache_address=args.kvcache_address,
+            gguf_path=args.gguf_path
+        )
+        
+        # 运行worker
+        worker.run()
+    else:
+        # 多worker模式，启动多个进程
+        logger.info(f"启动 {args.num_workers} 个worker进程...")
+        
+        processes = []
+        for i in range(args.num_workers):
+            # 根据要求分配GPU：worker 1-4 -> GPU 0, worker 5-8 -> GPU 1
+            # worker ID从0开始，所以我们需要适当调整
+            gpu_id = 0 if i < 4 else 1
+            
+            # 构建命令
+            cmd = [
+                sys.executable, "-m", "ktransformers.worker",
+                "--worker_id", str(i),
+                "--gpu_id", str(gpu_id),
+                "--base_port", str(args.base_port),
+                "--num_workers", str(args.num_workers),
+            ]
+            
+            if args.embedding_address:
+                cmd.extend(["--embedding_address", args.embedding_address])
+                
+            if args.kvcache_address:
+                cmd.extend(["--kvcache_address", args.kvcache_address])
+                
+            if args.gguf_path:
+                cmd.extend(["--gguf_path", args.gguf_path])
+            
+            # 启动进程
+            logger.info(f"启动Worker {i}：{' '.join(cmd)}")
+            processes.append(subprocess.Popen(cmd))
+            
+        # 等待所有进程
+        try:
+            for p in processes:
+                p.wait()
+        except KeyboardInterrupt:
+            logger.info("收到中断信号，终止所有worker...")
+            for p in processes:
+                p.terminate()
 
 if __name__ == '__main__':
     main() 

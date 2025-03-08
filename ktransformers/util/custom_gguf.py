@@ -211,7 +211,6 @@ class GGUFLoader:
                             
     def load_gguf(self, f):
         f.seek(0)
-        assert f.read(4) == b'GGUF'
         values = struct.unpack("<IQQ", f.read(4+8+8))
         version, n_tensors, n_kv = values
         if version != 3:

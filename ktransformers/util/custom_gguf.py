@@ -28,6 +28,10 @@ import KTransformersOps
 from .custom_loader import SafeTensorLoader
 import ctypes
 import math
+import logging
+
+# 创建logger对象
+logger = logging.getLogger(__name__)
 
 class GGMLQuantizationType(IntEnum):
     F32     = 0

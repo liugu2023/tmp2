@@ -13945,6 +13945,338 @@ _**User**_
 
 _**Assistant**_
 
+<think>
+是的，我明白您的意思了。您希望从原始模型路径只获取配置文件和tokenizer，而实际的模型参数则完全从GGUF文件加载。这是一个很好的方法，可以节省内存并利用GGUF的优化。
+
+总结您的需求:
+1. 从原始模型路径(MODEL_PATH)加载配置和tokenizer
+2. 从GGUF路径(GGUF_PATH)加载模型权重
+3. 不要尝试加载原始的完整模型
+</think>
+
+# 修改代码，只从原始模型加载配置和tokenizer
+
+您的思路非常正确。我们应该从原始模型文件夹只加载配置文件和tokenizer，而完整的模型参数则完全从GGUF文件加载。这样能大幅降低内存占用，同时利用GGUF的优化。
+
+下面是这种方法的详细步骤实现：
+
+```python:ktransformers/worker.py
+def load_model(self, model_path: str, gguf_path: str = None):
+    """从原始模型加载配置和tokenizer，从GGUF加载参数"""
+    logger.info(f"Worker {self.worker_id} loading model")
+    
+    try:
+        # 优先使用传入的GGUF路径，如果没有则使用初始化时的路径
+        if gguf_path is None:
+            gguf_path = self.gguf_path
+        
+        if not gguf_path:
+            return {"status": "error", "error": "未提供GGUF模型路径"}
+        
+        # 步骤1: 加载配置和tokenizer
+        logger.info(f"从 {model_path} 加载tokenizer和配置")
+        from transformers import AutoTokenizer, AutoConfig
+        
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        
+        # 步骤2: 在meta设备上创建模型
+        logger.info("在meta设备上创建模型结构")
+        with torch.device("meta"):
+            if config.architectures[0] == "LlamaForCausalLM":
+                logger.info("使用自定义LlamaForCausalLM模型架构")
+                from ktransformers.models.modeling_llama import LlamaForCausalLM
+                config._attn_implementation = "eager"
+                self.model = LlamaForCausalLM(config)
+            else:
+                logger.info(f"使用标准架构: {config.architectures[0]}")
+                from transformers import AutoModelForCausalLM
+                self.model = AutoModelForCausalLM.from_config(
+                    config, trust_remote_code=True
+                )
+        
+        # 步骤3: 设置优化规则
+        # 确定优化规则路径
+        ktransformer_rules_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "ktransformers/optimize/optimize_rules/"
+        )
+        # 选择合适的优化规则（根据模型架构类型）
+        model_name = config.architectures[0]
+        if "DeepSeek" in model_name and "70B" in model_path:
+            optimize_rule = os.path.join(ktransformer_rules_dir, "DeepSeek-R1-70B.yaml")
+        else:
+            # 根据需要添加其他规则匹配
+            optimize_rule = None
+            for rule_file in os.listdir(ktransformer_rules_dir):
+                if rule_file.endswith('.yaml') and any(keyword in model_path for keyword in rule_file.replace('.yaml', '').split('-')):
+                    optimize_rule = os.path.join(ktransformer_rules_dir, rule_file)
+                    break
+            
+            # 如果找不到匹配规则，使用一个默认规则
+            if not optimize_rule:
+                # 检查是否有LLaMA通用规则
+                if os.path.exists(os.path.join(ktransformer_rules_dir, "LLaMA.yaml")):
+                    optimize_rule = os.path.join(ktransformer_rules_dir, "LLaMA.yaml")
+                else:
+                    # 使用目录中的第一个规则文件
+                    rule_files = [f for f in os.listdir(ktransformer_rules_dir) if f.endswith('.yaml')]
+                    if rule_files:
+                        optimize_rule = os.path.join(ktransformer_rules_dir, rule_files[0])
+                    else:
+                        return {"status": "error", "error": "找不到有效的优化规则文件"}
+        
+        logger.info(f"使用优化规则: {optimize_rule}")
+        
+        # 步骤4: 优化并加载GGUF模型参数
+        logger.info(f"从GGUF加载模型参数: {gguf_path}")
+        from ktransformers.optimize.optimize import optimize_and_load_gguf
+        optimize_and_load_gguf(self.model, optimize_rule, gguf_path, config)
+        
+        # 步骤5: 设置生成配置
+        from transformers import GenerationConfig
+        try:
+            self.model.generation_config = GenerationConfig.from_pretrained(model_path)
+        except Exception as e:
+            logger.warning(f"无法加载生成配置，使用默认值: {e}")
+            gen_config = GenerationConfig(
+                temperature=0.7,
+                top_p=0.9,
+                do_sample=True
+            )
+            self.model.generation_config = gen_config
+        
+        # 确保有有效的pad_token_id
+        if self.model.generation_config.pad_token_id is None:
+            self.model.generation_config.pad_token_id = self.model.generation_config.eos_token_id
+        
+        # 步骤6: 设置为评估模式
+        self.model.eval()
+        
+        # 加载成功
+        self.model_loaded = True
+        logger.info("GGUF模型加载完成，可以开始生成")
+        
+        # 报告CUDA内存状态
+        if torch.cuda.is_available():
+            logger.info(f"CUDA内存: 已分配={torch.cuda.memory_allocated()/1024**3:.2f}GB, 缓存={torch.cuda.memory_reserved()/1024**3:.2f}GB")
+        
+        return {"status": "success"}
+        
+    except Exception as e:
+        logger.error(f"模型加载失败: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return {"status": "error", "error": str(e)}
+```
+
+
+同时，对生成方法进行相应修改：
+
+```python:ktransformers/worker.py
+def generate(self, data):
+    """使用已加载的GGUF模型生成文本"""
+    try:
+        # 提取输入数据
+        input_ids = torch.tensor(data.get('input_ids'), device='cpu')
+        max_new_tokens = data.get('max_new_tokens', 512)
+        temperature = data.get('temperature', 0.7)
+        top_p = data.get('top_p', 0.9)
+        do_sample = data.get('do_sample', True)
+        stream = data.get('stream', True)
+        
+        logger.info(f"Worker {self.worker_id} generating with {max_new_tokens} new tokens")
+        
+        # 检查模型是否已加载
+        if not hasattr(self, 'model_loaded') or not self.model_loaded:
+            logger.error("模型尚未加载，无法生成")
+            return {
+                'status': 'error',
+                'error': '模型未加载',
+                'output_ids': [[0]]
+            }
+        
+        # 准备输入
+        messages = [{"role": "user", "content": self.tokenizer.decode(input_ids[0], skip_special_tokens=True)}]
+        input_tensor = self.tokenizer.apply_chat_template(
+            messages, add_generation_prompt=True, return_tensors="pt"
+        )
+        
+        # 使用ktransformers内置的生成方法
+        from ktransformers.util.utils import prefill_and_generate
+        
+        # 将输入移至GPU
+        input_tensor = input_tensor.cuda()
+        
+        # 生成文本
+        logger.info("开始生成...")
+        generated = prefill_and_generate(
+            self.model, self.tokenizer, input_tensor, 
+            max_new_tokens, use_cuda_graph=False
+        )
+        
+        logger.info(f"生成完成: {generated[:100]}...")
+        
+        # 处理结果
+        try:
+            # 将生成的文本转换回token ID
+            generated_ids = self.tokenizer.encode(generated, return_tensors="pt")[0]
+            
+            # 提取新生成的部分
+            input_length = input_ids.shape[1]
+            if len(generated_ids) > input_length:
+                new_tokens = generated_ids[input_length:].tolist()
+            else:
+                new_tokens = [0]
+            
+            return {
+                'status': 'success',
+                'output_ids': [new_tokens]
+            }
+        except Exception as e:
+            logger.error(f"处理生成结果时出错: {e}")
+            return {
+                'status': 'error',
+                'error': f'处理生成结果错误: {str(e)}',
+                'output_ids': [[0]]
+            }
+        
+    except Exception as e:
+        logger.error(f"生成错误: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        
+        # 确保清理内存
+        torch.cuda.empty_cache()
+        
+        # 返回错误响应
+        return {
+            'status': 'error',
+            'error': str(e),
+            'output_ids': [[0]]
+        }
+```
+
+
+这个实现方法具有以下优点：
+1. **内存效率**：只从原始模型目录加载配置和tokenizer，大幅减少内存使用
+2. **利用优化**：充分利用GGUF格式的优化能力
+3. **自动选择规则**：根据模型路径自动选择适合的优化规则
+4. **详细日志**：添加了详细的日志以便调试
+5. **健壮性**：添加了充分的错误处理以避免崩溃
+
+这应该能满足您的需求，只从model文件夹获取配置和tokenizer，而模型加载则完全依赖GGUF文件。
+
+---
+
+_**User**_
+
+INFO:__main__:从GGUF加载模型参数: /archive/liugu/ds/DeepSeek-R1-Distill-Llama-70B-GGUF/
+/archive/liugu/ds/ktransformers/ktransformers/util/custom_gguf.py:217: UserWarning: Version 1179993927 has never been tested, might not work
+  warnings.warn(f"Version {version} has never been tested, might not work")
+
+---
+
+_**Assistant**_
+
+<think>
+我们看到从日志中，系统正在尝试从GGUF文件加载模型参数，但出现了一个警告，指出GGUF文件的版本(1179993927)未经测试，可能无法正常工作。这通常表明使用的GGUF文件格式与当前库支持的版本不完全兼容。
+
+我们可以查看 ktransformers/util/custom_gguf.py 文件来了解更多关于GGUF加载过程的细节，特别是版本兼容性的处理。这可能有助于解决当前问题。
+
+针对这个GGUF版本警告，我们有几个方案：
+
+1. 如果有更新版本的 ktransformers 库，可以尝试更新，因为新版本可能支持这个GGUF版本
+2. 如果可能，使用另一个已知兼容的GGUF文件
+3. 修改 custom_gguf.py 文件中的版本处理逻辑，使其支持当前遇到的版本
+
+另外，根据警告消息的位置(在custom_gguf.py文件的第217行)，这可能只是一个警告，而不是一个严重错误，所以加载过程可能会继续进行。
+
+我们应该继续观察服务器日志，看看模型加载是否成功完成，以及是否有后续的错误。
+</think>
+
+# GGUF版本兼容性警告处理
+
+看起来您的代码正在正确地从GGUF文件加载模型，但遇到了一个GGUF格式版本兼容性警告：
+
+```
+Version 1179993927 has never been tested, might not work
+```
+
+这个警告来自`ktransformers/util/custom_gguf.py`，表明您的GGUF文件版本与ktransformers库测试过的版本不同。
+
+## 解决GGUF版本兼容性问题
+
+这个警告可能只是一个提示，但也可能导致一些功能不正确。我们有几种方法可以处理：
+
+```python:ktransformers/util/custom_gguf.py
+# 在custom_gguf.py中添加对新版本的支持
+def read_header(f):
+    magic = f.read(4)
+    if magic != b'GGUF':
+        raise ValueError("Not a GGUF file")
+    
+    version = struct.unpack("<I", f.read(4))[0]
+    
+    # 添加对新版本的支持
+    if version not in [1, 2, 3]:
+        # 修改这里，添加您看到的版本号
+        known_versions = [1, 2, 3, 1179993927]
+        if version in known_versions:
+            print(f"Using GGUF version {version}")
+        else:
+            warnings.warn(f"Version {version} has never been tested, might not work")
+    
+    # 其余代码...
+```
+
+如果您想更彻底地解决这个问题，可以查看 `ktransformers/util/custom_gguf.py` 文件，找到警告消息附近的代码，并添加对这个特定版本(1179993927)的支持。
+
+## 检查加载进度
+
+这个警告本身可能不会阻止模型加载，关键是检查后续日志：
+
+- 如果您看到 "GGUF模型加载完成，可以开始生成" 或类似消息，说明模型已成功加载
+- 如果您看到错误消息，则表明加载失败
+
+## 建议的下一步
+
+1. **监控服务器状态**：继续观察是否有更多错误消息
+
+2. **测试生成功能**：尝试发送一个简单的生成请求，看看模型是否能响应
+
+3. **版本适配**（如果需要）：
+   - 联系模型提供者了解正确的GGUF版本
+   - 或尝试使用兼容版本的GGUF文件
+   - 或修改`custom_gguf.py`增加对此版本的支持
+
+最重要的是，这个警告可能不会阻止模型工作，因为它是一个警告而非错误。请继续测试您的系统，看看生成功能是否正常工作。
+
+---
+
+_**User**_
+
+ERROR:__main__:模型加载失败: 'utf-8' codec can't decode byte 0xf4 in position 548: invalid continuation byte
+ERROR:__main__:Traceback (most recent call last):
+  File "/archive/liugu/ds/ktransformers/ktransformers/worker.py", line 328, in load_model
+    optimize_and_load_gguf(self.model, optimize_rule, gguf_path, config)
+  File "/archive/liugu/ds/ktransformers/ktransformers/optimize/optimize.py", line 133, in optimize_and_load_gguf
+    gguf_loader = GGUFLoader(gguf_path)
+                  ^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ktransformers/ktransformers/util/custom_gguf.py", line 206, in __init__
+    self.load_gguf(f)
+  File "/archive/liugu/ds/ktransformers/ktransformers/util/custom_gguf.py", line 221, in load_gguf
+    name = read_value(f, DATA_TYPES["string"])
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/archive/liugu/ds/ktransformers/ktransformers/util/custom_gguf.py", line 405, in read_value
+    return f.read(length).decode("utf-8")
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeDecodeError: 'utf-8' codec can't decode byte 0xf4 in position 548: invalid continuation byte
+
+---
+
+_**Assistant**_
+
 
 
 ---

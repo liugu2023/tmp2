@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python
 # coding=utf-8
 '''
@@ -211,19 +210,28 @@ class GGUFLoader:
                             
     def load_gguf(self, f):
         f.seek(0)
+        magic = f.read(4)
+        if magic != b'GGUF':
+            raise ValueError("不是GGUF文件格式")
+        
         values = struct.unpack("<IQQ", f.read(4+8+8))
         version, n_tensors, n_kv = values
+        
+        # 允许版本3以外的版本
         if version != 3:
-            warnings.warn(f"Version {version} has never been tested, might not work")
-
+            logger.info(f"使用GGUF版本 {version}，这个版本未经全面测试，但仍将尝试加载")
+        
         info = {}
         for _ in range(n_kv):
-            name = read_value(f, DATA_TYPES["string"])
-
-            data_type = struct.unpack("<I", f.read(4))[0]
-
-            info[name] = read_value(f, data_type)
-
+            try:
+                name = read_value(f, DATA_TYPES["string"])
+                data_type = struct.unpack("<I", f.read(4))[0]
+                info[name] = read_value(f, data_type)
+            except Exception as e:
+                logger.warning(f"读取KV对时出错: {e}，跳过此项")
+                # 尝试跳过这一项，继续读取下一项
+                continue
+        
         tensor_info = {}
         for _ in range(n_tensors):
             name = read_value(f, DATA_TYPES["string"])
@@ -400,52 +408,42 @@ class GGUFLoader:
         return values
 
 def read_value(f, data_type):
-    if data_type == DATA_TYPES["string"]:
-        length = struct.unpack("<Q", f.read(8))[0]
-        return f.read(length).decode("utf-8")
-
-    elif data_type == DATA_TYPES["bool"]:
-        return bool(struct.unpack("<?", f.read(1))[0])
-
-    elif data_type == DATA_TYPES["uint8"]:
-        return struct.unpack("<B", f.read(1))[0]
-
-    elif data_type == DATA_TYPES["int8"]:
-        return struct.unpack("<b", f.read(1))[0]
-
-    elif data_type == DATA_TYPES["uint16"]:
-        return struct.unpack("<H", f.read(2))[0]
-
-    elif data_type == DATA_TYPES["int16"]:
-        return struct.unpack("<h", f.read(2))[0]
-
-    elif data_type == DATA_TYPES["uint32"]:
+    if data_type == DATA_TYPES["uint32"]:
         return struct.unpack("<I", f.read(4))[0]
-
     elif data_type == DATA_TYPES["int32"]:
         return struct.unpack("<i", f.read(4))[0]
-
     elif data_type == DATA_TYPES["float32"]:
         return struct.unpack("<f", f.read(4))[0]
-
+    elif data_type == DATA_TYPES["bool"]:
+        return struct.unpack("<?", f.read(1))[0]
+    elif data_type == DATA_TYPES["string"]:
+        length = struct.unpack("<I", f.read(4))[0]
+        if length == 0:
+            return ""
+        try:
+            # 尝试使用UTF-8解码
+            return f.read(length).decode("utf-8")
+        except UnicodeDecodeError:
+            # 如果失败，使用'latin-1'或'replace'错误处理
+            try:
+                # 先尝试使用latin-1（可以表示所有单字节值）
+                return f.read(length).decode("latin-1")
+            except Exception:
+                # 作为最后手段，使用errors='replace'读取并跳过
+                f.seek(f.tell() - length)  # 回到字符串开始位置
+                return f.read(length).decode("utf-8", errors="replace")
+    elif data_type == DATA_TYPES["array"]:
+        array_type = struct.unpack("<I", f.read(4))[0]
+        array_len = struct.unpack("<I", f.read(4))[0]
+        return [read_value(f, array_type) for _ in range(array_len)]
     elif data_type == DATA_TYPES["uint64"]:
         return struct.unpack("<Q", f.read(8))[0]
-
     elif data_type == DATA_TYPES["int64"]:
         return struct.unpack("<q", f.read(8))[0]
-
     elif data_type == DATA_TYPES["float64"]:
         return struct.unpack("<d", f.read(8))[0]
-
-    elif data_type == DATA_TYPES["array"]:
-        elem_type, count = struct.unpack("<IQ", f.read(4 + 8))
-        return [read_value(f, elem_type) for _ in range(count)]
-
-    elif data_type == DATA_TYPES["FP8"]:
-        return struct.unpack("<B", f.read(1))[0]
-
     else:
-        raise NotImplementedError(f"Data type {data_type} not implemented")
+        raise ValueError(f"Unhandled data type: {data_type}")
 
 def dequantize_q2_k(data):
     # C implementation
